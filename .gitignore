@@ -1,0 +1,33 @@
+# Python 缓存文件（这些 __pycache__ 目录不需要提交）
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包生成的文件（src/sim_dji_cloud.egg-info/ 这个目录不需要提交）
+*.egg-info/
+*.egg
+
+# 配置文件（包含敏感信息，不要提交）
+*.yaml
+*.yml
+!*.yaml.example  # 但保留 .example 模板文件
+
+# 日志文件和录像文件（运行时生成的数据）
+*.log
+*.mp4
+*.avi
+recordings/
+
+# IDE 配置（根据你用的编辑器）
+.vscode/
+.idea/
+*.swp
+
+# 测试临时文件
+.pytest_cache/
+.tox/
+
+# 环境变量文件
+.env
+.venv
+venv/

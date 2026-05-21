@@ -1,0 +1,52 @@
+mqtt:
+  host: dji-cloud.example.com
+  port: 8883
+  tls: true
+  client_id: sim-dji-recorder-001
+  dock_sn: "SN_DOCK_EXAMPLE"
+  username: "${env:DJI_MQTT_USERNAME}"
+  password: "${env:DJI_MQTT_PASSWORD}"
+  ca_file: null
+  cert_file: null
+  key_file: null
+  subscribe_patterns:
+    - "thing/product/+/+"
+    - "thing/product/+/property/+"
+    - "thing/product/+/drc/+"
+    - "sys/product/+/+"
+  deny_topics:
+    - exact: "thing/product/SN_DOCK_EXAMPLE/firmware_upgrade"
+    - regex: "thing/product/.+/token.*"
+
+storage:
+  root: ./recordings
+  enable_raw_firehose: false
+  flush_max_records: 1000
+  flush_interval_ms: 200
+  queue_max_size: 10000
+  rotate_max_bytes: 104857600
+  rotate_max_records: 1000000
+
+video:
+  enabled: true
+  source_url_field: "osd.live_capacity.live_status[0].rtmp_url"
+  source_url_override: null
+  ffmpeg_extra_args: []
+
+flight_detection:
+  finalize_idle_seconds: 30
+  rules:
+    start:
+      - source: dock_services
+        payload_match: {"method": "wayline_prepare"}
+      - source: dock_osd
+        field: "wayline_mission_state"
+        not_equals: "idle"
+    end:
+      - source: dock_osd
+        field: "wayline_mission_state"
+        equals: "idle"
+        sustain_seconds: 30
+      - source: drone_osd
+        field: "mode_code"
+        in: ["standby", "landed"]
