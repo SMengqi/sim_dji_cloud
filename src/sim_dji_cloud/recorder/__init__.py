@@ -38,10 +38,6 @@ class Recorder:
         self._queues: dict[str, TopicWriteQueue] = {}
         self._topic_routed: dict[str, Any] = {}
         self._writers: dict[str, RotatingJsonlWriter] = {}
-        # Accumulator for files_metadata across writer lifecycles (e.g. pending → task_id rename
-        # discards the old writers but their .jsonl files move with the directory and must stay
-        # in the manifest). Keyed by topic, value is the list of file-meta dicts from prior writers.
-        self._closed_files_meta: dict[str, list[dict[str, Any]]] = {}
         self.flight_dir: Optional[Path] = None
         self._manifest: Optional[ManifestBuilder] = None
         self._task_started_ms: Optional[int] = None
@@ -133,27 +129,32 @@ class Recorder:
         logger.info("flight dir opened: {}", self.flight_dir)
 
     async def _rename_pending_to_task(self, task_id: str) -> None:
+        """Rename pending_ dir to task_id-named dir.
+
+        关键性质：函数体内**全部同步**（无 await），保证调用期间不会被
+        并发 on_mqtt_message 打断。文件句柄按 inode 跟踪，目录 rename 后
+        已打开的 writer 仍可继续写入；我们只需把 base_path 指向新目录，
+        让未来 rotation 的新分卷落在新位置。
+        """
         assert self.flight_dir is not None
         if not self.flight_dir.name.startswith("pending_"):
-            return
-
-        # Drain existing queues, preserve their files_metadata before clearing writers.
-        # The .jsonl files themselves move with the directory rename, but the per-writer
-        # metadata (volume names, counts, first/last ms) lives only in memory — without
-        # this snapshot the records written pre-rename would be on disk but missing from
-        # the final manifest.
-        for q in list(self._queues.values()):
-            await q.drain_and_close()
-        for topic, writer in self._writers.items():
-            self._closed_files_meta.setdefault(topic, []).extend(writer.files_metadata())
-        old_queues = list(self._queues.keys())
-        self._queues.clear()
-        self._writers.clear()
+            return  # 已被另一并发调用 rename 完成
 
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime((self._task_started_ms or now_ms()) / 1000))
         new_dir = self.flight_dir.parent / f"{task_id}__{self.dock_sn}__{ts}"
+
+        # 原子 rename。文件句柄继续有效（Linux inode 语义）。
         self.flight_dir.rename(new_dir)
         self.flight_dir = new_dir
+
+        # 修正每个 writer 的 base_path，使后续分卷落在新目录里。
+        # 已打开的当前卷 fd 不需要重建——它仍然有效，写入会落到 rename
+        # 后的新路径（因为 fd 跟随 inode，inode 跟随磁盘文件，文件跟随目录）。
+        new_topics_dir = new_dir / "topics"
+        for writer in self._writers.values():
+            writer.base_path = new_topics_dir / writer.base_path.name
+
+        # ManifestBuilder 持有 flight_dir 路径，需要重建指向新位置
         self._manifest = ManifestBuilder(
             flight_dir=self.flight_dir,
             task_id=task_id,
@@ -161,13 +162,7 @@ class Recorder:
             drone_sn=self.drone_sn or "unknown",
             started_at_recv_ms=self._task_started_ms or now_ms(),
         )
-        # Reopen writers (now pointing into renamed dir). Each new writer will start
-        # its volume index at 1; since pre-rename volume files already exist with
-        # the same name (e.g. topic.0001.jsonl), JsonlWriter opens in "ab" mode and
-        # appends to them rather than truncating — so pre-rename records survive
-        # and post-rename records are appended in order.
-        for topic in old_queues:
-            await self._ensure_topic_writer(topic)
+        logger.info("renamed pending dir to: {}", new_dir.name)
 
     async def _ensure_topic_writer(self, topic: str) -> TopicWriteQueue:
         if topic in self._queues:
@@ -212,42 +207,19 @@ class Recorder:
             await q.drain_and_close()
 
         assert self._manifest is not None
-        # Merge pre-rename (_closed_files_meta) + post-rename (current writers) metadata
-        # per topic. Same volume file may appear in both lists (rename caused new writer
-        # to append to existing file); dedupe by file name and aggregate count + ts range.
-        all_topics = set(self._writers.keys()) | set(self._closed_files_meta.keys())
-        for topic in all_topics:
+        # rename 现在不再关闭/重建 writer，每个 topic 的全生命周期数据都在
+        # 同一 RotatingJsonlWriter 里累积，files_metadata() 直接给出完整列表。
+        for topic, writer in self._writers.items():
             routed = self._topic_routed[topic]
-            pre = self._closed_files_meta.get(topic, [])
-            post = self._writers[topic].files_metadata() if topic in self._writers else []
-            files_merged: dict[str, dict[str, Any]] = {}
-            for meta in pre + post:
-                name = meta["name"]
-                if name not in files_merged:
-                    files_merged[name] = {
-                        "name": f"topics/{name}",
-                        "count": meta["count"],
-                        "first_ms": meta.get("first_ms"),
-                        "last_ms": meta.get("last_ms"),
-                    }
-                else:
-                    existing = files_merged[name]
-                    existing["count"] += meta["count"]
-                    if meta.get("first_ms") is not None:
-                        existing["first_ms"] = (
-                            meta["first_ms"] if existing["first_ms"] is None
-                            else min(existing["first_ms"], meta["first_ms"])
-                        )
-                    if meta.get("last_ms") is not None:
-                        existing["last_ms"] = (
-                            meta["last_ms"] if existing["last_ms"] is None
-                            else max(existing["last_ms"], meta["last_ms"])
-                        )
+            files = writer.files_metadata()
             self._manifest.record_topic(
                 topic=topic,
                 device_sn=routed.device_sn,
                 direction=routed.direction,
-                files=list(files_merged.values()),
+                files=[
+                    {"name": f"topics/{f['name']}", **{k: v for k, v in f.items() if k != "name"}}
+                    for f in files
+                ],
             )
 
         ended = self._detector.task_ended_ms or now_ms()

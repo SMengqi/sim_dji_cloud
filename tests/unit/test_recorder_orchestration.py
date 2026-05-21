@@ -106,6 +106,77 @@ async def test_drone_sn_backfilled_from_dock_osd_sub_device(minimal_config, tmp_
 
 
 @pytest.mark.asyncio
+async def test_post_rename_writes_continue_to_disk(minimal_config, tmp_path: Path):
+    """关键回归：rename 之后 writer 不应失效。
+    曾经的 bug：rename 时 drain+close 所有 writer 再重开，
+    导致 writer/queue 状态错乱，rename 之后所有写入都停了。"""
+    cfg = dict(minimal_config)
+    cfg["flight_detection"]["rules"]["start"] = [
+        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
+    ]
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+
+    # Pre-rename: 触发 RECORDING + 回填 drone_sn
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({
+            "wayline_mission_state": "executing",
+            "data": {"sub_device": {"device_sn": "SN_DRONE"}},
+        }).encode(),
+        100,
+    )
+    assert rec.flight_dir is not None
+    assert rec.flight_dir.name.startswith("pending_")
+
+    # 触发 rename
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/events",
+        json.dumps({"method": "return_home_info",
+                    "data": {"flight_id": "T-POST-RENAME"}}).encode(),
+        200,
+    )
+    assert "T-POST-RENAME" in rec.flight_dir.name
+
+    # Post-rename：模拟持续 30 条飞行器 osd（之前 bug 会丢全部）
+    for i in range(30):
+        await rec.on_mqtt_message(
+            "thing/product/SN_DRONE/osd",
+            json.dumps({"mode_code": 0, "seq": i}).encode(),
+            300 + i * 100,
+        )
+
+    # 也持续录机场 osd 10 条
+    for i in range(10):
+        await rec.on_mqtt_message(
+            "thing/product/SN_DOCK/osd",
+            json.dumps({"wayline_mission_state": "executing", "i": i}).encode(),
+            500 + i * 200,
+        )
+
+    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+
+    # 飞行器 osd: 30 条全部应在 manifest 里（rename 后写入）
+    drone_osd = next(t for t in manifest["topics"]
+                     if t["topic"] == "thing/product/SN_DRONE/osd")
+    assert drone_osd["count"] == 30, \
+        f"rename 后丢了飞行器 osd！期望 30，实际 {drone_osd['count']}"
+
+    # 机场 osd: pre-rename 1 + post-rename 10 = 11
+    dock_osd = next(t for t in manifest["topics"]
+                    if t["topic"] == "thing/product/SN_DOCK/osd")
+    assert dock_osd["count"] == 11, \
+        f"rename 后丢了机场 osd！期望 11，实际 {dock_osd['count']}"
+
+    # 同时校验磁盘上的 jsonl 内容
+    drone_file = flight_dir / "topics" / "thing__product__SN_DRONE__osd.0001.jsonl"
+    assert drone_file.exists()
+    drone_lines = drone_file.read_text().strip().splitlines()
+    assert len(drone_lines) == 30
+
+
+@pytest.mark.asyncio
 async def test_foreign_dock_topics_are_dropped(minimal_config, tmp_path: Path):
     """多机场共享 broker 时，非本机场 SN 的 topic 必须被 Recorder 丢弃，
     不能流入 manifest 或 jsonl。"""
