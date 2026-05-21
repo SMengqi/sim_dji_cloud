@@ -138,6 +138,103 @@ def test_multiple_rules_any_match_returns_true():
     assert rule["field"] == "y"
 
 
+def test_dot_path_field_access():
+    """规则的 field 支持 'a.b.c' 点路径取值，匹配真实 DJI payload 结构
+    （mode_code 在 payload.data.mode_code，drone_in_dock 在 payload.data.drone_in_dock）。"""
+    rules = [{"source": "drone_osd", "field": "data.mode_code", "not_equals": 0}]
+    ev = RuleEvaluator(rules)
+
+    # drone 在飞（mode_code=5）→ 匹配
+    matched, _ = ev.evaluate(Source.DRONE_OSD, {"data": {"mode_code": 5}}, now_ms=0)
+    assert matched
+
+    # drone standby（mode_code=0）→ 不匹配
+    matched, _ = ev.evaluate(Source.DRONE_OSD, {"data": {"mode_code": 0}}, now_ms=0)
+    assert not matched
+
+    # 字段缺失（任一层非 dict）→ 视为 None，not_equals 0 比较 → 匹配（None != 0）
+    matched, _ = ev.evaluate(Source.DRONE_OSD, {"foo": "bar"}, now_ms=0)
+    assert matched
+    matched, _ = ev.evaluate(Source.DRONE_OSD, {"data": "not-a-dict"}, now_ms=0)
+    assert matched
+
+
+def test_real_drone_osd_flight_lifecycle():
+    """模拟真实抓取数据中观察到的 mode_code 切换：
+    5(wayline) → 9(RTH) → 10(landing) → 0(standby) 持续 30s
+    验证 start 立即触发、end 正确判定。"""
+    start_rules = [{"source": "drone_osd", "field": "data.mode_code", "not_equals": 0}]
+    end_rules = [
+        {"source": "drone_osd", "field": "data.mode_code",
+         "equals": 0, "sustain_seconds": 30}
+    ]
+    d = FlightDetector(start_rules=start_rules, end_rules=end_rules)
+
+    # 第一条 drone_osd: 已经在飞 (mode_code=5)
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 5}}, now_ms=0)
+    assert d.state == FlightState.RECORDING
+
+    # RTH (mode 9)
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 9}}, now_ms=10_000)
+    assert d.state == FlightState.RECORDING
+
+    # 自动降落 (mode 10)
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 10}}, now_ms=20_000)
+    assert d.state == FlightState.RECORDING
+
+    # 落地，回到 standby (mode 0)
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 0}}, now_ms=30_000)
+    assert d.state == FlightState.RECORDING  # sustain 还没到 30s
+
+    # standby 持续 < 30s
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 0}}, now_ms=50_000)
+    assert d.state == FlightState.RECORDING
+
+    # standby 持续 ≥ 30s → 触发 end
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 0}}, now_ms=60_500)
+    assert d.state == FlightState.FINALIZING
+    assert d.end_reason == "auto_idle"
+
+
+def test_real_services_method_triggers_start():
+    """services 方法名（基于真实抓包）应能触发 start。"""
+    start_rules = [{
+        "source": "dock_services",
+        "field": "method",
+        "in": ["takeoff_to_point", "return_home", "wayline_prepare"],
+    }]
+    d = FlightDetector(start_rules=start_rules, end_rules=[])
+    d.feed(Source.DOCK_SERVICES,
+           {"method": "takeoff_to_point", "data": {"flight_id": "T-REAL"}},
+           now_ms=0)
+    assert d.state == FlightState.RECORDING
+    assert d.task_id == "T-REAL"
+
+
+def test_drone_in_dock_end_signal():
+    """兜底 end 规则：drone_in_dock=1 持续 30s。"""
+    start_rules = [{"source": "drone_osd", "field": "data.mode_code", "not_equals": 0}]
+    end_rules = [{
+        "source": "dock_osd",
+        "field": "data.drone_in_dock",
+        "equals": 1,
+        "sustain_seconds": 30,
+    }]
+    d = FlightDetector(start_rules=start_rules, end_rules=end_rules)
+
+    # 飞行中
+    d.feed(Source.DRONE_OSD, {"data": {"mode_code": 5}}, now_ms=0)
+    assert d.state == FlightState.RECORDING
+
+    # 飞行器入坞
+    d.feed(Source.DOCK_OSD, {"data": {"drone_in_dock": 1}}, now_ms=10_000)
+    assert d.state == FlightState.RECORDING
+
+    # 持续 30s 后入坞
+    d.feed(Source.DOCK_OSD, {"data": {"drone_in_dock": 1}}, now_ms=40_500)
+    assert d.state == FlightState.FINALIZING
+
+
 def test_extract_task_id_does_not_crash_when_data_is_list():
     """Real-world dock_events payloads (ADS-B etc.) carry `data` as a LIST, not a dict.
     _extract_task_id must return None instead of raising AttributeError."""

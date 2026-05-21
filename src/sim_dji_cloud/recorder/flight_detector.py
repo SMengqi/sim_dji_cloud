@@ -28,17 +28,21 @@ class RuleEvaluator:
             ok = True
             if "payload_match" in rule:
                 for k, v in rule["payload_match"].items():
-                    if payload.get(k) != v:
+                    if _get_field(payload, k) != v:
                         ok = False
                         break
             if ok and "field" in rule:
-                actual = payload.get(rule["field"])
+                actual = _get_field(payload, rule["field"])
                 if "equals" in rule and actual != rule["equals"]:
                     ok = False
                 if "not_equals" in rule and actual == rule["not_equals"]:
                     ok = False
                 if "in" in rule and actual not in rule["in"]:
                     ok = False
+                if "exists" in rule:
+                    has_val = actual is not None
+                    if rule["exists"] != has_val:
+                        ok = False
 
             if not ok:
                 self._sustain_start.pop(idx, None)
@@ -53,6 +57,22 @@ class RuleEvaluator:
                 return True, rule
 
         return False, None
+
+
+def _get_field(obj: Any, path: str) -> Any:
+    """支持点路径取值：`_get_field({"a":{"b":1}}, "a.b") == 1`。
+
+    顶层字段不带点，行为与 dict.get 一致；带点时逐层下钻。
+    路径中任一层非 dict 时返回 None。
+    """
+    if "." not in path:
+        return obj.get(path) if isinstance(obj, dict) else None
+    cur: Any = obj
+    for seg in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(seg)
+    return cur
 
 
 class FlightDetector:
