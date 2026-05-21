@@ -96,5 +96,10 @@ class FlightDetector:
 
     @staticmethod
     def _extract_task_id(payload: dict[str, Any]) -> Optional[str]:
-        data = payload.get("data") or {}
+        # `data` may be a dict (services payload) or a list (some events payloads
+        # like dock_events carrying ADS-B arrays). Only dict has flight_id/task_id;
+        # otherwise fall back to top-level payload.flight_id.
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = {}
         return data.get("flight_id") or data.get("task_id") or payload.get("flight_id")

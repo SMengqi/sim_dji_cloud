@@ -136,3 +136,31 @@ def test_multiple_rules_any_match_returns_true():
     matched, rule = ev.evaluate(Source.DOCK_OSD, {"y": "yes"}, now_ms=0)
     assert matched
     assert rule["field"] == "y"
+
+
+def test_extract_task_id_does_not_crash_when_data_is_list():
+    """Real-world dock_events payloads (ADS-B etc.) carry `data` as a LIST, not a dict.
+    _extract_task_id must return None instead of raising AttributeError."""
+    start_rules = [{"source": "dock_osd", "field": "wayline_mission_state",
+                    "not_equals": "idle"}]
+    d = FlightDetector(start_rules=start_rules, end_rules=[])
+    d.feed(Source.DOCK_OSD, {"wayline_mission_state": "executing"}, now_ms=0)
+    assert d.state == FlightState.RECORDING
+    assert d.task_id is None
+
+    events_payload = {
+        "bid": "synthetic-bid",
+        "data": [{"icao": "ABCDEF", "altitude": 3000, "heading": 90.0}],
+    }
+    d.feed(Source.DOCK_EVENTS, events_payload, now_ms=1000)
+    assert d.task_id is None
+    assert d.state == FlightState.RECORDING
+
+
+def test_extract_task_id_handles_non_dict_data_variants():
+    """Defensively handle data being None, string, int, list, etc."""
+    for bad_data in (None, "string-not-dict", 42, [], [1, 2, 3]):
+        payload = {"method": "wayline_prepare", "data": bad_data}
+        assert FlightDetector._extract_task_id(payload) is None
+        payload_with_top = dict(payload, flight_id="TOP")
+        assert FlightDetector._extract_task_id(payload_with_top) == "TOP"
