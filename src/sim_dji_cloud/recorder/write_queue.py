@@ -74,6 +74,9 @@ class TopicWriteQueue:
                 if should_flush and buffer:
                     for r in buffer:
                         self._writer.write(r)
+                    # 把 writer 内部 buffer 也推到磁盘 fd，让用户能实时看到
+                    # 文件增长；同时把进程崩溃时的数据丢失上限锁在 flush_interval_ms
+                    self._writer.flush()
                     buffer.clear()
                     last_flush = loop.time()
 
@@ -83,6 +86,7 @@ class TopicWriteQueue:
                 buffer.append(self._queue.get_nowait())
             for r in buffer:
                 self._writer.write(r)
+            self._writer.flush()
         except Exception:
             logger.exception("TopicWriteQueue consumer crashed; remaining items may be lost")
             raise

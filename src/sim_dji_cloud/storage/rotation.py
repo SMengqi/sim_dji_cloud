@@ -71,6 +71,14 @@ class RotatingJsonlWriter:
         self._current_writer.write(obj)
         self._current_meta["count"] += 1
 
+    def flush(self) -> None:
+        """把当前卷 writer 内部 buffer 推到磁盘 fd（不关闭、不切卷）。
+        TopicWriteQueue 每个 flush_interval_ms 调一次，保证用户能实时看到
+        文件增长，并把进程崩溃时的数据丢失上限限制到 flush_interval_ms。
+        """
+        if self._current_writer is not None:
+            self._current_writer.flush()
+
     def close(self) -> None:
         if self._current_writer is not None:
             self._finalize_current()
