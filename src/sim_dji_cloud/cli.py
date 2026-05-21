@@ -45,6 +45,7 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
     from sim_dji_cloud.recorder import Recorder
     from sim_dji_cloud.recorder.mqtt_client import MqttRecorderClient, MqttConfig
     from sim_dji_cloud.recorder.stop_signal import StopSignalFile, read_stop_signal_if_present
+    from sim_dji_cloud.recorder.flight_detector import FlightState
 
     cfg = load_config(Path(config_path))
     if video is not None:
@@ -80,8 +81,16 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
             loop.add_signal_handler(sig, stop_event.set)
 
         state_path = Path(state_dir)
+        # 决定退出原因，优先级：manual_stop（信号/stop-file）→ auto_idle（detector）
+        finalize_reason = "manual_stop"
         while not stop_event.is_set():
             await asyncio.sleep(1.0)
+            # 检查 detector 是否已自动判定飞行结束（mode_code=0 sustain 30s 等）
+            if rec._detector.state == FlightState.FINALIZING:
+                finalize_reason = rec._detector.end_reason or "auto_idle"
+                click.echo(f"auto-finalize: detector reached FINALIZING ({finalize_reason})")
+                break
+            # 检查外部 stop-record 命令写的信号文件
             if rec._detector.task_id:
                 sig_file = StopSignalFile(state_path, rec._detector.task_id)
                 if read_stop_signal_if_present(sig_file) is not None:
@@ -90,8 +99,8 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
         await mqtt.stop()
         loop_task.cancel()
         if rec.flight_dir is not None:
-            flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
-            click.echo(f"finalized: {flight_dir}")
+            flight_dir = await rec.finalize_and_close(finalize_reason=finalize_reason)
+            click.echo(f"finalized: {flight_dir}  (reason={finalize_reason})")
 
     asyncio.run(run())
 
