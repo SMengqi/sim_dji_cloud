@@ -13,11 +13,17 @@ def test_route_drone_osd_when_sn_matches_drone():
     assert r == RoutedTopic(device_sn="SN_DRONE", source=Source.DRONE_OSD, direction="up")
 
 
-def test_route_drone_osd_when_drone_sn_unknown():
-    """drone_sn 未抵达时，非 dock_sn 的 osd 第三段假设为 drone_osd"""
+def test_route_unknown_osd_when_neither_dock_nor_drone():
+    """多机场共享 broker 环境：drone_sn 未抵达 + device_sn != dock_sn 的 osd
+    应返回 UNKNOWN，由 Recorder 决定是否丢弃。
+    避免被其他机场的 osd 抢占 drone_sn 位置。"""
     r = route_topic("thing/product/SN_X/osd", dock_sn="SN_DOCK", drone_sn=None)
     assert r.device_sn == "SN_X"
-    assert r.source == Source.DRONE_OSD
+    assert r.source == Source.UNKNOWN
+
+    # drone_sn 已设但不匹配，仍 UNKNOWN
+    r2 = route_topic("thing/product/SN_OTHER/osd", dock_sn="SN_DOCK", drone_sn="SN_DRONE")
+    assert r2.source == Source.UNKNOWN
 
 
 def test_route_dock_services_and_reply():

@@ -44,9 +44,13 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
         payload=json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T1"}}).encode(),
         recv_ts_ms=1000,
     )
+    # dock_osd 必须含 data.sub_device.device_sn 才能回填 drone_sn
     await rec.on_mqtt_message(
         topic="thing/product/SN_DOCK/osd",
-        payload=json.dumps({"wayline_mission_state": "executing"}).encode(),
+        payload=json.dumps({
+            "wayline_mission_state": "executing",
+            "data": {"sub_device": {"device_sn": "SN_DRONE"}},
+        }).encode(),
         recv_ts_ms=1500,
     )
     await rec.on_mqtt_message(
@@ -72,6 +76,97 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
     assert "thing/product/SN_DOCK/services" in topics
     assert "thing/product/SN_DOCK/osd" in topics
     assert "thing/product/SN_DRONE/osd" in topics
+
+
+@pytest.mark.asyncio
+async def test_drone_sn_backfilled_from_dock_osd_sub_device(minimal_config, tmp_path: Path):
+    """关键修复：drone_sn 应从 dock_osd.data.sub_device.device_sn 精确提取，
+    不再用'首条非 dock osd 即认为是飞行器'的启发式。"""
+    cfg = dict(minimal_config)
+    cfg["flight_detection"]["rules"]["start"] = [
+        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
+    ]
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+
+    # dock_osd 携带 sub_device.device_sn = "REAL_DRONE_SN"
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({
+            "wayline_mission_state": "executing",
+            "data": {"sub_device": {"device_sn": "REAL_DRONE_SN"}},
+        }).encode(),
+        500,
+    )
+    assert rec.drone_sn == "REAL_DRONE_SN"
+
+    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["drone_sn"] == "REAL_DRONE_SN"
+
+
+@pytest.mark.asyncio
+async def test_foreign_dock_topics_are_dropped(minimal_config, tmp_path: Path):
+    """多机场共享 broker 时，非本机场 SN 的 topic 必须被 Recorder 丢弃，
+    不能流入 manifest 或 jsonl。"""
+    cfg = dict(minimal_config)
+    cfg["flight_detection"]["rules"]["start"] = [
+        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
+    ]
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+
+    # 启动录制：dock_osd 携带 sub_device.device_sn
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({
+            "wayline_mission_state": "executing",
+            "data": {"sub_device": {"device_sn": "SN_OURS_DRONE"}},
+        }).encode(),
+        500,
+    )
+
+    # 其他机场的 osd / drc / services 全部应被丢弃
+    await rec.on_mqtt_message(
+        "thing/product/SN_OTHER_DOCK/osd",
+        json.dumps({"data": {"sub_device": {"device_sn": "SN_OTHER_DRONE"}}}).encode(),
+        600,
+    )
+    await rec.on_mqtt_message(
+        "thing/product/SN_OTHER_DRONE/osd",
+        json.dumps({"mode_code": "manual_flight"}).encode(),
+        700,
+    )
+    await rec.on_mqtt_message(
+        "thing/product/SN_THIRD_DOCK/services",
+        json.dumps({"method": "wayline_prepare", "data": {"flight_id": "OTHER_T"}}).encode(),
+        800,
+    )
+
+    # 本机场 + 本飞行器的消息应保留
+    await rec.on_mqtt_message(
+        "thing/product/SN_OURS_DRONE/osd",
+        json.dumps({"mode_code": "manual_flight"}).encode(),
+        900,
+    )
+
+    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+
+    topics_in_manifest = {t["topic"] for t in manifest["topics"]}
+    # 本机场和本飞行器的 topic 在
+    assert "thing/product/SN_DOCK/osd" in topics_in_manifest
+    assert "thing/product/SN_OURS_DRONE/osd" in topics_in_manifest
+    # 其他机场/飞行器的 topic 不在
+    assert "thing/product/SN_OTHER_DOCK/osd" not in topics_in_manifest
+    assert "thing/product/SN_OTHER_DRONE/osd" not in topics_in_manifest
+    assert "thing/product/SN_THIRD_DOCK/services" not in topics_in_manifest
+
+    # 也确认磁盘上没有这些文件
+    foreign_files = list((flight_dir / "topics").glob("thing__product__SN_OTHER*"))
+    assert foreign_files == []
+    foreign_files = list((flight_dir / "topics").glob("thing__product__SN_THIRD*"))
+    assert foreign_files == []
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,16 @@ class Recorder:
         if is_denied(topic, self.config["mqtt"].get("deny_topics", [])):
             return
 
+        # Device-SN 白名单：多机场共享 broker 时，仅保留本机场 + 已确认飞行器
+        # 的 topic。drone_sn 未知时，只接受 dock_sn 的消息（drone_sn 会从
+        # dock_osd.data.sub_device.device_sn 回填，之后才放行飞行器消息）。
+        parts = topic.split("/")
+        msg_device_sn = parts[2] if len(parts) >= 3 else ""
+        if msg_device_sn != self.dock_sn and (
+            self.drone_sn is None or msg_device_sn != self.drone_sn
+        ):
+            return
+
         try:
             payload_obj = json.loads(payload.decode("utf-8")) if payload else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -64,18 +74,25 @@ class Recorder:
             routed = route_topic(topic, self.dock_sn, self.drone_sn)
             self._topic_routed[topic] = routed
 
-        # 回填 drone_sn（首条飞行器 osd）
-        if self.drone_sn is None and routed.source == Source.DRONE_OSD:
-            self.drone_sn = routed.device_sn
-            if self._manifest is not None:
-                self._manifest.update_drone_sn(self.drone_sn)
-            # 重新解析所有已缓存 topic（dock/drone 判定可能改变）
-            for cached_topic in list(self._topic_routed.keys()):
-                self._topic_routed[cached_topic] = route_topic(
-                    cached_topic, self.dock_sn, self.drone_sn,
+        # 回填 drone_sn —— 从 dock_osd.data.sub_device.device_sn 精确提取，
+        # 避免之前"首条非 dock osd 即认为是飞行器"启发式在多机场环境下出错。
+        if self.drone_sn is None and routed.source == Source.DOCK_OSD:
+            data = payload_obj.get("data") if isinstance(payload_obj.get("data"), dict) else {}
+            sub = data.get("sub_device") if isinstance(data, dict) else None
+            sn = sub.get("device_sn") if isinstance(sub, dict) else None
+            if sn:
+                self.drone_sn = sn
+                if self._manifest is not None:
+                    self._manifest.update_drone_sn(self.drone_sn)
+                # 重新解析所有已缓存 topic（drone_sn 现在已知，路由可能变化）
+                for cached_topic in list(self._topic_routed.keys()):
+                    self._topic_routed[cached_topic] = route_topic(
+                        cached_topic, self.dock_sn, self.drone_sn,
+                    )
+                routed = self._topic_routed[topic]
+                logger.info(
+                    "drone_sn backfilled from dock_osd.sub_device: {}", self.drone_sn,
                 )
-            routed = route_topic(topic, self.dock_sn, self.drone_sn)
-            self._topic_routed[topic] = routed
 
         prev_state = self._detector.state
         new_state = self._detector.feed(routed.source, payload_obj, recv_ts_ms)

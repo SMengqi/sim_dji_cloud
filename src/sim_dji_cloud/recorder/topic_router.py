@@ -75,8 +75,9 @@ def route_topic(topic: str, dock_sn: str, drone_sn: Optional[str]) -> RoutedTopi
         elif is_drone:
             src = Source.DRONE_OSD
         else:
-            # drone_sn unknown or unmatched: a non-dock device publishing osd is the drone
-            src = Source.DRONE_OSD
+            # 多机场共享 broker 时，仅 SN 等于本机场或已确认飞行器才归类；
+            # 其他 SN 一律 UNKNOWN，由 Recorder 决定是否丢弃。不再启发式假设。
+            src = Source.UNKNOWN
         return RoutedTopic(device_sn, src, direction)
 
     src = _SUFFIX_TO_DOCK_SOURCE.get(suffix, Source.UNKNOWN)
