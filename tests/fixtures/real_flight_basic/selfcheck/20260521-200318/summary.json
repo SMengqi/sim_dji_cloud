@@ -1,0 +1,127 @@
+{
+  "flight_dir": "real_flight_basic",
+  "tolerance_ms": 200,
+  "overall": "PASS",
+  "topics": [
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/osd",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "orig_count": 110,
+      "replayed_count": 110,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/events",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 488,
+      "replayed_count": 488,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/osd",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 446,
+      "replayed_count": 446,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/state",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "orig_count": 151,
+      "replayed_count": 151,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/state_reply",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "orig_count": 72,
+      "replayed_count": 72,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/events",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "orig_count": 108,
+      "replayed_count": 108,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/state",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 8,
+      "replayed_count": 8,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/services",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 64,
+      "replayed_count": 64,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/services_reply",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 64,
+      "replayed_count": 64,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/events_reply",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "orig_count": 10,
+      "replayed_count": 10,
+      "first_divergence_index": null,
+      "first_divergence_field": null,
+      "max_relative_drift_ms": 0,
+      "out_of_order_count": 0,
+      "max_reorder_offset": 0,
+      "status": "PASS"
+    }
+  ]
+}

@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "finalize_reason": "manual_stop",
+  "task_id": "T-FIXTURE-001",
+  "dock_sn": "SN_DOCK_FIXTURE",
+  "drone_sn": "SN_DRONE_FIXTURE",
+  "started_at_recv_ms": 1779352083932,
+  "ended_at_recv_ms": 1779352303929,
+  "takeoff_offset_ms": null,
+  "landing_offset_ms": null,
+  "gaps": [],
+  "topics": [
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/osd",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "direction": "up",
+      "count": 110,
+      "first_recv_ts_ms": 1779352083932,
+      "last_recv_ts_ms": 1779352301935,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DRONE_FIXTURE__osd.0001.jsonl",
+          "count": 110,
+          "first_ms": 1779352083932,
+          "last_ms": 1779352301935
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/events",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "up",
+      "count": 488,
+      "first_recv_ts_ms": 1779352084059,
+      "last_recv_ts_ms": 1779352303185,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__events.0001.jsonl",
+          "count": 488,
+          "first_ms": 1779352084059,
+          "last_ms": 1779352303185
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/osd",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "up",
+      "count": 446,
+      "first_recv_ts_ms": 1779352084531,
+      "last_recv_ts_ms": 1779352303908,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__osd.0001.jsonl",
+          "count": 446,
+          "first_ms": 1779352084531,
+          "last_ms": 1779352303908
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/state",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "direction": "up",
+      "count": 151,
+      "first_recv_ts_ms": 1779352084838,
+      "last_recv_ts_ms": 1779352303639,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DRONE_FIXTURE__state.0001.jsonl",
+          "count": 151,
+          "first_ms": 1779352084838,
+          "last_ms": 1779352303639
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/state_reply",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "direction": "up",
+      "count": 72,
+      "first_recv_ts_ms": 1779352084847,
+      "last_recv_ts_ms": 1779352303641,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DRONE_FIXTURE__state_reply.0001.jsonl",
+          "count": 72,
+          "first_ms": 1779352084847,
+          "last_ms": 1779352303641
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DRONE_FIXTURE/events",
+      "device_sn": "SN_DRONE_FIXTURE",
+      "direction": "up",
+      "count": 108,
+      "first_recv_ts_ms": 1779352085809,
+      "last_recv_ts_ms": 1779352303241,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DRONE_FIXTURE__events.0001.jsonl",
+          "count": 108,
+          "first_ms": 1779352085809,
+          "last_ms": 1779352303241
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/state",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "up",
+      "count": 8,
+      "first_recv_ts_ms": 1779352117877,
+      "last_recv_ts_ms": 1779352273542,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__state.0001.jsonl",
+          "count": 8,
+          "first_ms": 1779352117877,
+          "last_ms": 1779352273542
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/services",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "svc_req",
+      "count": 64,
+      "first_recv_ts_ms": 1779352131549,
+      "last_recv_ts_ms": 1779352297454,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__services.0001.jsonl",
+          "count": 64,
+          "first_ms": 1779352131549,
+          "last_ms": 1779352297454
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/services_reply",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "svc_rsp",
+      "count": 64,
+      "first_recv_ts_ms": 1779352131583,
+      "last_recv_ts_ms": 1779352297459,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__services_reply.0001.jsonl",
+          "count": 64,
+          "first_ms": 1779352131583,
+          "last_ms": 1779352297459
+        }
+      ]
+    },
+    {
+      "topic": "thing/product/SN_DOCK_FIXTURE/events_reply",
+      "device_sn": "SN_DOCK_FIXTURE",
+      "direction": "up",
+      "count": 10,
+      "first_recv_ts_ms": 1779352131743,
+      "last_recv_ts_ms": 1779352292356,
+      "files": [
+        {
+          "name": "topics/thing__product__SN_DOCK_FIXTURE__events_reply.0001.jsonl",
+          "count": 10,
+          "first_ms": 1779352131743,
+          "last_ms": 1779352292356
+        }
+      ]
+    }
+  ],
+  "video": null
+}
