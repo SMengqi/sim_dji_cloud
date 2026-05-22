@@ -120,3 +120,48 @@ sim_dji_cloud/
     ├── integration/                # mosquitto 集成测试
     └── fixtures/recorder_minimal.yaml
 ```
+
+## Phase 2: Player + SelfCheck
+
+阶段二交付：**`sim-dji play` + `sim-dji selfcheck` + `sim-dji list` + `sim-dji repair`**。
+阶段三（UI / 视频回放）见父设计文档。
+
+### 回放
+
+```bash
+sim-dji play ./recordings/<flight_dir>/ \
+    --mqtt-url tcp://localhost:1883 --speed 1.0
+```
+
+把飞行目录的所有 topic 按原时序重发到指定 broker。被测业务系统作为订阅端连同一 broker 即可复现飞行。
+
+### 自检（录-放对称性回归）
+
+```bash
+sim-dji selfcheck ./recordings/<flight_dir>/ --tolerance-ms 50
+```
+
+In-process loopback：Player 发 → 临时 Recorder 收 → Comparator 比对。
+退出码 0 = PASS / 非 0 = FAIL。报告写到 `<flight_dir>/selfcheck/<ts>/`。
+
+### 列出 + 修复
+
+```bash
+sim-dji list --root ./recordings              # 列出所有飞行
+sim-dji repair ./recordings/<flight_dir>/     # manifest 丢失/损坏时重建
+```
+
+### 真机 fixture
+
+`tests/fixtures/real_flight_basic/` 是 220s 完整飞行的脱敏版本，作为 SelfCheck 回归基线：
+
+```
+test_selfcheck_on_real_flight_fixture PASSED
+```
+
+要重新生成（基于新真机数据）：
+
+```bash
+python3 scripts/anonymize_flight.py recordings/<flight_dir>/ tests/fixtures/real_flight_basic/
+```
+
