@@ -11,7 +11,7 @@ from sim_dji_cloud.dashboard.live_state import LiveState
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app(state: LiveState, ws_push_interval_ms: int = 500) -> FastAPI:
+def create_app(state: LiveState, ws_push_interval_ms: int = 2000) -> FastAPI:
     app = FastAPI(title="sim-dji dashboard")
 
     @app.get("/api/health")

@@ -9,6 +9,7 @@ def run_dashboard(
     mqtt_url: str,
     host: str,
     port: int,
+    ws_push_interval_ms: int = 2000,
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -18,7 +19,7 @@ def run_dashboard(
     broker_port = parsed.port or 1883
 
     state = LiveState()
-    app = create_app(state)
+    app = create_app(state, ws_push_interval_ms=ws_push_interval_ms)
 
     sub_holder: dict = {"sub": None}
 

@@ -158,9 +158,14 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
               help="HTTP 监听地址，默认对外可访问")
 @click.option("--port", default=8080, type=int,
               help="HTTP 监听端口，默认 8080")
-def dashboard_cmd(mqtt_url: str, host: str, port: int) -> None:
+@click.option("--ws-push-interval-ms", default=2000, type=int,
+              help="WebSocket 推送间隔毫秒，默认 2000（与 DJI dock OSD 2s 上报一致）")
+def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int) -> None:
     from sim_dji_cloud.tools.dashboard_cmd import run_dashboard
-    raise SystemExit(run_dashboard(mqtt_url=mqtt_url, host=host, port=port))
+    raise SystemExit(run_dashboard(
+        mqtt_url=mqtt_url, host=host, port=port,
+        ws_push_interval_ms=ws_push_interval_ms,
+    ))
 
 
 if __name__ == "__main__":

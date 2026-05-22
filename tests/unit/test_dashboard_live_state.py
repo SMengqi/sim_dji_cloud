@@ -144,6 +144,74 @@ def test_unknown_topic_only_counted_not_decoded():
     assert snap["dock"] == {}
 
 
+def test_partial_dock_osd_preserves_previous_fields():
+    """DJI 部分 OSD 报文不带某些字段（如 flighttask_step_code 只在变化时上报）。
+    LiveState 应保留上次值，而不是把字段清空成 None —— 否则前端会闪烁出 null。"""
+    s = LiveState()
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {
+            "mode_code": 4,
+            "flighttask_step_code": 1,
+            "drc_state": 2,
+            "drone_in_dock": 0,
+            "cover_state": 1,
+            "environment_temperature": 26.4,
+            "humidity": 96,
+            "sub_device": {"device_sn": "SN_DRONE"},
+        },
+    }, recv_ts_ms=1000)
+
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {
+            "mode_code": 4,
+            "drone_in_dock": 0,
+            "cover_state": 1,
+            "environment_temperature": 26.5,
+            "humidity": 96,
+        },
+    }, recv_ts_ms=2000)
+
+    snap = s.snapshot()
+    dock = snap["dock"]
+    assert dock["mode_code"] == 4
+    assert dock["flighttask_step_code"] == 1, "应保留上次值而非清空成 None"
+    assert dock["drc_state"] == 2, "应保留上次值而非清空成 None"
+    assert dock["paired_drone_sn"] == "SN_DRONE", "sub_device 缺失时应保留"
+    assert dock["temperature"] == 26.5, "新值应覆盖"
+    assert dock["last_recv_ts_ms"] == 2000
+
+
+def test_partial_drone_osd_preserves_previous_fields():
+    """飞行器 OSD 部分字段缺失时同样应合并保留。"""
+    s = LiveState()
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {
+            "mode_code": 2,
+            "battery": {"capacity_percent": 80},
+            "attitude_head": 90.0,
+            "latitude": 30.0, "longitude": 121.0,
+            "horizontal_speed": 1.5,
+            "position_state": {"gps_number": 12, "rtk_number": 24},
+        },
+    }, recv_ts_ms=1000)
+
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {
+            "mode_code": 2,
+            "latitude": 30.001, "longitude": 121.001,
+            "horizontal_speed": 1.6,
+        },
+    }, recv_ts_ms=2000)
+
+    snap = s.snapshot()
+    drone = snap["drone"]
+    assert drone["battery_pct"] == 80, "battery 字段未上报时应保留"
+    assert drone["attitude_head"] == 90.0, "attitude 字段未上报时应保留"
+    assert drone["gps_satellites"] == 12, "position_state 未上报时应保留"
+    assert drone["latitude"] == 30.001, "新值应覆盖"
+    assert drone["horizontal_speed"] == 1.6
+
+
 def test_snapshot_returns_copy():
     """snapshot 应返回深拷贝。"""
     s = LiveState()

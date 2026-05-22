@@ -15,6 +15,8 @@ class LiveState:
         self._events: deque[dict[str, Any]] = deque(maxlen=events_ring_size)
         self._trail: deque[list[float]] = deque(maxlen=trail_max)
         self._topic_counts: dict[str, int] = {}
+        self._known_dock_sn: str | None = None
+        self._known_drone_sn: str | None = None
 
     def update(self, topic: str, payload: dict[str, Any], recv_ts_ms: int) -> None:
         self._topic_counts[topic] = self._topic_counts.get(topic, 0) + 1
@@ -25,7 +27,18 @@ class LiveState:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
 
         if suffix == "osd":
-            if isinstance(data.get("sub_device"), dict):
+            sub = data.get("sub_device")
+            if isinstance(sub, dict):
+                self._known_dock_sn = device_sn
+                child_sn = sub.get("device_sn")
+                if child_sn:
+                    self._known_drone_sn = child_sn
+
+            if device_sn and device_sn == self._known_dock_sn:
+                self._update_dock(device_sn, data, recv_ts_ms)
+            elif device_sn and device_sn == self._known_drone_sn:
+                self._update_drone(device_sn, data, recv_ts_ms)
+            elif isinstance(sub, dict):
                 self._update_dock(device_sn, data, recv_ts_ms)
             else:
                 self._update_drone(device_sn, data, recv_ts_ms)
@@ -37,50 +50,68 @@ class LiveState:
                 "flight_id": data.get("flight_id"),
             })
 
+    # (osd_data_key, snapshot_key) — dock 顶层字段映射
+    _DOCK_FIELD_MAP = (
+        ("mode_code", "mode_code"),
+        ("cover_state", "cover_state"),
+        ("drone_in_dock", "drone_in_dock"),
+        ("flighttask_step_code", "flighttask_step_code"),
+        ("drc_state", "drc_state"),
+        ("environment_temperature", "temperature"),
+        ("humidity", "humidity"),
+        ("wind_speed", "wind_speed"),
+        ("rainfall", "rainfall"),
+        ("latitude", "latitude"),
+        ("longitude", "longitude"),
+        ("height", "height"),
+    )
+
+    # drone 顶层字段映射
+    _DRONE_FIELD_MAP = (
+        ("mode_code", "mode_code"),
+        ("attitude_head", "attitude_head"),
+        ("attitude_pitch", "attitude_pitch"),
+        ("attitude_roll", "attitude_roll"),
+        ("horizontal_speed", "horizontal_speed"),
+        ("vertical_speed", "vertical_speed"),
+        ("height", "height"),
+        ("home_distance", "home_distance"),
+        ("latitude", "latitude"),
+        ("longitude", "longitude"),
+        ("wind_speed", "wind_speed"),
+    )
+
     def _update_dock(self, sn: str, data: dict, recv_ts_ms: int) -> None:
-        net = data.get("network_state") if isinstance(data.get("network_state"), dict) else {}
-        sub = data.get("sub_device") if isinstance(data.get("sub_device"), dict) else {}
-        self._dock = {
-            "sn": sn,
-            "mode_code": data.get("mode_code"),
-            "cover_state": data.get("cover_state"),
-            "drone_in_dock": data.get("drone_in_dock"),
-            "flighttask_step_code": data.get("flighttask_step_code"),
-            "drc_state": data.get("drc_state"),
-            "temperature": data.get("environment_temperature"),
-            "humidity": data.get("humidity"),
-            "wind_speed": data.get("wind_speed"),
-            "rainfall": data.get("rainfall"),
-            "network_quality": net.get("quality"),
-            "network_rate": net.get("rate"),
-            "latitude": data.get("latitude"),
-            "longitude": data.get("longitude"),
-            "height": data.get("height"),
-            "paired_drone_sn": sub.get("device_sn"),
-            "last_recv_ts_ms": recv_ts_ms,
-        }
+        self._dock["sn"] = sn
+        self._dock["last_recv_ts_ms"] = recv_ts_ms
+        for src, dst in self._DOCK_FIELD_MAP:
+            if src in data:
+                self._dock[dst] = data[src]
+        net = data.get("network_state")
+        if isinstance(net, dict):
+            if "quality" in net:
+                self._dock["network_quality"] = net["quality"]
+            if "rate" in net:
+                self._dock["network_rate"] = net["rate"]
+        sub = data.get("sub_device")
+        if isinstance(sub, dict) and "device_sn" in sub:
+            self._dock["paired_drone_sn"] = sub["device_sn"]
 
     def _update_drone(self, sn: str, data: dict, recv_ts_ms: int) -> None:
-        battery = data.get("battery") if isinstance(data.get("battery"), dict) else {}
-        position = data.get("position_state") if isinstance(data.get("position_state"), dict) else {}
-        self._drone = {
-            "sn": sn,
-            "mode_code": data.get("mode_code"),
-            "battery_pct": battery.get("capacity_percent"),
-            "attitude_head": data.get("attitude_head"),
-            "attitude_pitch": data.get("attitude_pitch"),
-            "attitude_roll": data.get("attitude_roll"),
-            "horizontal_speed": data.get("horizontal_speed"),
-            "vertical_speed": data.get("vertical_speed"),
-            "height": data.get("height"),
-            "home_distance": data.get("home_distance"),
-            "latitude": data.get("latitude"),
-            "longitude": data.get("longitude"),
-            "gps_satellites": position.get("gps_number"),
-            "rtk_satellites": position.get("rtk_number"),
-            "wind_speed": data.get("wind_speed"),
-            "last_recv_ts_ms": recv_ts_ms,
-        }
+        self._drone["sn"] = sn
+        self._drone["last_recv_ts_ms"] = recv_ts_ms
+        for src, dst in self._DRONE_FIELD_MAP:
+            if src in data:
+                self._drone[dst] = data[src]
+        battery = data.get("battery")
+        if isinstance(battery, dict) and "capacity_percent" in battery:
+            self._drone["battery_pct"] = battery["capacity_percent"]
+        position = data.get("position_state")
+        if isinstance(position, dict):
+            if "gps_number" in position:
+                self._drone["gps_satellites"] = position["gps_number"]
+            if "rtk_number" in position:
+                self._drone["rtk_satellites"] = position["rtk_number"]
         lat = data.get("latitude")
         lon = data.get("longitude")
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
