@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sim-dji dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #1a1a1a; color: #e0e0e0; display: grid;
+         grid-template-columns: 1fr 360px; grid-template-rows: 60px 1fr 240px;
+         height: 100vh; gap: 1px; }
+  header { grid-column: 1 / 3; background: #0a0a0a; padding: 12px 16px;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 500; }
+  .conn-status { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .conn-status.up { background: #1d6f1d; }
+  .conn-status.down { background: #6f1d1d; }
+  #map { grid-column: 1; grid-row: 2 / 4; background: #2a2a2a; }
+  .sidebar { grid-column: 2; grid-row: 2; overflow-y: auto; padding: 12px;
+             background: #0f0f0f; }
+  .events { grid-column: 1 / 3; grid-row: 4; background: #0a0a0a; padding: 8px 16px;
+            overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 4px;
+          padding: 10px; margin-bottom: 10px; }
+  .card h2 { font-size: 12px; margin: 0 0 8px 0; color: #888; text-transform: uppercase;
+             letter-spacing: 0.5px; }
+  .row { display: flex; justify-content: space-between; padding: 3px 0;
+         font-size: 13px; }
+  .row .k { color: #888; }
+  .row .v { color: #fff; font-variant-numeric: tabular-nums; }
+  .events table { width: 100%; border-collapse: collapse; }
+  .events td { padding: 2px 6px; border-bottom: 1px solid #1a1a1a; }
+  .topic-counts { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.4; }
+  .topic-counts .row { padding: 1px 0; }
+</style>
+</head>
+<body x-data="dashboard()" x-init="init()">
+  <header>
+    <h1>sim-dji dashboard</h1>
+    <span class="conn-status" :class="connected ? 'up' : 'down'"
+          x-text="connected ? 'WS connected' : 'WS disconnected'"></span>
+    <span style="color:#888;font-size:12px;" x-text="'updates: ' + updates"></span>
+  </header>
+
+  <div id="map"></div>
+
+  <div class="sidebar">
+    <div class="card" x-show="state.drone && state.drone.sn">
+      <h2>飞行器 (<span x-text="state.drone.sn"></span>)</h2>
+      <div class="row"><span class="k">mode_code</span><span class="v" x-text="state.drone.mode_code"></span></div>
+      <div class="row"><span class="k">battery</span><span class="v" x-text="state.drone.battery_pct + '%'"></span></div>
+      <div class="row"><span class="k">height</span><span class="v" x-text="fmt(state.drone.height) + ' m'"></span></div>
+      <div class="row"><span class="k">home_distance</span><span class="v" x-text="fmt(state.drone.home_distance) + ' m'"></span></div>
+      <div class="row"><span class="k">h_speed</span><span class="v" x-text="fmt(state.drone.horizontal_speed) + ' m/s'"></span></div>
+      <div class="row"><span class="k">v_speed</span><span class="v" x-text="fmt(state.drone.vertical_speed) + ' m/s'"></span></div>
+      <div class="row"><span class="k">heading</span><span class="v" x-text="fmt(state.drone.attitude_head) + '°'"></span></div>
+      <div class="row"><span class="k">GPS / RTK</span><span class="v" x-text="(state.drone.gps_satellites || 0) + ' / ' + (state.drone.rtk_satellites || 0)"></span></div>
+      <div class="row"><span class="k">lat, lon</span><span class="v" x-text="fmt(state.drone.latitude, 5) + ', ' + fmt(state.drone.longitude, 5)"></span></div>
+    </div>
+
+    <div class="card" x-show="state.dock && state.dock.sn">
+      <h2>机场 (<span x-text="state.dock.sn"></span>)</h2>
+      <div class="row"><span class="k">mode_code</span><span class="v" x-text="state.dock.mode_code"></span></div>
+      <div class="row"><span class="k">drone_in_dock</span><span class="v" x-text="state.dock.drone_in_dock"></span></div>
+      <div class="row"><span class="k">cover_state</span><span class="v" x-text="state.dock.cover_state"></span></div>
+      <div class="row"><span class="k">temperature</span><span class="v" x-text="fmt(state.dock.temperature) + ' °C'"></span></div>
+      <div class="row"><span class="k">humidity</span><span class="v" x-text="state.dock.humidity + ' %'"></span></div>
+      <div class="row"><span class="k">wind</span><span class="v" x-text="fmt(state.dock.wind_speed) + ' m/s'"></span></div>
+      <div class="row"><span class="k">network quality</span><span class="v" x-text="state.dock.network_quality"></span></div>
+      <div class="row"><span class="k">paired drone</span><span class="v" x-text="state.dock.paired_drone_sn || '-'"></span></div>
+    </div>
+
+    <div class="card">
+      <h2>topic counts</h2>
+      <div class="topic-counts">
+        <template x-for="[topic, count] in Object.entries(state.topic_counts || {}).sort((a,b) => b[1]-a[1])" :key="topic">
+          <div class="row"><span class="k" x-text="topic.replace(/^thing\/product\//, '')"></span><span class="v" x-text="count"></span></div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <div class="events">
+    <strong>最近事件</strong>
+    <table>
+      <tbody>
+        <template x-for="ev in (state.events || []).slice().reverse()" :key="ev.recv_ts_ms">
+          <tr>
+            <td style="width:160px;color:#666;" x-text="new Date(ev.recv_ts_ms).toLocaleTimeString()"></td>
+            <td style="width:280px;color:#aaa;" x-text="ev.method"></td>
+            <td style="color:#666;" x-text="ev.flight_id || ''"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+<script>
+function dashboard() {
+  return {
+    connected: false,
+    updates: 0,
+    state: { dock: {}, drone: {}, drone_trail: [], events: [], topic_counts: {} },
+    map: null,
+    droneMarker: null,
+    trailLayer: null,
+    homeMarker: null,
+
+    init() {
+      this.initMap();
+      this.connectWS();
+    },
+
+    initMap() {
+      this.map = L.map('map', { zoomControl: true }).setView([29.92, 121.66], 18);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap', maxZoom: 19,
+      }).addTo(this.map);
+      this.trailLayer = L.polyline([], { color: '#ffaa00', weight: 3 }).addTo(this.map);
+    },
+
+    connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+      ws.onopen = () => { this.connected = true; };
+      ws.onclose = () => {
+        this.connected = false;
+        setTimeout(() => this.connectWS(), 1000);
+      };
+      ws.onerror = () => { this.connected = false; };
+      ws.onmessage = (ev) => {
+        try {
+          this.state = JSON.parse(ev.data);
+          this.updates += 1;
+          this.updateMap();
+        } catch (e) { console.error(e); }
+      };
+    },
+
+    updateMap() {
+      const trail = this.state.drone_trail || [];
+      if (trail.length) {
+        this.trailLayer.setLatLngs(trail);
+        const latest = trail[trail.length - 1];
+        if (!this.droneMarker) {
+          this.droneMarker = L.circleMarker(latest, {
+            radius: 8, color: '#ff5555', fillColor: '#ff5555', fillOpacity: 0.7,
+          }).addTo(this.map);
+          this.map.setView(latest, 18);
+        } else {
+          this.droneMarker.setLatLng(latest);
+        }
+      }
+      const dock = this.state.dock || {};
+      if (dock.latitude && dock.longitude && !this.homeMarker) {
+        this.homeMarker = L.marker([dock.latitude, dock.longitude],
+          { title: 'dock' }).addTo(this.map);
+      }
+    },
+
+    fmt(v, digits = 1) {
+      if (v === null || v === undefined) return '-';
+      if (typeof v !== 'number') return String(v);
+      return v.toFixed(digits);
+    },
+  };
+}
+</script>
+</body>
+</html>

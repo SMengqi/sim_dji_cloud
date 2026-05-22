@@ -165,3 +165,66 @@ test_selfcheck_on_real_flight_fixture PASSED
 python3 scripts/anonymize_flight.py recordings/<flight_dir>/ tests/fixtures/real_flight_basic/
 ```
 
+---
+
+## Dashboard 可视化（阶段二 UI 补丁）
+
+无图形界面 Linux 服务器友好——纯 HTTP，浏览器看：
+
+```bash
+# 在录制或回放的同台服务器上
+sim-dji dashboard --port 8080
+# 浏览器访问 http://<server-ip>:8080
+```
+
+订阅本地 broker（与 record/play 同一个），实时显示：
+
+- 飞行器位置 + 轨迹（Leaflet 地图）
+- 机场状态（温度、湿度、舱盖、入坞、网络）
+- 飞行器状态（mode_code、电池、高度、速度、GPS/RTK、姿态）
+- 最近 20 条 events
+- 各 topic 实时消息计数
+
+SSH 隧道（不开外网端口）：
+
+```bash
+ssh -L 8080:localhost:8080 <user>@<server>
+# 浏览器访问 http://localhost:8080
+```
+
+详见操作手册 §6.5。
+
+---
+
+## 📖 完整操作手册
+
+所有 8 个 CLI 子命令的详细用法、配置说明、完整工作流、故障排查矩阵、数据契约速查见：
+
+**[../2026-05-21-sim-dji-cloud-operations-manual.md](../2026-05-21-sim-dji-cloud-operations-manual.md)**
+
+涵盖章节：
+
+- 0. 快速速查表（8 个命令一览）
+- 1-2. 安装 + 配置
+- 3. 录制（启停三种方式 / 实时验证）
+- 4. 检查（inspect / list / repair）
+- 5. 回放（broker 启动 / play 选项 / 验证）
+- 6. 自检（in-process loopback / 报告解读 / 失败排查）
+- 7. 真机 fixture 脱敏复用
+- 8. 跑测试
+- 9. 完整工作流示例
+- 10. 故障排查（录制 / 回放 / 自检 三大类常见现象）
+- 11-12. 文件结构 + 数据契约速查
+- 13-15. 阶段状态 + 诊断顺序 + 参考文档
+
+## 设计文档与实施计划
+
+| 文件 | 内容 |
+|------|------|
+| `../2026-05-18-sim-dji-cloud-design.md` | v1 设计文档（数据契约权威） |
+| `../2026-05-19-sim-dji-cloud-design-revision-dock-drone.md` | dock/drone 数据源拆分修订记录 |
+| `../2026-05-19-sim-dji-cloud-phase1-prp.md` | 阶段一实施计划（Recorder MVP） |
+| `../2026-05-21-sim-dji-cloud-phase2-prp.md` | 阶段二实施计划（Player + SelfCheck） |
+| `../2026-05-22-sim-dji-cloud-phase2-ui-prp.md` | 阶段二 UI 实施计划（dashboard） |
+| `../2026-05-21-sim-dji-cloud-operations-manual.md` | **操作手册（常用入口）** |
+

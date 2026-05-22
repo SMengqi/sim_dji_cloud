@@ -151,5 +151,17 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
     )))
 
 
+@main.command("dashboard")
+@click.option("--mqtt-url", default="tcp://localhost:1883",
+              help="订阅哪个 broker（同 record/play 使用的本地 broker）")
+@click.option("--host", default="0.0.0.0",
+              help="HTTP 监听地址，默认对外可访问")
+@click.option("--port", default=8080, type=int,
+              help="HTTP 监听端口，默认 8080")
+def dashboard_cmd(mqtt_url: str, host: str, port: int) -> None:
+    from sim_dji_cloud.tools.dashboard_cmd import run_dashboard
+    raise SystemExit(run_dashboard(mqtt_url=mqtt_url, host=host, port=port))
+
+
 if __name__ == "__main__":
     main()

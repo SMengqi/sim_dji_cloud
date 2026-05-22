@@ -34,3 +34,17 @@ def test_cli_help_lists_list_and_repair():
     assert r.exit_code == 0
     assert "list" in r.output
     assert "repair" in r.output
+
+
+def test_cli_dashboard_help():
+    r = CliRunner().invoke(main, ["dashboard", "--help"])
+    assert r.exit_code == 0
+    out = r.output.lower()
+    assert "broker" in out or "mqtt-url" in out
+    assert "port" in out
+
+
+def test_cli_help_lists_dashboard():
+    r = CliRunner().invoke(main, ["--help"])
+    assert r.exit_code == 0
+    assert "dashboard" in r.output
