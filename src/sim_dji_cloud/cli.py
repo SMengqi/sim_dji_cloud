@@ -105,5 +105,51 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
     asyncio.run(run())
 
 
+@main.command("play")
+@click.argument("flight_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--mqtt-url", default="tcp://localhost:1883",
+              help="本地 broker，如 tcp://localhost:1883")
+@click.option("--speed", default=1.0, type=float, help="回放速度倍率，默认 1.0")
+@click.option("--start-offset-ms", default=0, type=int, help="跳过开头多少毫秒，默认 0")
+def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int) -> None:
+    from sim_dji_cloud.tools.play_cmd import play_flight
+    raise SystemExit(asyncio.run(play_flight(
+        flight_dir=Path(flight_dir),
+        mqtt_url=mqtt_url,
+        speed=speed,
+        start_offset_ms=start_offset_ms,
+    )))
+
+
+@main.command("list")
+@click.option("--root", default="./recordings", type=click.Path(),
+              help="recordings 根目录")
+def list_cmd(root: str) -> None:
+    from sim_dji_cloud.tools.list_cmd import list_flights
+    raise SystemExit(list_flights(Path(root)))
+
+
+@main.command("repair")
+@click.argument("flight_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--force", is_flag=True, default=False,
+              help="覆盖已存在的 manifest.json")
+def repair_cmd(flight_dir: str, force: bool) -> None:
+    from sim_dji_cloud.tools.repair_cmd import repair_flight
+    raise SystemExit(repair_flight(Path(flight_dir), force=force))
+
+
+@main.command("selfcheck")
+@click.argument("flight_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--tolerance-ms", default=50, type=int)
+@click.option("--report-dir", default=None, type=click.Path())
+def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) -> None:
+    from sim_dji_cloud.tools.selfcheck_cmd import run_selfcheck
+    raise SystemExit(asyncio.run(run_selfcheck(
+        flight_dir=Path(flight_dir),
+        tolerance_ms=tolerance_ms,
+        report_dir=Path(report_dir) if report_dir else None,
+    )))
+
+
 if __name__ == "__main__":
     main()
