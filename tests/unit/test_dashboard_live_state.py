@@ -17,6 +17,8 @@ def test_update_dock_osd_extracts_key_fields():
             "mode_code": 4,
             "cover_state": 1,
             "drone_in_dock": 0,
+            "flighttask_step_code": 1,
+            "drc_state": 2,
             "environment_temperature": 26.4,
             "humidity": 96,
             "wind_speed": 0,
@@ -34,6 +36,8 @@ def test_update_dock_osd_extracts_key_fields():
     assert snap["dock"]["mode_code"] == 4
     assert snap["dock"]["cover_state"] == 1
     assert snap["dock"]["drone_in_dock"] == 0
+    assert snap["dock"]["flighttask_step_code"] == 1
+    assert snap["dock"]["drc_state"] == 2
     assert snap["dock"]["temperature"] == 26.4
     assert snap["dock"]["humidity"] == 96
     assert snap["dock"]["wind_speed"] == 0

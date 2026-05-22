@@ -66,8 +66,10 @@
 
     <div class="card" x-show="state.dock && state.dock.sn">
       <h2>机场 (<span x-text="state.dock.sn"></span>)</h2>
-      <div class="row"><span class="k">mode_code</span><span class="v" x-text="state.dock.mode_code"></span></div>
-      <div class="row"><span class="k">drone_in_dock</span><span class="v" x-text="state.dock.drone_in_dock"></span></div>
+      <div class="row"><span class="k">mode_code</span><span class="v" x-text="enumLabel('dock_mode', state.dock.mode_code)"></span></div>
+      <div class="row"><span class="k">flighttask_step</span><span class="v" x-text="enumLabel('flighttask_step', state.dock.flighttask_step_code)"></span></div>
+      <div class="row"><span class="k">drone_in_dock</span><span class="v" x-text="enumLabel('drone_in_dock', state.dock.drone_in_dock)"></span></div>
+      <div class="row"><span class="k">drc_state</span><span class="v" x-text="enumLabel('drc_state', state.dock.drc_state)"></span></div>
       <div class="row"><span class="k">cover_state</span><span class="v" x-text="state.dock.cover_state"></span></div>
       <div class="row"><span class="k">temperature</span><span class="v" x-text="fmt(state.dock.temperature) + ' °C'"></span></div>
       <div class="row"><span class="k">humidity</span><span class="v" x-text="state.dock.humidity + ' %'"></span></div>
@@ -102,6 +104,20 @@
   </div>
 
 <script>
+const ENUM_MAP = {
+  dock_mode: {
+    0: '空闲中', 1: '现场调试', 2: '远程调试', 3: '固件升级中',
+    4: '作业中', 5: '待标定',
+  },
+  flighttask_step: {
+    0: '作业准备中', 1: '飞行作业中', 2: '作业后状态恢复',
+    3: '自定义飞行区更新中', 4: '地形障碍物更新中', 5: '任务空闲',
+    255: '飞行器异常', 256: '未知状态',
+  },
+  drone_in_dock: { 0: '舱外', 1: '舱内' },
+  drc_state: { 0: '未连接', 1: '连接中', 2: '已连接' },
+};
+
 function dashboard() {
   return {
     connected: false,
@@ -168,6 +184,12 @@ function dashboard() {
       if (v === null || v === undefined) return '-';
       if (typeof v !== 'number') return String(v);
       return v.toFixed(digits);
+    },
+
+    enumLabel(group, v) {
+      if (v === null || v === undefined) return '-';
+      const label = (ENUM_MAP[group] || {})[v];
+      return label ? `${v} (${label})` : String(v);
     },
   };
 }

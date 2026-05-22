@@ -45,6 +45,8 @@ class LiveState:
             "mode_code": data.get("mode_code"),
             "cover_state": data.get("cover_state"),
             "drone_in_dock": data.get("drone_in_dock"),
+            "flighttask_step_code": data.get("flighttask_step_code"),
+            "drc_state": data.get("drc_state"),
             "temperature": data.get("environment_temperature"),
             "humidity": data.get("humidity"),
             "wind_speed": data.get("wind_speed"),

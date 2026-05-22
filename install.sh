@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# sim_dji_cloud Phase 1 — 一键安装脚本
+# sim_dji_cloud — 一键安装脚本（阶段一 Recorder + 阶段二 Player/SelfCheck + Dashboard UI）
 # 用法：bash install.sh   或   ./install.sh
 #
 # 行为：
 # 1) 检查 Python 3.10+ / ffmpeg / mosquitto
 # 2) 创建 .venv（已存在则复用）
-# 3) pip install -e ".[test]"
-# 4) 验证 sim-dji CLI 可调用
+# 3) pip install -e ".[test]" --upgrade（关键：升级以同步新增依赖如 fastapi/uvicorn）
+# 4) 验证 sim-dji CLI 可调用（9 个子命令）
 # 5) 跑单元测试（集成测试需 mosquitto，跳过 OK）
 # 6) 如存在 recorder.yaml，顺手 validate-config
 
@@ -79,9 +79,18 @@ say "  已激活：$(which python3)"
 hr
 
 # ---------- 5. pip install ----------
-say "升级 pip + 安装依赖（editable + test extras）..."
+say "升级 pip + 安装依赖（editable + test extras，--upgrade 以同步新增依赖）..."
 python3 -m pip install --upgrade pip --quiet
-python3 -m pip install -e ".[test]" --quiet
+python3 -m pip install -e ".[test]" --upgrade --upgrade-strategy eager --quiet
+# 兜底：显式校验阶段二 UI 新增依赖在位（防止极老缓存 / 修改 pyproject 后未同步）
+MISSING=()
+for mod in fastapi uvicorn websockets httpx; do
+    python3 -c "import $mod" 2>/dev/null || MISSING+=("$mod")
+done
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+    warn "  以下依赖未装好，强制重装：${MISSING[*]}"
+    python3 -m pip install --force-reinstall "${MISSING[@]}" --quiet
+fi
 say "  依赖安装完成"
 hr
 
@@ -93,7 +102,7 @@ fi
 sim-dji --help >/dev/null 2>&1 || fail "sim-dji --help 执行失败"
 say "  $(which sim-dji)"
 say "  sim-dji 可用，子命令："
-sim-dji --help 2>&1 | grep -E "^  (record|stop-record|inspect|validate-config)" | sed 's/^/    /'
+sim-dji --help 2>&1 | grep -E "^  (record|stop-record|inspect|validate-config|play|list|repair|selfcheck|dashboard)" | sed 's/^/    /'
 hr
 
 # ---------- 7. 单元测试 ----------
@@ -139,5 +148,16 @@ ${G}=== 安装完成 ===${N}
 
 检查录制结果：
   sim-dji inspect ./recordings/<flight_dir>/
+
+回放：
+  sim-dji play ./recordings/<flight_dir>/ --mqtt-url tcp://localhost:1883 --speed 1.0
+
+自检（录-放对称性回归）：
+  sim-dji selfcheck ./recordings/<flight_dir>/ --tolerance-ms 50
+
+可视化仪表盘（headless 服务器友好，浏览器看）：
+  sim-dji dashboard --port 8080
+  # 浏览器访问 http://<server-ip>:8080
+  # 或 SSH 隧道：ssh -L 8080:localhost:8080 <user>@<server>
 
 EOF
