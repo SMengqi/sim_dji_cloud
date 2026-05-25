@@ -53,7 +53,7 @@
   <div class="sidebar">
     <div class="card" x-show="state.drone && state.drone.sn">
       <h2>飞行器 (<span x-text="state.drone.sn"></span>)</h2>
-      <div class="row"><span class="k">mode_code</span><span class="v" x-text="state.drone.mode_code"></span></div>
+      <div class="row"><span class="k">mode_code</span><span class="v" x-text="enumLabel('drone_mode', state.drone.mode_code)"></span></div>
       <div class="row"><span class="k">battery</span><span class="v" x-text="state.drone.battery_pct + '%'"></span></div>
       <div class="row"><span class="k">height</span><span class="v" x-text="fmt(state.drone.height) + ' m'"></span></div>
       <div class="row"><span class="k">home_distance</span><span class="v" x-text="fmt(state.drone.home_distance) + ' m'"></span></div>
@@ -120,6 +120,14 @@ const ENUM_MAP = {
   drc_state: { 0: '未连接', 1: '连接中', 2: '已连接' },
   cover_state: { 0: '关闭', 1: '打开', 2: '半开', 3: '舱盖状态异常' },
   rainfall: { 0: '无雨', 1: '小雨', 2: '中雨', 3: '大雨' },
+  drone_mode: {
+    0: '待机', 1: '起飞准备', 2: '起飞准备完毕', 3: '手动飞行',
+    4: '自动起飞', 5: '航线飞行', 6: '全景拍照', 7: '智能跟随',
+    8: 'ADS-B 躲避', 9: '自动返航', 10: '自动降落', 11: '强制降落',
+    12: '三桨叶降落', 13: '升级中', 14: '未连接', 15: 'APAS',
+    16: '虚拟摇杆状态', 17: '指令飞行', 18: '空中 RTK 收敛模式',
+    19: '机场选址中', 20: 'POI环绕', 21: '进离场航线飞行过程中',
+  },
 };
 
 function dashboard() {
