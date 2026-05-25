@@ -38,6 +38,8 @@
   .events td { padding: 2px 6px; border-bottom: 1px solid #1a1a1a; }
   .topic-counts { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.4; }
   .topic-counts .row { padding: 1px 0; }
+  .drone-icon .drone-rot { width: 48px; height: 48px; transform-origin: center center;
+                           transition: transform 0.25s linear; }
 </style>
 </head>
 <body x-data="dashboard()" x-init="init()">
@@ -130,19 +132,28 @@ const ENUM_MAP = {
   },
 };
 
+// 机头朝向画面正上方（北）。运行时按 attitude_head 旋转整个图标来体现航向。
 const DRONE_ICON_SVG = `
-<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
-  <line x1="8" y1="8" x2="32" y2="32" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
-  <line x1="32" y1="8" x2="8" y2="32" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
-  <circle cx="8" cy="8" r="6" fill="#555" stroke="#000" stroke-width="1"/>
-  <circle cx="32" cy="8" r="6" fill="#555" stroke="#000" stroke-width="1"/>
-  <circle cx="8" cy="32" r="6" fill="#555" stroke="#000" stroke-width="1"/>
-  <circle cx="32" cy="32" r="6" fill="#555" stroke="#000" stroke-width="1"/>
-  <circle cx="8" cy="8" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
-  <circle cx="32" cy="8" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
-  <circle cx="8" cy="32" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
-  <circle cx="32" cy="32" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
-  <circle cx="20" cy="20" r="6" fill="#ff4444" stroke="#000" stroke-width="1"/>
+<svg width="48" height="48" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+  <!-- 机头方向指示（forward = up） -->
+  <polygon points="24,2 31,16 17,16" fill="#ff3b30" stroke="#000" stroke-width="0.8"/>
+  <!-- 机臂 -->
+  <line x1="14" y1="14" x2="34" y2="34" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="34" y1="14" x2="14" y2="34" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- 前桨（高亮，朝机头方向） -->
+  <circle cx="14" cy="14" r="6" fill="#ff6b5e" stroke="#000" stroke-width="1"/>
+  <circle cx="34" cy="14" r="6" fill="#ff6b5e" stroke="#000" stroke-width="1"/>
+  <!-- 后桨 -->
+  <circle cx="14" cy="34" r="6" fill="#666" stroke="#000" stroke-width="1"/>
+  <circle cx="34" cy="34" r="6" fill="#666" stroke="#000" stroke-width="1"/>
+  <!-- 桨叶虚线 -->
+  <circle cx="14" cy="14" r="4" fill="none" stroke="#fff" stroke-width="0.7" stroke-dasharray="2 2"/>
+  <circle cx="34" cy="14" r="4" fill="none" stroke="#fff" stroke-width="0.7" stroke-dasharray="2 2"/>
+  <circle cx="14" cy="34" r="4" fill="none" stroke="#aaa" stroke-width="0.7" stroke-dasharray="2 2"/>
+  <circle cx="34" cy="34" r="4" fill="none" stroke="#aaa" stroke-width="0.7" stroke-dasharray="2 2"/>
+  <!-- 机身 -->
+  <circle cx="24" cy="24" r="6" fill="#1a1a1a" stroke="#000" stroke-width="1"/>
+  <circle cx="24" cy="24" r="2.5" fill="#ff3b30"/>
 </svg>`;
 
 const START_MARKER_HTML = `
@@ -160,7 +171,6 @@ function dashboard() {
     droneMarker: null,
     droneIcon: null,
     trailLayer: null,
-    homeMarker: null,
     startMarker: null,
     startIcon: null,
 
@@ -177,9 +187,9 @@ function dashboard() {
       this.trailLayer = L.polyline([], { color: '#7cffaa', weight: 3, opacity: 0.9 }).addTo(this.map);
       this.droneIcon = L.divIcon({
         className: 'drone-icon',
-        html: DRONE_ICON_SVG,
-        iconSize: [40, 40],
-        iconAnchor: [20, 20],
+        html: `<div class="drone-rot">${DRONE_ICON_SVG}</div>`,
+        iconSize: [48, 48],
+        iconAnchor: [24, 24],
       });
       this.startIcon = L.divIcon({
         className: 'start-icon',
@@ -223,12 +233,20 @@ function dashboard() {
         } else {
           this.droneMarker.setLatLng(latest);
         }
+        this.applyDroneHeading();
       }
-      const dock = this.state.dock || {};
-      if (dock.latitude && dock.longitude && !this.homeMarker) {
-        this.homeMarker = L.marker([dock.latitude, dock.longitude],
-          { title: 'dock' }).addTo(this.map);
-      }
+    },
+
+    // 按航向角旋转飞行器图标，使机头指向真实飞行方向。
+    // attitude_head 为相对正北顺时针的角度，CSS rotate 正向亦为顺时针，地图正北朝上，可直接套用。
+    applyDroneHeading() {
+      if (!this.droneMarker) return;
+      const head = this.state.drone && this.state.drone.attitude_head;
+      if (typeof head !== 'number' || Number.isNaN(head)) return;
+      const el = this.droneMarker.getElement();
+      if (!el) return;
+      const rot = el.querySelector('.drone-rot');
+      if (rot) rot.style.transform = `rotate(${head}deg)`;
     },
 
     fmt(v, digits = 1) {
