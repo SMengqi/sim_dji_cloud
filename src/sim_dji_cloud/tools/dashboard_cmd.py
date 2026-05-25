@@ -5,7 +5,7 @@ from loguru import logger
 
 from sim_dji_cloud.dashboard import create_app, LiveState, MqttSubscriber
 from sim_dji_cloud.dashboard.flight_area import (
-    load_flight_area, parse_png_bounds, parse_png_bounds_latlon,
+    load_flight_area, parse_png_bounds, parse_png_bounds_latlon, read_sidecar_bounds,
 )
 
 
@@ -29,10 +29,15 @@ def run_dashboard(
     flight_area = None
     if flight_area_xml:
         try:
+            utm = parse_png_bounds(flight_area_png_bounds)
+            latlon = parse_png_bounds_latlon(flight_area_png_bounds_latlon)
+            # 都没传时，回退读取 PNG 旁的 sidecar <png>.bounds（校准产出，固化对位）
+            if utm is None and latlon is None and flight_area_png:
+                latlon = read_sidecar_bounds(Path(flight_area_png))
+                if latlon is not None:
+                    logger.info("PNG 边界自 sidecar 读取：{}.bounds", Path(flight_area_png).name)
             flight_area = load_flight_area(
-                Path(flight_area_xml),
-                png_bounds_utm=parse_png_bounds(flight_area_png_bounds),
-                png_bounds_latlon=parse_png_bounds_latlon(flight_area_png_bounds_latlon))
+                Path(flight_area_xml), png_bounds_utm=utm, png_bounds_latlon=latlon)
             logger.info("flight area loaded: {} 个区域", len(flight_area["areas"]["features"]))
         except Exception:
             logger.exception("加载飞行区失败；dashboard 将不带叠加运行")

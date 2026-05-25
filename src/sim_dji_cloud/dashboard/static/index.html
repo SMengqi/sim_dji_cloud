@@ -266,7 +266,9 @@ function dashboard() {
       panel.innerHTML = '<b style="color:#fff;">PNG 校准</b> 拖 SW/NE 角缩放 · 拖 ✛ 平移<br>'
         + '<span style="color:#888;">--flight-area-png-bounds-latlon</span> '
         + '"<span id="calibval" style="color:#0f0;"></span>" '
-        + '<button id="calibcopy" style="cursor:pointer;margin-left:4px;">复制</button>';
+        + '<button id="calibcopy" style="cursor:pointer;margin-left:4px;">复制</button>'
+        + '<br><span style="color:#888;">永久固定：把这串写入 PNG 同名 .bounds 文件'
+        + '（如 东方理工新区背景.png.bounds），下次启动自动读取</span>';
       document.body.appendChild(panel);
       const valEl = panel.querySelector('#calibval');
       panel.querySelector('#calibcopy').onclick = () => {

@@ -167,7 +167,8 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
 @click.option("--flight-area-png-bounds", default=None,
               help="PNG 地理边界 UTM 'minx,miny,maxx,maxy'，用于校准；缺省取 XML utm_min/max")
 @click.option("--flight-area-png-bounds-latlon", default=None,
-              help="PNG 地理边界经纬度 'swLat,swLng,neLat,neLng'（校准模式产出，直接粘贴）；优先级高于 UTM")
+              help="PNG 地理边界经纬度 'swLat,swLng,neLat,neLng'（校准模式产出）；优先级最高。"
+                   "也可写入 PNG 同名 '.bounds' 文件，未传参时自动读取")
 def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
                   flight_area_xml: str | None, flight_area_png: str | None,
                   flight_area_png_bounds: str | None,

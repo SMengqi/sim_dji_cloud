@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from sim_dji_cloud.dashboard.flight_area import (
-    load_flight_area, parse_png_bounds, parse_png_bounds_latlon,
+    load_flight_area, parse_png_bounds, parse_png_bounds_latlon, read_sidecar_bounds,
 )
 
 # 合成 XML：2 个区域（1 限制区 + 1 作业区）、2 个 points 块、
@@ -145,3 +145,16 @@ def test_parse_png_bounds_latlon():
 def test_parse_png_bounds_latlon_bad():
     with pytest.raises(ValueError):
         parse_png_bounds_latlon("1,2,3")
+
+
+def test_read_sidecar_bounds(tmp_path):
+    png = tmp_path / "bg.png"
+    png.write_bytes(b"x")
+    (tmp_path / "bg.png.bounds").write_text("29.92,121.65,29.93,121.67\n", encoding="utf-8")
+    assert read_sidecar_bounds(png) == (29.92, 121.65, 29.93, 121.67)
+
+
+def test_read_sidecar_bounds_missing(tmp_path):
+    # 无 sidecar / png_path 为 None 都返回 None
+    assert read_sidecar_bounds(tmp_path / "nope.png") is None
+    assert read_sidecar_bounds(None) is None

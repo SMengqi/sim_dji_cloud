@@ -39,6 +39,20 @@ def parse_png_bounds_latlon(s: str | None) -> tuple[float, float, float, float] 
     return _parse_4floats(s, "swLat,swLng,neLat,neLng")
 
 
+def read_sidecar_bounds(png_path: Path | None) -> tuple[float, float, float, float] | None:
+    """读取 PNG 旁的 sidecar '<png>.bounds'（单行 swLat,swLng,neLat,neLng）。
+
+    校准模式产出的经纬度边界可写入该文件，启动时自动读取，免去每次传参。
+    文件不存在返回 None；内容格式错误则由 parse_png_bounds_latlon 抛出。
+    """
+    if png_path is None:
+        return None
+    sidecar = Path(str(png_path) + ".bounds")
+    if not sidecar.exists():
+        return None
+    return parse_png_bounds_latlon(sidecar.read_text(encoding="utf-8").strip())
+
+
 def load_flight_area(
     xml_path: Path,
     png_bounds_utm: tuple[float, float, float, float] | None = None,
