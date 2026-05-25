@@ -1,3 +1,4 @@
+import base64
 from fastapi.testclient import TestClient
 from sim_dji_cloud.dashboard.live_state import LiveState
 from sim_dji_cloud.dashboard.api import create_app
@@ -54,3 +55,62 @@ def test_websocket_pushes_snapshot():
         frame = ws.receive_json()
         assert "drone" in frame
         assert frame["drone"]["mode_code"] == 7
+
+
+# 1x1 透明 PNG，用于测试 PNG 端点
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _sample_flight_area():
+    return {
+        "png_bounds": [[0.0, 123.0], [0.001, 123.001]],
+        "areas": {"type": "FeatureCollection", "features": [
+            {"type": "Feature",
+             "geometry": {"type": "Polygon",
+                          "coordinates": [[[123.0, 0.0], [123.001, 0.0], [123.0, 0.001], [123.0, 0.0]]]},
+             "properties": {"id": 1000, "kind": "restriction", "height_limit": 120, "name": "禁飞区A"}},
+        ]},
+    }
+
+
+def test_flight_area_unconfigured():
+    app = create_app(LiveState())
+    client = TestClient(app)
+    r = client.get("/api/flight-area")
+    assert r.status_code == 200
+    assert r.json() == {"configured": False}
+    # PNG 未配置 -> 404
+    assert client.get("/api/flight-area/background.png").status_code == 404
+
+
+def test_flight_area_configured(tmp_path):
+    png = tmp_path / "bg.png"
+    png.write_bytes(_PNG_1X1)
+    app = create_app(LiveState(), flight_area=_sample_flight_area(), flight_area_png=png)
+    client = TestClient(app)
+
+    r = client.get("/api/flight-area")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["configured"] is True
+    assert body["png_url"] == "/api/flight-area/background.png"
+    assert body["png_bounds"] == [[0.0, 123.0], [0.001, 123.001]]
+    assert body["areas"]["features"][0]["properties"]["kind"] == "restriction"
+
+    img = client.get("/api/flight-area/background.png")
+    assert img.status_code == 200
+    assert "image/png" in img.headers["content-type"]
+    assert img.headers["cache-control"] == "public, max-age=86400"
+    assert img.content == _PNG_1X1
+
+
+def test_flight_area_configured_without_png():
+    # 提供了区域但没给 PNG：不应广告 png_url，PNG 端点仍 404
+    app = create_app(LiveState(), flight_area=_sample_flight_area(), flight_area_png=None)
+    client = TestClient(app)
+    body = client.get("/api/flight-area").json()
+    assert body["configured"] is True
+    assert "png_url" not in body
+    assert client.get("/api/flight-area/background.png").status_code == 404

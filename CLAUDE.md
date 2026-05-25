@@ -121,4 +121,5 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 | `../2026-05-19-sim-dji-cloud-phase1-prp.md` | Phase 1 plan |
 | `../2026-05-21-sim-dji-cloud-phase2-prp.md` | Phase 2 plan (Player + SelfCheck) |
 | `../2026-05-22-sim-dji-cloud-phase2-ui-prp.md` | Phase 2 UI plan (dashboard) |
+| `../2026-05-25-sim-dji-cloud-flight-area-overlay-design.md` | Flight-area XML + PNG overlay on dashboard map (design) |
 | `../2026-05-21-sim-dji-cloud-operations-manual.md` | **End-user operations manual — first stop for "how do I run X"** |

@@ -174,16 +174,14 @@ function dashboard() {
     startMarker: null,
     startIcon: null,
 
-    init() {
+    async init() {
       this.initMap();
+      await this.loadFlightArea();
       this.connectWS();
     },
 
     initMap() {
       this.map = L.map('map', { zoomControl: true }).setView([29.92, 121.66], 18);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap', maxZoom: 19,
-      }).addTo(this.map);
       this.trailLayer = L.polyline([], { color: '#7cffaa', weight: 3, opacity: 0.9 }).addTo(this.map);
       this.droneIcon = L.divIcon({
         className: 'drone-icon',
@@ -197,6 +195,47 @@ function dashboard() {
         iconSize: [28, 28],
         iconAnchor: [14, 14],
       });
+    },
+
+    addOsmBase() {
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap', maxZoom: 19,
+      }).addTo(this.map);
+    },
+
+    async loadFlightArea() {
+      let fa = null;
+      try {
+        const r = await fetch('/api/flight-area');
+        fa = await r.json();
+      } catch (e) { fa = null; }
+
+      if (fa && fa.configured) {
+        if (fa.png_url) {
+          // PNG 作为离线底图
+          L.imageOverlay(fa.png_url, fa.png_bounds, { opacity: 1 }).addTo(this.map);
+        } else {
+          // 配置了区域但没有 PNG：用 OSM 作底图
+          this.addOsmBase();
+        }
+        // 区域多边形：限制区红、作业区蓝
+        L.geoJSON(fa.areas, {
+          style: (f) => f.properties.kind === 'restriction'
+            ? { color: '#ff4444', weight: 2, fillColor: '#ff4444', fillOpacity: 0.15 }
+            : { color: '#3388ff', weight: 1.5, fillColor: '#3388ff', fillOpacity: 0.10 },
+          onEachFeature: (f, layer) => {
+            const p = f.properties;
+            const hl = (p.height_limit != null && p.height_limit > 0)
+              ? `限高 ${p.height_limit} m` : '无限高';
+            const label = p.kind === 'restriction' ? '限制区' : '作业区';
+            layer.bindPopup(`${label} ${p.id}<br>${p.name || ''}<br>${hl}`);
+          },
+        }).addTo(this.map);
+        if (fa.png_bounds) this.map.fitBounds(fa.png_bounds);
+      } else {
+        // 未配置飞行区 -> 回退 OSM 在线底图（保持现有行为）
+        this.addOsmBase();
+      }
     },
 
     connectWS() {

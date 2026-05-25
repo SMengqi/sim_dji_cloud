@@ -31,3 +31,7 @@ recordings/
 .env
 .venv
 venv/
+
+# flight-area local site data (large binaries)
+东方理工新区_*.xml
+*背景.png
