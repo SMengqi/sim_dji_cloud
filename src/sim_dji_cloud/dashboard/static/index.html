@@ -130,6 +130,27 @@ const ENUM_MAP = {
   },
 };
 
+const DRONE_ICON_SVG = `
+<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+  <line x1="8" y1="8" x2="32" y2="32" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="32" y1="8" x2="8" y2="32" stroke="#222" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="8" cy="8" r="6" fill="#555" stroke="#000" stroke-width="1"/>
+  <circle cx="32" cy="8" r="6" fill="#555" stroke="#000" stroke-width="1"/>
+  <circle cx="8" cy="32" r="6" fill="#555" stroke="#000" stroke-width="1"/>
+  <circle cx="32" cy="32" r="6" fill="#555" stroke="#000" stroke-width="1"/>
+  <circle cx="8" cy="8" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
+  <circle cx="32" cy="8" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
+  <circle cx="8" cy="32" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
+  <circle cx="32" cy="32" r="4" fill="none" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
+  <circle cx="20" cy="20" r="6" fill="#ff4444" stroke="#000" stroke-width="1"/>
+</svg>`;
+
+const START_MARKER_HTML = `
+<div style="background:#1a8c1a;color:#fff;width:28px;height:28px;border-radius:50%;
+            display:flex;align-items:center;justify-content:center;
+            font-weight:bold;font-size:14px;border:2px solid #fff;
+            box-shadow:0 1px 3px rgba(0,0,0,0.5);font-family:sans-serif;">起</div>`;
+
 function dashboard() {
   return {
     connected: false,
@@ -137,8 +158,11 @@ function dashboard() {
     state: { dock: {}, drone: {}, drone_trail: [], events: [], topic_counts: {} },
     map: null,
     droneMarker: null,
+    droneIcon: null,
     trailLayer: null,
     homeMarker: null,
+    startMarker: null,
+    startIcon: null,
 
     init() {
       this.initMap();
@@ -150,7 +174,19 @@ function dashboard() {
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap', maxZoom: 19,
       }).addTo(this.map);
-      this.trailLayer = L.polyline([], { color: '#ffaa00', weight: 3 }).addTo(this.map);
+      this.trailLayer = L.polyline([], { color: '#7cffaa', weight: 3, opacity: 0.9 }).addTo(this.map);
+      this.droneIcon = L.divIcon({
+        className: 'drone-icon',
+        html: DRONE_ICON_SVG,
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
+      });
+      this.startIcon = L.divIcon({
+        className: 'start-icon',
+        html: START_MARKER_HTML,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      });
     },
 
     connectWS() {
@@ -175,11 +211,14 @@ function dashboard() {
       const trail = this.state.drone_trail || [];
       if (trail.length) {
         this.trailLayer.setLatLngs(trail);
+        if (!this.startMarker) {
+          this.startMarker = L.marker(trail[0],
+            { icon: this.startIcon, title: '起飞点', zIndexOffset: 500 }).addTo(this.map);
+        }
         const latest = trail[trail.length - 1];
         if (!this.droneMarker) {
-          this.droneMarker = L.circleMarker(latest, {
-            radius: 8, color: '#ff5555', fillColor: '#ff5555', fillOpacity: 0.7,
-          }).addTo(this.map);
+          this.droneMarker = L.marker(latest,
+            { icon: this.droneIcon, title: '飞行器', zIndexOffset: 1000 }).addTo(this.map);
           this.map.setView(latest, 18);
         } else {
           this.droneMarker.setLatLng(latest);
