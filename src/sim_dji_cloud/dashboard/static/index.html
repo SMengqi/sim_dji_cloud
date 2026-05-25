@@ -55,31 +55,31 @@
   <div class="sidebar">
     <div class="card" x-show="state.drone && state.drone.sn">
       <h2>飞行器 (<span x-text="state.drone.sn"></span>)</h2>
-      <div class="row"><span class="k">mode_code</span><span class="v" x-text="enumLabel('drone_mode', state.drone.mode_code)"></span></div>
-      <div class="row"><span class="k">battery</span><span class="v" x-text="state.drone.battery_pct + '%'"></span></div>
-      <div class="row"><span class="k">height</span><span class="v" x-text="fmt(state.drone.height) + ' m'"></span></div>
-      <div class="row"><span class="k">home_distance</span><span class="v" x-text="fmt(state.drone.home_distance) + ' m'"></span></div>
-      <div class="row"><span class="k">h_speed</span><span class="v" x-text="fmt(state.drone.horizontal_speed) + ' m/s'"></span></div>
-      <div class="row"><span class="k">v_speed</span><span class="v" x-text="fmt(state.drone.vertical_speed) + ' m/s'"></span></div>
-      <div class="row"><span class="k">heading</span><span class="v" x-text="fmt(state.drone.attitude_head) + '°'"></span></div>
-      <div class="row"><span class="k">GPS / RTK</span><span class="v" x-text="(state.drone.gps_satellites || 0) + ' / ' + (state.drone.rtk_satellites || 0)"></span></div>
-      <div class="row"><span class="k">lat, lon</span><span class="v" x-text="fmt(state.drone.latitude, 5) + ', ' + fmt(state.drone.longitude, 5)"></span></div>
+      <div class="row"><span class="k">飞行模式</span><span class="v" x-text="enumLabel('drone_mode', state.drone.mode_code)"></span></div>
+      <div class="row"><span class="k">电量</span><span class="v" x-text="state.drone.battery_pct + '%'"></span></div>
+      <div class="row"><span class="k">飞行高度</span><span class="v" x-text="fmt(state.drone.height) + ' m'"></span></div>
+      <div class="row"><span class="k">距返航点</span><span class="v" x-text="fmt(state.drone.home_distance) + ' m'"></span></div>
+      <div class="row"><span class="k">水平速度</span><span class="v" x-text="fmt(state.drone.horizontal_speed) + ' m/s'"></span></div>
+      <div class="row"><span class="k">垂直速度</span><span class="v" x-text="fmt(state.drone.vertical_speed) + ' m/s'"></span></div>
+      <div class="row"><span class="k">航向角</span><span class="v" x-text="fmt(state.drone.attitude_head) + '°'"></span></div>
+      <div class="row"><span class="k">卫星数(GPS/RTK)</span><span class="v" x-text="(state.drone.gps_satellites || 0) + ' / ' + (state.drone.rtk_satellites || 0)"></span></div>
+      <div class="row"><span class="k">经纬度</span><span class="v" x-text="fmt(state.drone.latitude, 5) + ', ' + fmt(state.drone.longitude, 5)"></span></div>
     </div>
 
     <div class="card" x-show="state.dock && state.dock.sn">
       <h2>机场 (<span x-text="state.dock.sn"></span>)</h2>
-      <div class="row"><span class="k">mode_code</span><span class="v" x-text="enumLabel('dock_mode', state.dock.mode_code)"></span></div>
-      <div class="row"><span class="k">flighttask_step</span><span class="v" x-text="enumLabel('flighttask_step', state.dock.flighttask_step_code)"></span></div>
-      <div class="row"><span class="k">drone_in_dock</span><span class="v" x-text="enumLabel('drone_in_dock', state.dock.drone_in_dock)"></span></div>
-      <div class="row"><span class="k">drc_state</span><span class="v" x-text="enumLabel('drc_state', state.dock.drc_state)"></span></div>
-      <div class="row"><span class="k">cover_state</span><span class="v" x-text="enumLabel('cover_state', state.dock.cover_state)"></span></div>
+      <div class="row"><span class="k">工作模式</span><span class="v" x-text="enumLabel('dock_mode', state.dock.mode_code)"></span></div>
+      <div class="row"><span class="k">任务阶段</span><span class="v" x-text="enumLabel('flighttask_step', state.dock.flighttask_step_code)"></span></div>
+      <div class="row"><span class="k">飞行器位置</span><span class="v" x-text="enumLabel('drone_in_dock', state.dock.drone_in_dock)"></span></div>
+      <div class="row"><span class="k">DRC 连接状态</span><span class="v" x-text="enumLabel('drc_state', state.dock.drc_state)"></span></div>
+      <div class="row"><span class="k">舱盖状态</span><span class="v" x-text="enumLabel('cover_state', state.dock.cover_state)"></span></div>
       <div class="row"><span class="k">环境温度</span><span class="v" x-text="fmt(state.dock.environment_temperature) + ' °C'"></span></div>
       <div class="row"><span class="k">舱内温度</span><span class="v" x-text="fmt(state.dock.temperature) + ' °C'"></span></div>
       <div class="row"><span class="k">舱内湿度</span><span class="v" x-text="fmt(state.dock.humidity) + ' %RH'"></span></div>
       <div class="row"><span class="k">风速</span><span class="v" x-text="fmt(state.dock.wind_speed) + ' m/s'"></span></div>
       <div class="row"><span class="k">降雨量</span><span class="v" x-text="enumLabel('rainfall', state.dock.rainfall)"></span></div>
-      <div class="row"><span class="k">network quality</span><span class="v" x-text="state.dock.network_quality"></span></div>
-      <div class="row"><span class="k">paired drone</span><span class="v" x-text="state.dock.paired_drone_sn || '-'"></span></div>
+      <div class="row"><span class="k">网络质量</span><span class="v" x-text="state.dock.network_quality"></span></div>
+      <div class="row"><span class="k">配对飞行器</span><span class="v" x-text="state.dock.paired_drone_sn || '-'"></span></div>
     </div>
 
     <div class="card">
