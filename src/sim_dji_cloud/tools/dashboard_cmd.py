@@ -4,7 +4,9 @@ import uvicorn
 from loguru import logger
 
 from sim_dji_cloud.dashboard import create_app, LiveState, MqttSubscriber
-from sim_dji_cloud.dashboard.flight_area import load_flight_area, parse_png_bounds
+from sim_dji_cloud.dashboard.flight_area import (
+    load_flight_area, parse_png_bounds, parse_png_bounds_latlon,
+)
 
 
 def run_dashboard(
@@ -15,6 +17,7 @@ def run_dashboard(
     flight_area_xml: str | None = None,
     flight_area_png: str | None = None,
     flight_area_png_bounds: str | None = None,
+    flight_area_png_bounds_latlon: str | None = None,
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -27,7 +30,9 @@ def run_dashboard(
     if flight_area_xml:
         try:
             flight_area = load_flight_area(
-                Path(flight_area_xml), parse_png_bounds(flight_area_png_bounds))
+                Path(flight_area_xml),
+                png_bounds_utm=parse_png_bounds(flight_area_png_bounds),
+                png_bounds_latlon=parse_png_bounds_latlon(flight_area_png_bounds_latlon))
             logger.info("flight area loaded: {} 个区域", len(flight_area["areas"]["features"]))
         except Exception:
             logger.exception("加载飞行区失败；dashboard 将不带叠加运行")

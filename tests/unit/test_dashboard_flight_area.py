@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from sim_dji_cloud.dashboard.flight_area import load_flight_area, parse_png_bounds
+from sim_dji_cloud.dashboard.flight_area import (
+    load_flight_area, parse_png_bounds, parse_png_bounds_latlon,
+)
 
 # 合成 XML：2 个区域（1 限制区 + 1 作业区）、2 个 points 块、
 # 以及 block_level/block 干扰项（必须被忽略）。
@@ -124,3 +126,22 @@ def test_parse_png_bounds():
 def test_parse_png_bounds_bad():
     with pytest.raises(ValueError):
         parse_png_bounds("1,2,3")
+
+
+def test_png_bounds_latlon_override(tmp_path):
+    # 直接给经纬度边界（校准模式产出）应原样返回，不走 UTM 换算
+    fa = load_flight_area(_write(tmp_path), png_bounds_latlon=(29.92, 121.65, 29.93, 121.67))
+    assert fa["png_bounds"] == [[29.92, 121.65], [29.93, 121.67]]
+    # 多边形仍正常解析
+    assert len(fa["areas"]["features"]) == 2
+
+
+def test_parse_png_bounds_latlon():
+    assert parse_png_bounds_latlon(None) is None
+    assert parse_png_bounds_latlon("") is None
+    assert parse_png_bounds_latlon("29.92,121.65,29.93,121.67") == (29.92, 121.65, 29.93, 121.67)
+
+
+def test_parse_png_bounds_latlon_bad():
+    with pytest.raises(ValueError):
+        parse_png_bounds_latlon("1,2,3")

@@ -19,19 +19,30 @@ _WGS84_EPSG = "EPSG:4326"
 _AREA_TAGS = {"restriction_area": "restriction", "ground_area": "ground"}
 
 
-def parse_png_bounds(s: str | None) -> tuple[float, float, float, float] | None:
-    """把 CLI 字符串 'minx,miny,maxx,maxy'(UTM) 解析为元组；空值返回 None。"""
+def _parse_4floats(s: str | None, fmt: str) -> tuple[float, float, float, float] | None:
+    """把逗号分隔的 4 个数值解析为元组；空值返回 None；个数不对则报错。"""
     if not s:
         return None
     parts = [p.strip() for p in s.split(",")]
     if len(parts) != 4:
-        raise ValueError("png bounds 必须是 'minx,miny,maxx,maxy' 四个 UTM 数值")
+        raise ValueError(f"必须是 4 个数值 '{fmt}'")
     return (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+
+
+def parse_png_bounds(s: str | None) -> tuple[float, float, float, float] | None:
+    """CLI 'minx,miny,maxx,maxy'(UTM) -> 元组；空值返回 None。"""
+    return _parse_4floats(s, "minx,miny,maxx,maxy")
+
+
+def parse_png_bounds_latlon(s: str | None) -> tuple[float, float, float, float] | None:
+    """CLI 'swLat,swLng,neLat,neLng'(WGS84) -> 元组；空值返回 None。"""
+    return _parse_4floats(s, "swLat,swLng,neLat,neLng")
 
 
 def load_flight_area(
     xml_path: Path,
     png_bounds_utm: tuple[float, float, float, float] | None = None,
+    png_bounds_latlon: tuple[float, float, float, float] | None = None,
 ) -> dict:
     """解析飞行区 XML，返回 {png_bounds: [[swLat,swLng],[neLat,neLng]], areas: GeoJSON}。"""
     xml_path = Path(xml_path)
@@ -115,14 +126,20 @@ def load_flight_area(
             },
         })
 
-    minx, miny, maxx, maxy = (
-        png_bounds_utm if png_bounds_utm is not None
-        else (utm_min[0], utm_min[1], utm_max[0], utm_max[1])
-    )
-    sw_lon, sw_lat = transformer.transform(minx, miny)
-    ne_lon, ne_lat = transformer.transform(maxx, maxy)
+    if png_bounds_latlon is not None:
+        # 直接给定经纬度边界（校准模式产出），跳过 UTM 换算
+        sw_lat, sw_lon, ne_lat, ne_lon = png_bounds_latlon
+        png_bounds = [[sw_lat, sw_lon], [ne_lat, ne_lon]]
+    else:
+        minx, miny, maxx, maxy = (
+            png_bounds_utm if png_bounds_utm is not None
+            else (utm_min[0], utm_min[1], utm_max[0], utm_max[1])
+        )
+        sw_lon, sw_lat = transformer.transform(minx, miny)
+        ne_lon, ne_lat = transformer.transform(maxx, maxy)
+        png_bounds = [[sw_lat, sw_lon], [ne_lat, ne_lon]]
 
     return {
-        "png_bounds": [[sw_lat, sw_lon], [ne_lat, ne_lon]],
+        "png_bounds": png_bounds,
         "areas": {"type": "FeatureCollection", "features": features},
     }

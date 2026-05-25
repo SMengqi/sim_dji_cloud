@@ -173,6 +173,7 @@ function dashboard() {
     trailLayer: null,
     startMarker: null,
     startIcon: null,
+    pngOverlay: null,
 
     async init() {
       this.initMap();
@@ -213,7 +214,7 @@ function dashboard() {
       if (fa && fa.configured) {
         if (fa.png_url) {
           // PNG 作为离线底图
-          L.imageOverlay(fa.png_url, fa.png_bounds, { opacity: 1 }).addTo(this.map);
+          this.pngOverlay = L.imageOverlay(fa.png_url, fa.png_bounds, { opacity: 1 }).addTo(this.map);
         } else {
           // 配置了区域但没有 PNG：用 OSM 作底图
           this.addOsmBase();
@@ -232,10 +233,63 @@ function dashboard() {
           },
         }).addTo(this.map);
         if (fa.png_bounds) this.map.fitBounds(fa.png_bounds);
+        // ?calibrate=1 进入 PNG 对位校准（拖角缩放、拖中心平移、实时输出边界串）
+        const calibrate = new URLSearchParams(location.search).get('calibrate') === '1';
+        if (calibrate && this.pngOverlay && fa.png_bounds) this.startCalibration(fa.png_bounds);
       } else {
         // 未配置飞行区 -> 回退 OSM 在线底图（保持现有行为）
         this.addOsmBase();
       }
+    },
+
+    // PNG 对位校准：拖 SW/NE 角调缩放（含东西/南北独立），拖 ✛ 平移整体；
+    // 实时 setBounds 并显示可直接粘贴的 --flight-area-png-bounds-latlon 串。
+    startCalibration(bounds) {
+      let sw = L.latLng(bounds[0][0], bounds[0][1]);
+      let ne = L.latLng(bounds[1][0], bounds[1][1]);
+
+      const mkIcon = (txt, color) => L.divIcon({
+        className: 'calib-icon',
+        html: `<div style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;`
+            + `font:bold 12px sans-serif;border:1px solid #fff;white-space:nowrap;`
+            + `box-shadow:0 1px 3px rgba(0,0,0,.5);">${txt}</div>`,
+      });
+      const swM = L.marker(sw, { draggable: true, icon: mkIcon('SW ↙', '#e67e22'), zIndexOffset: 2000 }).addTo(this.map);
+      const neM = L.marker(ne, { draggable: true, icon: mkIcon('NE ↗', '#e67e22'), zIndexOffset: 2000 }).addTo(this.map);
+      let center = L.latLng((sw.lat + ne.lat) / 2, (sw.lng + ne.lng) / 2);
+      const moveM = L.marker(center, { draggable: true, icon: mkIcon('✛ 移动', '#8e44ad'), zIndexOffset: 2000 }).addTo(this.map);
+
+      const panel = document.createElement('div');
+      panel.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:1000;background:#0a0a0a;'
+        + 'color:#0f0;font:12px ui-monospace,monospace;padding:10px 12px;border:1px solid #333;'
+        + 'border-radius:6px;max-width:540px;line-height:1.6;';
+      panel.innerHTML = '<b style="color:#fff;">PNG 校准</b> 拖 SW/NE 角缩放 · 拖 ✛ 平移<br>'
+        + '<span style="color:#888;">--flight-area-png-bounds-latlon</span> '
+        + '"<span id="calibval" style="color:#0f0;"></span>" '
+        + '<button id="calibcopy" style="cursor:pointer;margin-left:4px;">复制</button>';
+      document.body.appendChild(panel);
+      const valEl = panel.querySelector('#calibval');
+      panel.querySelector('#calibcopy').onclick = () => {
+        if (navigator.clipboard) navigator.clipboard.writeText(`"${valEl.textContent}"`);
+      };
+
+      const apply = () => {
+        this.pngOverlay.setBounds(L.latLngBounds(sw, ne));
+        valEl.textContent = `${sw.lat.toFixed(6)},${sw.lng.toFixed(6)},${ne.lat.toFixed(6)},${ne.lng.toFixed(6)}`;
+      };
+
+      swM.on('drag', (e) => { sw = e.latlng; apply(); });
+      neM.on('drag', (e) => { ne = e.latlng; apply(); });
+      moveM.on('drag', (e) => {
+        const d = e.latlng;
+        const dLat = d.lat - center.lat, dLng = d.lng - center.lng;
+        sw = L.latLng(sw.lat + dLat, sw.lng + dLng);
+        ne = L.latLng(ne.lat + dLat, ne.lng + dLng);
+        center = d;
+        swM.setLatLng(sw); neM.setLatLng(ne);
+        apply();
+      });
+      apply();
     },
 
     connectWS() {
