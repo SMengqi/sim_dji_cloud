@@ -20,6 +20,7 @@ def test_update_dock_osd_extracts_key_fields():
             "flighttask_step_code": 1,
             "drc_state": 2,
             "environment_temperature": 26.4,
+            "temperature": 21.7,
             "humidity": 96,
             "wind_speed": 0,
             "rainfall": 0,
@@ -38,9 +39,11 @@ def test_update_dock_osd_extracts_key_fields():
     assert snap["dock"]["drone_in_dock"] == 0
     assert snap["dock"]["flighttask_step_code"] == 1
     assert snap["dock"]["drc_state"] == 2
-    assert snap["dock"]["temperature"] == 26.4
+    assert snap["dock"]["environment_temperature"] == 26.4
+    assert snap["dock"]["temperature"] == 21.7
     assert snap["dock"]["humidity"] == 96
     assert snap["dock"]["wind_speed"] == 0
+    assert snap["dock"]["rainfall"] == 0
     assert snap["dock"]["network_quality"] == 0
     assert snap["dock"]["latitude"] == 29.92
     assert snap["dock"]["longitude"] == 121.66
@@ -156,7 +159,9 @@ def test_partial_dock_osd_preserves_previous_fields():
             "drone_in_dock": 0,
             "cover_state": 1,
             "environment_temperature": 26.4,
+            "temperature": 21.5,
             "humidity": 96,
+            "rainfall": 0,
             "sub_device": {"device_sn": "SN_DRONE"},
         },
     }, recv_ts_ms=1000)
@@ -176,8 +181,10 @@ def test_partial_dock_osd_preserves_previous_fields():
     assert dock["mode_code"] == 4
     assert dock["flighttask_step_code"] == 1, "应保留上次值而非清空成 None"
     assert dock["drc_state"] == 2, "应保留上次值而非清空成 None"
+    assert dock["rainfall"] == 0, "应保留上次值而非清空成 None"
+    assert dock["temperature"] == 21.5, "舱内温度未上报时应保留上次值"
     assert dock["paired_drone_sn"] == "SN_DRONE", "sub_device 缺失时应保留"
-    assert dock["temperature"] == 26.5, "新值应覆盖"
+    assert dock["environment_temperature"] == 26.5, "新值应覆盖"
     assert dock["last_recv_ts_ms"] == 2000
 
 

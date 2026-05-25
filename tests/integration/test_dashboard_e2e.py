@@ -59,7 +59,7 @@ async def test_dashboard_receives_real_broker_messages(mosquitto_broker):
     assert body["drone"]["mode_code"] == 5
     assert body["drone"]["battery_pct"] == 75
     assert body["dock"]["sn"] == "SN_DOCK_E2E"
-    assert body["dock"]["temperature"] == 25.0
+    assert body["dock"]["environment_temperature"] == 25.0
     assert body["dock"]["paired_drone_sn"] == "SN_DRONE_E2E"
     assert len(body["events"]) >= 1
     assert any(e["method"] == "return_home_info" for e in body["events"])
