@@ -83,24 +83,26 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
         state_path = Path(state_dir)
         # 决定退出原因，优先级：manual_stop（信号/stop-file）→ auto_idle（detector）
         finalize_reason = "manual_stop"
-        while not stop_event.is_set():
-            await asyncio.sleep(1.0)
-            # 检查 detector 是否已自动判定飞行结束（mode_code=0 sustain 30s 等）
-            if rec._detector.state == FlightState.FINALIZING:
-                finalize_reason = rec._detector.end_reason or "auto_idle"
-                click.echo(f"auto-finalize: detector reached FINALIZING ({finalize_reason})")
-                break
-            # 检查外部 stop-record 命令写的信号文件
-            if rec._detector.task_id:
-                sig_file = StopSignalFile(state_path, rec._detector.task_id)
-                if read_stop_signal_if_present(sig_file) is not None:
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(1.0)
+                # 检查 detector 是否已自动判定飞行结束（mode_code=0 sustain 30s 等）
+                if rec._detector.state == FlightState.FINALIZING:
+                    finalize_reason = rec._detector.end_reason or "auto_idle"
+                    click.echo(f"auto-finalize: detector reached FINALIZING ({finalize_reason})")
                     break
-
-        await mqtt.stop()
-        loop_task.cancel()
-        if rec.flight_dir is not None:
-            flight_dir = await rec.finalize_and_close(finalize_reason=finalize_reason)
-            click.echo(f"finalized: {flight_dir}  (reason={finalize_reason})")
+                # 检查外部 stop-record 命令写的信号文件
+                if rec._detector.task_id:
+                    sig_file = StopSignalFile(state_path, rec._detector.task_id)
+                    if read_stop_signal_if_present(sig_file) is not None:
+                        break
+        finally:
+            # 无论正常退出还是异常，都收尾：停 MQTT + 停 ffmpeg（在 finalize 内）
+            await mqtt.stop()
+            loop_task.cancel()
+            if rec.flight_dir is not None:
+                flight_dir = await rec.finalize_and_close(finalize_reason=finalize_reason)
+                click.echo(f"finalized: {flight_dir}  (reason={finalize_reason})")
 
     asyncio.run(run())
 

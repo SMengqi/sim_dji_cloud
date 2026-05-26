@@ -1,7 +1,7 @@
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from loguru import logger
 
 from sim_dji_cloud.utils.time_ms import now_ms
@@ -12,6 +12,7 @@ from sim_dji_cloud.recorder.topic_router import (
 )
 from sim_dji_cloud.recorder.write_queue import TopicWriteQueue
 from sim_dji_cloud.recorder.flight_detector import FlightDetector, FlightState
+from sim_dji_cloud.recorder.video_writer import VideoWriter, resolve_video_source_url
 
 
 class Recorder:
@@ -25,6 +26,7 @@ class Recorder:
         config: dict[str, Any],
         dock_sn: str,
         drone_sn: Optional[str],
+        video_writer_factory: Callable[..., VideoWriter] = VideoWriter,
     ):
         self.config = config
         self.dock_sn = dock_sn
@@ -41,6 +43,9 @@ class Recorder:
         self.flight_dir: Optional[Path] = None
         self._manifest: Optional[ManifestBuilder] = None
         self._task_started_ms: Optional[int] = None
+        self._video_writer_factory = video_writer_factory
+        self._video_writer: Optional[VideoWriter] = None
+        self._video_started_ms: Optional[int] = None
 
     async def start_async_components(self) -> None:
         """阶段一无后台任务；预留接口给阶段二。"""
@@ -128,6 +133,27 @@ class Recorder:
         )
         logger.info("flight dir opened: {}", self.flight_dir)
 
+        # 单进程一次飞行；进入新飞行前清掉上一段视频状态（防御性，正常不会触发）
+        self._video_writer = None
+        self._video_started_ms = None
+        vcfg = self.config.get("video") or {}  # video: 空段时 yaml 给 None，归一为 {}
+        if vcfg.get("enabled"):
+            url = resolve_video_source_url(vcfg)
+            if url:
+                try:
+                    video_dir = self.flight_dir / "video"
+                    vw = self._video_writer_factory(
+                        url, video_dir, vcfg.get("ffmpeg_extra_args", []))
+                    vw.start(started_ms)
+                    self._video_writer = vw
+                    self._video_started_ms = started_ms
+                    logger.info("video recording started: {} -> {}", url, video_dir)
+                except Exception:
+                    logger.exception("视频启动失败；继续录 MQTT（manifest.video=null）")
+                    self._video_writer = None
+            else:
+                logger.warning("video.enabled 但未配置 source_url_override，跳过视频")
+
     async def _rename_pending_to_task(self, task_id: str) -> None:
         """Rename pending_ dir to task_id-named dir.
 
@@ -162,6 +188,10 @@ class Recorder:
             drone_sn=self.drone_sn or "unknown",
             started_at_recv_ms=self._task_started_ms or now_ms(),
         )
+        # 视频：目录已 rename（ffmpeg fd 跟随 inode 继续写），仅需把 output_dir
+        # 指向新目录，使 stop() 时 timing.json 落在新位置。
+        if self._video_writer is not None:
+            self._video_writer.output_dir = self.flight_dir / "video"
         logger.info("renamed pending dir to: {}", new_dir.name)
 
     async def _ensure_topic_writer(self, topic: str) -> TopicWriteQueue:
@@ -223,6 +253,18 @@ class Recorder:
             )
 
         ended = self._detector.task_ended_ms or now_ms()
+
+        if self._video_writer is not None:
+            try:
+                self._video_writer.stop()  # SIGINT→10s→SIGKILL，并写 timing.json
+                # _video_writer 非空即 _video_started_ms 已设；显式 is-not-None 防 0 被当假
+                start_ms = self._video_started_ms if self._video_started_ms is not None else ended
+                duration = max(0, ended - start_ms)  # 时钟异常时兜底，避免负时长
+                self._manifest.set_video(self._video_writer.manifest_video_block(duration))
+            except Exception:
+                logger.exception("视频收尾失败；manifest.video 置 null")
+                self._manifest.set_video(None)
+
         self._manifest.finalize(
             ended_at_recv_ms=ended,
             finalize_reason=finalize_reason,

@@ -78,3 +78,12 @@ class VideoWriter:
                 {"start_ms": 0, "end_ms": duration_ms, "file": "video/main.mp4"},
             ],
         }
+
+
+def resolve_video_source_url(video_cfg: dict) -> str | None:
+    """解析视频拉流 URL。
+
+    v1：只返回 source_url_override（去空白后），空/缺失返回 None。
+    OSD 自动提取（source_url_field）延后实现。
+    """
+    return (video_cfg.get("source_url_override") or "").strip() or None

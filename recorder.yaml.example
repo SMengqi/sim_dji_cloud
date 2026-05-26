@@ -29,8 +29,10 @@ storage:
 
 video:
   enabled: true
+  # v1：从这里取 SRS 拉流地址，例如 "rtmp://<srs-host>/live/<stream>"
+  source_url_override: "rtmp://localhost/live/dock"
+  # 预留：从 dock OSD 自动取 rtmp_url（暂未接线，留空即可）
   source_url_field: "osd.live_capacity.live_status[0].rtmp_url"
-  source_url_override: null
   ffmpeg_extra_args: []
 
 flight_detection:

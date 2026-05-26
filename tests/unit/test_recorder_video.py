@@ -1,0 +1,196 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from sim_dji_cloud.recorder import Recorder
+
+
+class FakeVideoWriter:
+    """测试替身：记录调用，不起 ffmpeg。签名与 VideoWriter 一致。"""
+    def __init__(self, source_url, output_dir, extra_args=None):
+        self.source_url = source_url
+        self.output_dir = Path(output_dir)
+        self.extra_args = extra_args
+        self.started_at = None
+        self.stopped = False
+
+    def start(self, started_at_recv_ms):
+        self.started_at = started_at_recv_ms
+
+    def stop(self, timeout_s=10.0):
+        self.stopped = True
+
+    def manifest_video_block(self, duration_ms):
+        return {
+            "file": "video/main.mp4",
+            "source_url": self.source_url,
+            "started_at_recv_ms": self.started_at,
+            "duration_ms": duration_ms,
+            "segments": [{"start_ms": 0, "end_ms": duration_ms, "file": "video/main.mp4"}],
+        }
+
+
+def _cfg(tmp_path: Path, video: dict) -> dict:
+    return {
+        "mqtt": {
+            "host": "localhost", "port": 1883, "tls": False,
+            "client_id": "t", "username": None, "password": None,
+            "ca_file": None, "cert_file": None, "key_file": None,
+            "subscribe_patterns": [], "deny_topics": [],
+        },
+        "storage": {
+            "root": str(tmp_path / "rec"), "enable_raw_firehose": False,
+            "flush_max_records": 1, "flush_interval_ms": 50, "queue_max_size": 1000,
+            "rotate_max_bytes": 10**9, "rotate_max_records": 10**6,
+        },
+        "video": video,
+        "flight_detection": {
+            "finalize_idle_seconds": 0,
+            "rules": {
+                "start": [{"source": "dock_services", "payload_match": {"method": "wayline_prepare"}}],
+                "end": [{"source": "dock_osd", "field": "wayline_mission_state", "equals": "idle"}],
+            },
+        },
+    }
+
+
+async def _drive_flight(rec: Recorder) -> None:
+    """触发 RECORDING（@1000）→ ... → idle（@10000）。"""
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/services",
+        json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T1"}}).encode(),
+        1000,
+    )
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"wayline_mission_state": "executing",
+                    "data": {"sub_device": {"device_sn": "SN_DRONE"}}}).encode(),
+        1500,
+    )
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"wayline_mission_state": "idle"}).encode(),
+        10_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_video_started_and_manifest_set(tmp_path):
+    created = []
+
+    def factory(url, out, args):
+        vw = FakeVideoWriter(url, out, args)
+        created.append(vw)
+        return vw
+
+    cfg = _cfg(tmp_path, {"enabled": True,
+                          "source_url_override": "rtmp://srs/live/x",
+                          "ffmpeg_extra_args": []})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None, video_writer_factory=factory)
+    await rec.start_async_components()
+    await _drive_flight(rec)
+    flight_dir = await rec.finalize_and_close("auto_idle")
+
+    assert len(created) == 1
+    vw = created[0]
+    assert vw.source_url == "rtmp://srs/live/x"
+    assert vw.output_dir.name == "video"
+    assert vw.started_at == 1000
+    assert vw.stopped is True
+
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["video"]["source_url"] == "rtmp://srs/live/x"
+    assert manifest["video"]["file"] == "video/main.mp4"
+    assert manifest["video"]["started_at_recv_ms"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_video_disabled_no_writer(tmp_path):
+    created = []
+    cfg = _cfg(tmp_path, {"enabled": False})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None,
+                   video_writer_factory=lambda *a: created.append(a))
+    await rec.start_async_components()
+    await _drive_flight(rec)
+    flight_dir = await rec.finalize_and_close("auto_idle")
+
+    assert created == []
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["video"] is None
+
+
+@pytest.mark.asyncio
+async def test_video_enabled_but_no_override_skips(tmp_path):
+    created = []
+    cfg = _cfg(tmp_path, {"enabled": True, "source_url_override": ""})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None,
+                   video_writer_factory=lambda *a: created.append(a))
+    await rec.start_async_components()
+    await _drive_flight(rec)
+    flight_dir = await rec.finalize_and_close("auto_idle")
+
+    assert created == []
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["video"] is None
+
+
+@pytest.mark.asyncio
+async def test_video_start_failure_is_non_fatal(tmp_path):
+    def boom(url, out, args):
+        raise RuntimeError("ffmpeg not found")
+
+    cfg = _cfg(tmp_path, {"enabled": True,
+                          "source_url_override": "rtmp://srs/live/x",
+                          "ffmpeg_extra_args": []})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None, video_writer_factory=boom)
+    await rec.start_async_components()
+    await _drive_flight(rec)
+    flight_dir = await rec.finalize_and_close("auto_idle")
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["video"] is None
+    assert (flight_dir / "topics").exists()
+
+
+@pytest.mark.asyncio
+async def test_video_stop_failure_is_non_fatal(tmp_path):
+    # finalize 时 stop() 抛异常也不能炸；manifest.video 置 null，飞行仍正常收尾
+    class BoomOnStop(FakeVideoWriter):
+        def stop(self, timeout_s=10.0):
+            raise OSError("ffmpeg stop failed")
+
+    cfg = _cfg(tmp_path, {"enabled": True,
+                          "source_url_override": "rtmp://srs/live/x",
+                          "ffmpeg_extra_args": []})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None,
+                   video_writer_factory=lambda u, o, a: BoomOnStop(u, o, a))
+    await rec.start_async_components()
+    await _drive_flight(rec)
+    flight_dir = await rec.finalize_and_close("auto_idle")
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    assert manifest["video"] is None
+    assert (flight_dir / "manifest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_rename_updates_video_output_dir(tmp_path):
+    created = []
+
+    def factory(url, out, args):
+        vw = FakeVideoWriter(url, out, args)
+        created.append(vw)
+        return vw
+
+    cfg = _cfg(tmp_path, {"enabled": True,
+                          "source_url_override": "rtmp://srs/live/x",
+                          "ffmpeg_extra_args": []})
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None, video_writer_factory=factory)
+
+    # 直接驱动内部：task_id 未知 -> pending 目录 + 起视频
+    await rec._open_flight_dir(1000)
+    assert created[0].output_dir.parent.name.startswith("pending_")
+
+    # 拿到 task_id -> 改名，视频 output_dir 应跟到新目录
+    await rec._rename_pending_to_task("T1")
+    assert "T1" in rec.flight_dir.name
+    assert created[0].output_dir == rec.flight_dir / "video"
