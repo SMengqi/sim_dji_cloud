@@ -1,11 +1,12 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Callable
 from loguru import logger
 
 from sim_dji_cloud.player.jsonl_iterator import JsonlIterator
 from sim_dji_cloud.player.scheduler import VirtTimeScheduler
+from sim_dji_cloud.player.video_pusher import VideoPusher, plan_video_push
 
 
 class _PublisherProto(Protocol):
@@ -27,6 +28,8 @@ class Player:
         publisher: _PublisherProto,
         speed: float = 1.0,
         start_offset_ms: int = 0,
+        video_push_url: str | None = None,
+        video_pusher_factory: Callable[..., VideoPusher] = VideoPusher,
     ):
         self.flight_dir = Path(flight_dir)
         self._publisher = publisher
@@ -35,6 +38,10 @@ class Player:
         self._scheduler = VirtTimeScheduler()
         self._manifest: dict = {}
         self._tasks: list[asyncio.Task] = []
+        self._video_push_url = video_push_url
+        self._video_pusher_factory = video_pusher_factory
+        self._video_pusher: Optional[VideoPusher] = None
+        self._video_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         self._manifest = json.loads((self.flight_dir / "manifest.json").read_text())
@@ -58,6 +65,26 @@ class Player:
             )
             self._tasks.append(task)
 
+        plan = plan_video_push(
+            self._manifest, self._video_push_url, self._speed,
+            (self.flight_dir / "video" / "main.mp4").exists(),
+        )
+        if plan is not None:
+            self._video_task = asyncio.create_task(self._run_video_push(plan))
+
+    async def _run_video_push(self, plan: dict) -> None:
+        try:
+            await self._scheduler.wait_until_virt(plan["wait_virt_ms"])
+            pusher = self._video_pusher_factory(
+                self.flight_dir / "video" / "main.mp4", self._video_push_url, [])
+            pusher.start(plan["ss_seconds"])
+            self._video_pusher = pusher
+            logger.info("video push started -> {}", self._video_push_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("视频推流启动失败；MQTT 回放不受影响")
+
     async def _replay_topic(
         self,
         topic_entry: dict,
@@ -80,6 +107,19 @@ class Player:
                 logger.exception("publish failed for topic {}", topic)
 
     async def wait_until_done(self) -> None:
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self._publisher.disconnect()
+        try:
+            if self._tasks:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+        finally:
+            if self._video_task is not None:
+                self._video_task.cancel()
+                try:
+                    await self._video_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if self._video_pusher is not None:
+                try:
+                    self._video_pusher.stop()
+                except Exception:
+                    logger.exception("停止视频推流失败")
+            await self._publisher.disconnect()

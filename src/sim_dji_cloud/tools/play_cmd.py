@@ -11,6 +11,7 @@ async def play_flight(
     mqtt_url: str,
     speed: float,
     start_offset_ms: int,
+    video_push_url: str | None = None,
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -25,6 +26,7 @@ async def play_flight(
         publisher=publisher,
         speed=speed,
         start_offset_ms=start_offset_ms,
+        video_push_url=video_push_url,
     )
     logger.info("play start: flight={}, broker=tcp://{}:{}, speed={}",
                 flight_dir, host, port, speed)

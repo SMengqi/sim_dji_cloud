@@ -113,13 +113,17 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
               help="本地 broker，如 tcp://localhost:1883")
 @click.option("--speed", default=1.0, type=float, help="回放速度倍率，默认 1.0")
 @click.option("--start-offset-ms", default=0, type=int, help="跳过开头多少毫秒，默认 0")
-def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int) -> None:
+@click.option("--video-push-url", default=None,
+              help="把 video/main.mp4 推到该 RTMP（如 rtmp://<srs>/live/<stream>），仅 speed=1.0 生效")
+def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int,
+             video_push_url: str | None) -> None:
     from sim_dji_cloud.tools.play_cmd import play_flight
     raise SystemExit(asyncio.run(play_flight(
         flight_dir=Path(flight_dir),
         mqtt_url=mqtt_url,
         speed=speed,
         start_offset_ms=start_offset_ms,
+        video_push_url=video_push_url,
     )))
 
 
