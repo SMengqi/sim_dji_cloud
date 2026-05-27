@@ -32,10 +32,10 @@ class Recorder:
         self.dock_sn = dock_sn
         self.drone_sn = drone_sn
         self.storage_root = Path(config["storage"]["root"])
-        rules = config["flight_detection"]["rules"]
+        fd = config.get("flight_detection", {}) or {}
         self._detector = FlightDetector(
-            start_rules=rules.get("start", []),
-            end_rules=rules.get("end", []),
+            record_steps=fd.get("record_steps", [0, 1, 2]),
+            idle_debounce_seconds=fd.get("idle_debounce_seconds", 5),
         )
         self._queues: dict[str, TopicWriteQueue] = {}
         self._topic_routed: dict[str, Any] = {}
@@ -271,3 +271,23 @@ class Recorder:
             status="ok",
         )
         return self.flight_dir
+
+    async def reset_for_next_flight(self) -> None:
+        """一段任务 finalize 后清空状态，准备录下一段（长跑多任务）。
+
+        注意：保留 dock_sn / 已学到的 drone_sn / detector 的 sticky _last_step。
+        """
+        for q in self._queues.values():
+            try:
+                await q.drain_and_close()
+            except Exception:
+                logger.exception("drain queue on reset failed")
+        self._queues = {}
+        self._writers = {}
+        self._topic_routed = {}
+        self.flight_dir = None
+        self._manifest = None
+        self._task_started_ms = None
+        self._video_writer = None
+        self._video_started_ms = None
+        self._detector.reset()

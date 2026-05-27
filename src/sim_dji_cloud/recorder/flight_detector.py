@@ -5,66 +5,13 @@ from sim_dji_cloud.recorder.topic_router import Source
 
 
 class FlightState(str, Enum):
-    IDLE = "idle"
     WAITING_TASK = "waiting_task"
     RECORDING = "recording"
     FINALIZING = "finalizing"
 
 
-class RuleEvaluator:
-    """评估一组规则，维护 sustain_seconds 类规则的内部计时状态。"""
-
-    def __init__(self, rules: list[dict[str, Any]]):
-        self.rules = rules
-        self._sustain_start: dict[int, int] = {}  # rule_idx → first_match_ms
-
-    def evaluate(
-        self, source: Source, payload: dict[str, Any], now_ms: int,
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
-        for idx, rule in enumerate(self.rules):
-            if rule.get("source") != source.value:
-                continue
-
-            ok = True
-            if "payload_match" in rule:
-                for k, v in rule["payload_match"].items():
-                    if _get_field(payload, k) != v:
-                        ok = False
-                        break
-            if ok and "field" in rule:
-                actual = _get_field(payload, rule["field"])
-                if "equals" in rule and actual != rule["equals"]:
-                    ok = False
-                if "not_equals" in rule and actual == rule["not_equals"]:
-                    ok = False
-                if "in" in rule and actual not in rule["in"]:
-                    ok = False
-                if "exists" in rule:
-                    has_val = actual is not None
-                    if rule["exists"] != has_val:
-                        ok = False
-
-            if not ok:
-                self._sustain_start.pop(idx, None)
-                continue
-
-            sustain = rule.get("sustain_seconds")
-            if sustain is None:
-                return True, rule
-
-            first = self._sustain_start.setdefault(idx, now_ms)
-            if (now_ms - first) >= sustain * 1000:
-                return True, rule
-
-        return False, None
-
-
 def _get_field(obj: Any, path: str) -> Any:
-    """支持点路径取值：`_get_field({"a":{"b":1}}, "a.b") == 1`。
-
-    顶层字段不带点，行为与 dict.get 一致；带点时逐层下钻。
-    路径中任一层非 dict 时返回 None。
-    """
+    """点路径取值；任一层非 dict 返回 None。"""
     if "." not in path:
         return obj.get(path) if isinstance(obj, dict) else None
     cur: Any = obj
@@ -75,51 +22,71 @@ def _get_field(obj: Any, path: str) -> Any:
     return cur
 
 
+def _extract_task_id(payload: dict[str, Any]) -> Optional[str]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    return data.get("flight_id") or data.get("task_id") or payload.get("flight_id")
+
+
 class FlightDetector:
-    def __init__(
-        self,
-        start_rules: list[dict[str, Any]],
-        end_rules: list[dict[str, Any]],
-    ):
-        self._start = RuleEvaluator(start_rules)
-        self._end = RuleEvaluator(end_rules)
-        self.state = FlightState.IDLE
+    """按机场 flighttask_step_code 的 sticky 状态机驱动录制。
+
+    flighttask_step_code 仅在状态变化时下发；本检测器保持"最后已知"值，
+    OSD 不带该字段时不改变状态（绝不据此误停）。多任务循环：finalize 后
+    调用 reset() 回到等待，下一段任务自动重新进入 RECORDING。
+    """
+
+    def __init__(self, record_steps: list[int], idle_debounce_seconds: int):
+        self.record_steps = set(record_steps)
+        self.idle_debounce_ms = int(idle_debounce_seconds * 1000)  # 支持小数秒
+        self.state = FlightState.WAITING_TASK
+        self._last_step: Optional[int] = None
+        self._left_record_at_ms: Optional[int] = None
         self.task_id: Optional[str] = None
         self.task_started_ms: Optional[int] = None
         self.task_ended_ms: Optional[int] = None
         self.end_reason: Optional[str] = None
 
     def feed(self, source: Source, payload: dict[str, Any], now_ms: int) -> FlightState:
-        if self.state in (FlightState.IDLE, FlightState.WAITING_TASK):
-            matched, _ = self._start.evaluate(source, payload, now_ms)
-            if matched:
+        if source == Source.DOCK_OSD:
+            step = _get_field(payload, "data.flighttask_step_code")
+            if step is not None:
+                self._last_step = step
+        result = self._advance(now_ms)
+        # 在 _advance 之后补 task_id：使起录那条消息（若同时带 flight_id）也能被捕获
+        if self.state == FlightState.RECORDING and not self.task_id:
+            tid = _extract_task_id(payload)
+            if tid:
+                self.task_id = tid
+        return result
+
+    def tick(self, now_ms: int) -> FlightState:
+        return self._advance(now_ms)
+
+    def reset(self) -> None:
+        self.state = FlightState.WAITING_TASK
+        self._left_record_at_ms = None
+        self.task_id = None
+        self.task_started_ms = None
+        self.task_ended_ms = None
+        self.end_reason = None
+
+    def _advance(self, now_ms: int) -> FlightState:
+        recording_now = self._last_step in self.record_steps
+        if self.state == FlightState.WAITING_TASK:
+            if recording_now:
                 self.task_started_ms = now_ms
-                self.task_id = self._extract_task_id(payload) or self.task_id
+                self.task_id = None
                 self.state = FlightState.RECORDING
-
         elif self.state == FlightState.RECORDING:
-            # 持续提取 task_id（首次触发未带 ID 时）
-            if not self.task_id:
-                self.task_id = self._extract_task_id(payload)
-            matched, _ = self._end.evaluate(source, payload, now_ms)
-            if matched:
-                self.task_ended_ms = now_ms
-                self.end_reason = "auto_idle"
-                self.state = FlightState.FINALIZING
-
+            if recording_now:
+                self._left_record_at_ms = None
+            else:
+                if self._left_record_at_ms is None:
+                    self._left_record_at_ms = now_ms
+                if now_ms - self._left_record_at_ms >= self.idle_debounce_ms:
+                    self.task_ended_ms = now_ms
+                    self.end_reason = "task_idle"
+                    self.state = FlightState.FINALIZING
         return self.state
-
-    def force_stop(self, now_ms: int, reason: str) -> None:
-        self.task_ended_ms = now_ms
-        self.end_reason = reason
-        self.state = FlightState.FINALIZING
-
-    @staticmethod
-    def _extract_task_id(payload: dict[str, Any]) -> Optional[str]:
-        # `data` may be a dict (services payload) or a list (some events payloads
-        # like dock_events carrying ADS-B arrays). Only dict has flight_id/task_id;
-        # otherwise fall back to top-level payload.flight_id.
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            data = {}
-        return data.get("flight_id") or data.get("task_id") or payload.get("flight_id")

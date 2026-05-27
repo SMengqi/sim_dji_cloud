@@ -60,7 +60,7 @@ Multi-dock shared brokers exist — the Recorder applies a `device_sn` whitelist
 
 ### Recording is async-pipelined per topic
 
-`Recorder` (`src/sim_dji_cloud/recorder/__init__.py`) is the orchestrator. Each topic gets its own `TopicWriteQueue` (`write_queue.py`) backed by a `RotatingJsonlWriter` (`storage/rotation.py`); records are buffered and flushed on `flush_max_records` OR `flush_interval_ms` (whichever first — both matter, low-frequency topics depend on the time fallback). `FlightDetector` (`flight_detector.py`) is a rule engine that watches OSD streams, transitions `IDLE → ACTIVE → FINALIZING`, names the flight directory `<task_id>__<dock_sn>__<ts>/`, and triggers a synchronous rename of pending JSONL files (purely sync — never await mid-rename; a previous bug had concurrent gmqtt callbacks corrupting state during async drain).
+`Recorder` (`src/sim_dji_cloud/recorder/__init__.py`) is the orchestrator. Each topic gets its own `TopicWriteQueue` (`write_queue.py`) backed by a `RotatingJsonlWriter` (`storage/rotation.py`); records are buffered and flushed on `flush_max_records` OR `flush_interval_ms` (whichever first — both matter, low-frequency topics depend on the time fallback). `FlightDetector` (`flight_detector.py`) is a **sticky `flighttask_step_code` state machine**: it tracks the dock's last-known `data.flighttask_step_code` (the field is sent only on state change, so absence ≠ a state — it keeps the last value), transitions `WAITING_TASK → RECORDING` when that value ∈ `record_steps` (default `{0,1,2}`) and `RECORDING → FINALIZING` after it leaves the set for `idle_debounce_seconds`. It names the flight directory `<task_id>__<dock_sn>__<ts>/` and triggers a synchronous rename of pending JSONL files (purely sync — never await mid-rename; a previous bug had concurrent gmqtt callbacks corrupting state during async drain). `reset()` returns it to `WAITING_TASK` for the next task (multi-task per process); `tick(now_ms)` advances the idle debounce when no messages arrive.
 
 `MqttRecorderClient` (`recorder/mqtt_client.py`) wraps gmqtt and reports connection gaps into the manifest.
 
@@ -96,7 +96,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 
 ### Config & flight-detection rules
 
-`config.py` resolves `${env:VAR}` placeholders at load. `flight_detection.rules` use dot-paths (`"data.mode_code"`) evaluated by `RuleEvaluator` against either `dock_osd` or `drone_osd` sources. The **end-of-flight** rule that actually works in production is: `drone_osd.data.mode_code == 0 sustained for 30 seconds`. `wayline_mission_state` / `wayline_prepare` don't exist in real DJI payloads — don't add rules referencing them.
+`config.py` resolves `${env:VAR}` placeholders at load. Flight detection is driven by the dock OSD's `data.flighttask_step_code` (NOT the old `mode_code` rules — those were removed). Config keys: `flight_detection.record_steps` (default `[0,1,2]` = 作业准备中/飞行作业中/作业后状态恢复) and `flight_detection.idle_debounce_seconds` (default 5). Record while the sticky last-known step ∈ `record_steps`; finalize the current task after it leaves the set (e.g. 5 任务空闲) sustained `idle_debounce_seconds`. **Edge-sent caveat:** `flighttask_step_code` is only present in the OSD on a state change, so the detector keeps the last-known value and never treats an absent field as a state — otherwise it would wrongly finalize mid-flight.
 
 ## Testing conventions
 
@@ -109,7 +109,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 
 - `install.sh` uses `pip install -e ".[test]" --upgrade --upgrade-strategy eager` and then explicitly imports `fastapi/uvicorn/websockets/httpx` as a sanity check. This is intentional — `-e` alone doesn't resync dependencies on existing venvs, which has bitten us when pyproject grew new deps.
 - Plain TCP (port 1883) vs TLS (port 8883) — the YAML `mqtt.tls` flag must match the actual broker. A mismatch surfaces as `ConnectionResetError` during handshake.
-- Phase 2's CLI `record` loop polls `rec._detector.state == FlightState.FINALIZING` to auto-exit. Don't refactor that polling away — it's the only path that triggers `auto_idle` finalize.
+- The CLI `record` loop is **long-running and does NOT auto-exit**. Each 1s tick calls `rec._detector.tick(now_ms())`; on `FlightState.FINALIZING` it `finalize_and_close` + `reset_for_next_flight` and **keeps looping** for the next task (multi-task per process). Only Ctrl-C / SIGTERM / `stop-record` set `stop_event` to exit, and the `finally` finalizes any in-progress flight on the way out (`reason=manual_stop`). Video is default-off (`video.enabled: false`); `--video` opts in.
 - `recordings/` and `*.yaml` are gitignored; only `*.yaml.example` is tracked.
 
 ## Reference documents
@@ -124,4 +124,5 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 | `../2026-05-25-sim-dji-cloud-flight-area-overlay-design.md` | Flight-area XML + PNG overlay on dashboard map (design) |
 | `../2026-05-25-sim-dji-cloud-recorder-video-design.md` | Recorder video: pull RTMP from SRS → video/main.mp4 (design) |
 | `../2026-05-26-sim-dji-cloud-playback-video-design.md` | Playback video: play pushes video/main.mp4 → SRS RTMP (design) |
+| `../2026-05-27-sim-dji-cloud-continuous-record-design.md` | Continuous record: dock flighttask_step-driven multi-task, no auto-exit, video default-off (design) |
 | `../2026-05-21-sim-dji-cloud-operations-manual.md` | **End-user operations manual — first stop for "how do I run X"** |

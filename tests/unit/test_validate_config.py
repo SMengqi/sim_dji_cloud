@@ -26,8 +26,8 @@ storage:
 video:
   enabled: false
 flight_detection:
-  finalize_idle_seconds: 30
-  rules: {start: [], end: []}
+  record_steps: [0, 1, 2]
+  idle_debounce_seconds: 5
 ''')
     code = validate_config_file(p)
     captured = capsys.readouterr()
@@ -50,7 +50,7 @@ mqtt:
   deny_topics: []
 storage: {root: ./rec, flush_max_records: 1, flush_interval_ms: 1, queue_max_size: 1, rotate_max_bytes: 1, rotate_max_records: 1}
 video: {enabled: false}
-flight_detection: {finalize_idle_seconds: 1, rules: {start: [], end: []}}
+flight_detection: {record_steps: [0, 1, 2], idle_debounce_seconds: 5}
 ''')
     code = validate_config_file(p)
     assert code != 0
@@ -73,7 +73,7 @@ mqtt:
   deny_topics: []
 storage: {root: ./rec, flush_max_records: 1, flush_interval_ms: 1, queue_max_size: 1, rotate_max_bytes: 1, rotate_max_records: 1}
 video: {enabled: false}
-flight_detection: {finalize_idle_seconds: 1, rules: {start: [], end: []}}
+flight_detection: {record_steps: [0, 1, 2], idle_debounce_seconds: 5}
 ''')
     code = validate_config_file(p)
     assert code != 0

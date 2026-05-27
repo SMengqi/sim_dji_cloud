@@ -80,29 +80,28 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
 
+        from sim_dji_cloud.utils.time_ms import now_ms
         state_path = Path(state_dir)
-        # 决定退出原因，优先级：manual_stop（信号/stop-file）→ auto_idle（detector）
-        finalize_reason = "manual_stop"
         try:
             while not stop_event.is_set():
                 await asyncio.sleep(1.0)
-                # 检查 detector 是否已自动判定飞行结束（mode_code=0 sustain 30s 等）
-                if rec._detector.state == FlightState.FINALIZING:
-                    finalize_reason = rec._detector.end_reason or "auto_idle"
-                    click.echo(f"auto-finalize: detector reached FINALIZING ({finalize_reason})")
-                    break
-                # 检查外部 stop-record 命令写的信号文件
-                if rec._detector.task_id:
+                rec._detector.tick(now_ms())                      # 推进空闲去抖
+                if rec._detector.state == FlightState.FINALIZING:  # 一段任务结束
+                    reason = rec._detector.end_reason or "task_idle"
+                    fd = await rec.finalize_and_close(finalize_reason=reason)
+                    click.echo(f"finalized: {fd}  (reason={reason})")
+                    await rec.reset_for_next_flight()              # 重置，继续等下一段
+                    continue
+                if rec._detector.task_id:                          # 外部 stop-record
                     sig_file = StopSignalFile(state_path, rec._detector.task_id)
                     if read_stop_signal_if_present(sig_file) is not None:
-                        break
+                        stop_event.set()
         finally:
-            # 无论正常退出还是异常，都收尾：停 MQTT + 停 ffmpeg（在 finalize 内）
             await mqtt.stop()
             loop_task.cancel()
-            if rec.flight_dir is not None:
-                flight_dir = await rec.finalize_and_close(finalize_reason=finalize_reason)
-                click.echo(f"finalized: {flight_dir}  (reason={finalize_reason})")
+            if rec.flight_dir is not None:                         # 退出时收尾在录的那段
+                fd = await rec.finalize_and_close(finalize_reason="manual_stop")
+                click.echo(f"finalized: {fd}  (reason=manual_stop)")
 
     asyncio.run(run())
 

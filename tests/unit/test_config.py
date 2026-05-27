@@ -40,10 +40,8 @@ storage:
 video:
   enabled: true
 flight_detection:
-  finalize_idle_seconds: 30
-  rules:
-    start: []
-    end: []
+  record_steps: [0, 1, 2]
+  idle_debounce_seconds: 5
 '''
     p = tmp_path / "rec.yaml"
     p.write_text(yaml_text)

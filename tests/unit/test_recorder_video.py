@@ -45,32 +45,26 @@ def _cfg(tmp_path: Path, video: dict) -> dict:
             "rotate_max_bytes": 10**9, "rotate_max_records": 10**6,
         },
         "video": video,
-        "flight_detection": {
-            "finalize_idle_seconds": 0,
-            "rules": {
-                "start": [{"source": "dock_services", "payload_match": {"method": "wayline_prepare"}}],
-                "end": [{"source": "dock_osd", "field": "wayline_mission_state", "equals": "idle"}],
-            },
-        },
+        "flight_detection": {"record_steps": [0, 1, 2], "idle_debounce_seconds": 0},
     }
 
 
 async def _drive_flight(rec: Recorder) -> None:
-    """触发 RECORDING（@1000）→ ... → idle（@10000）。"""
+    """dock flighttask_step=1 起录（@1000，带 sub_device 回填 drone_sn）→ step=5 空闲（@10000）。"""
     await rec.on_mqtt_message(
-        "thing/product/SN_DOCK/services",
-        json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T1"}}).encode(),
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"data": {"flighttask_step_code": 1,
+                             "sub_device": {"device_sn": "SN_DRONE"}}}).encode(),
         1000,
     )
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "executing",
-                    "data": {"sub_device": {"device_sn": "SN_DRONE"}}}).encode(),
+        json.dumps({"data": {"flighttask_step_code": 1}}).encode(),
         1500,
     )
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "idle"}).encode(),
+        json.dumps({"data": {"flighttask_step_code": 5}}).encode(),
         10_000,
     )
 

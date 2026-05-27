@@ -28,47 +28,11 @@ storage:
   rotate_max_records: 1000000
 
 video:
-  enabled: true
-  # v1：从这里取 SRS 拉流地址，例如 "rtmp://<srs-host>/live/<stream>"
+  enabled: false                 # 默认不录视频；需要时启动加 --video
   source_url_override: "rtmp://localhost/live/dock"
-  # 预留：从 dock OSD 自动取 rtmp_url（暂未接线，留空即可）
   source_url_field: "osd.live_capacity.live_status[0].rtmp_url"
   ffmpeg_extra_args: []
 
 flight_detection:
-  finalize_idle_seconds: 30
-  # 规则字段支持 dot-path（如 "data.mode_code"），由 RuleEvaluator 逐层下钻。
-  # mode_code 参考 DJI Cloud API M30/Dock 3 文档：
-  #   0=standby/在地待机   1=preparing       2=ready
-  #   3=manual flight      4=auto takeoff    5=wayline 执行
-  #   6=panoramic          7=active track    8=ADS-B 规避
-  #   9=auto RTH           10=auto landing   11=forced landing
-  #   12=三桨落地          13=upgrading      14=disconnected
-  rules:
-    start:
-      # 主信号：飞行器进入任何非 standby 状态即视为飞行开始
-      - source: drone_osd
-        field: "data.mode_code"
-        not_equals: 0
-      # 兜底 A：dock 下发起飞/航线/RTH 类 services 也立刻进入 recording
-      # （避免飞行器 osd 还没到达前漏掉前几条机场端消息）
-      - source: dock_services
-        field: "method"
-        in: ["takeoff_to_point", "return_home", "fly_to_point",
-             "wayline_prepare", "wayline_start", "drc_mode_enter"]
-      # 兜底 B：dock_events 携带 flight_id 的飞行进度类消息
-      - source: dock_events
-        field: "method"
-        in: ["return_home_info", "flighttask_progress",
-             "wayline_status_update", "task_progress"]
-    end:
-      # 主信号：飞行器回到 standby（mode_code=0）持续 30s = 真正落地
-      - source: drone_osd
-        field: "data.mode_code"
-        equals: 0
-        sustain_seconds: 30
-      # 兜底：机场报告 drone_in_dock=1（无人机已停泊）持续 30s
-      - source: dock_osd
-        field: "data.drone_in_dock"
-        equals: 1
-        sustain_seconds: 30
+  record_steps: [0, 1, 2]        # dock flighttask_step_code ∈ 此集合时录制（0准备/1飞行/2作业后恢复）
+  idle_debounce_seconds: 5       # 进入空闲(5)等持续该秒数后收尾当前任务

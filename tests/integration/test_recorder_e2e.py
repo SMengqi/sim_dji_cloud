@@ -38,23 +38,48 @@ async def test_record_one_flight_end_to_end(mosquitto_broker, tmp_path: Path):
     pub = gmqtt.Client("fake-cloud")
     await pub.connect(m["host"], m["port"])
 
-    pub.publish("thing/product/SN_DOCK_TEST/services",
-                json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T-E2E-1"}}))
+    # START: dock OSD with flighttask_step_code=1 (inside record_steps=[0,1,2])
+    # also carries sub_device.device_sn so drone_sn is learned
+    pub.publish(
+        "thing/product/SN_DOCK_TEST/osd",
+        json.dumps({
+            "data": {
+                "flighttask_step_code": 1,
+                "sub_device": {"device_sn": "SN_DRONE_TEST"},
+            },
+            "timestamp": 1000,
+        }),
+    )
     await asyncio.sleep(0.1)
-    pub.publish("thing/product/SN_DOCK_TEST/osd",
-                json.dumps({"wayline_mission_state": "executing", "timestamp": 1000}))
+
+    # Carry flight_id via a dock events message so manifest.task_id is set
+    pub.publish(
+        "thing/product/SN_DOCK_TEST/events",
+        json.dumps({"method": "flighttask_progress", "data": {"flight_id": "T-E2E-1"}}),
+    )
     await asyncio.sleep(0.1)
+
+    # Drone OSD data
     pub.publish("thing/product/SN_DRONE_TEST/osd",
                 json.dumps({"mode_code": "manual_flight", "timestamp": 1001}))
     await asyncio.sleep(0.1)
+
+    # DRC data
     for i in range(20):
         pub.publish("thing/product/SN_DOCK_TEST/drc/up",
                     json.dumps({"hsi": i, "timestamp": 2000 + i}))
     await asyncio.sleep(0.5)
 
-    pub.publish("thing/product/SN_DOCK_TEST/osd",
-                json.dumps({"wayline_mission_state": "idle", "timestamp": 3000}))
-    await asyncio.sleep(2.0)
+    # END: dock OSD with flighttask_step_code=5 (outside record_steps=[0,1,2])
+    pub.publish(
+        "thing/product/SN_DOCK_TEST/osd",
+        json.dumps({
+            "data": {"flighttask_step_code": 5},
+            "timestamp": 3000,
+        }),
+    )
+    # idle_debounce_seconds=0 -> FINALIZING fires immediately on next tick
+    await asyncio.sleep(1.5)
 
     await rcli.stop()
     loop_task.cancel()
@@ -68,7 +93,7 @@ async def test_record_one_flight_end_to_end(mosquitto_broker, tmp_path: Path):
     assert manifest["dock_sn"] == "SN_DOCK_TEST"
     assert manifest["drone_sn"] == "SN_DRONE_TEST"
     topic_set = {t["topic"] for t in manifest["topics"]}
-    assert "thing/product/SN_DOCK_TEST/services" in topic_set
+    assert "thing/product/SN_DOCK_TEST/events" in topic_set
     assert "thing/product/SN_DOCK_TEST/osd" in topic_set
     assert "thing/product/SN_DRONE_TEST/osd" in topic_set
     assert "thing/product/SN_DOCK_TEST/drc/up" in topic_set

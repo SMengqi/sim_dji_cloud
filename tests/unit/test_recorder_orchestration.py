@@ -25,11 +25,8 @@ def minimal_config(tmp_path: Path):
         },
         "video": {"enabled": False},
         "flight_detection": {
-            "finalize_idle_seconds": 0,
-            "rules": {
-                "start": [{"source": "dock_services", "payload_match": {"method": "wayline_prepare"}}],
-                "end": [{"source": "dock_osd", "field": "wayline_mission_state", "equals": "idle"}],
-            },
+            "record_steps": [0, 1, 2],
+            "idle_debounce_seconds": 0,
         },
     }
 
@@ -40,40 +37,30 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
     await rec.start_async_components()
 
     await rec.on_mqtt_message(
-        topic="thing/product/SN_DOCK/services",
-        payload=json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T1"}}).encode(),
-        recv_ts_ms=1000,
-    )
-    # dock_osd 必须含 data.sub_device.device_sn 才能回填 drone_sn
-    await rec.on_mqtt_message(
         topic="thing/product/SN_DOCK/osd",
-        payload=json.dumps({
-            "wayline_mission_state": "executing",
-            "data": {"sub_device": {"device_sn": "SN_DRONE"}},
-        }).encode(),
-        recv_ts_ms=1500,
+        payload=json.dumps({"data": {"flighttask_step_code": 1,
+                                     "sub_device": {"device_sn": "SN_DRONE"}}}).encode(),
+        recv_ts_ms=1000,
     )
     await rec.on_mqtt_message(
         topic="thing/product/SN_DRONE/osd",
-        payload=json.dumps({"mode_code": "manual_flight"}).encode(),
+        payload=json.dumps({"data": {"mode_code": 3}}).encode(),
         recv_ts_ms=2000,
     )
     await rec.on_mqtt_message(
         topic="thing/product/SN_DOCK/osd",
-        payload=json.dumps({"wayline_mission_state": "idle"}).encode(),
+        payload=json.dumps({"data": {"flighttask_step_code": 5}}).encode(),
         recv_ts_ms=10_000,
     )
 
-    flight_dir = await rec.finalize_and_close(finalize_reason="auto_idle")
+    flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     assert flight_dir.exists()
     assert (flight_dir / "manifest.json").exists()
 
     manifest = json.loads((flight_dir / "manifest.json").read_text())
-    assert manifest["task_id"] == "T1"
     assert manifest["dock_sn"] == "SN_DOCK"
     assert manifest["drone_sn"] == "SN_DRONE"
     topics = {t["topic"] for t in manifest["topics"]}
-    assert "thing/product/SN_DOCK/services" in topics
     assert "thing/product/SN_DOCK/osd" in topics
     assert "thing/product/SN_DRONE/osd" in topics
 
@@ -82,25 +69,21 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
 async def test_drone_sn_backfilled_from_dock_osd_sub_device(minimal_config, tmp_path: Path):
     """关键修复：drone_sn 应从 dock_osd.data.sub_device.device_sn 精确提取，
     不再用'首条非 dock osd 即认为是飞行器'的启发式。"""
-    cfg = dict(minimal_config)
-    cfg["flight_detection"]["rules"]["start"] = [
-        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
-    ]
-    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
     await rec.start_async_components()
 
-    # dock_osd 携带 sub_device.device_sn = "REAL_DRONE_SN"
+    # dock_osd 携带 flighttask_step_code=1（起录）和 sub_device.device_sn
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
         json.dumps({
-            "wayline_mission_state": "executing",
-            "data": {"sub_device": {"device_sn": "REAL_DRONE_SN"}},
+            "data": {"flighttask_step_code": 1,
+                     "sub_device": {"device_sn": "REAL_DRONE_SN"}},
         }).encode(),
         500,
     )
     assert rec.drone_sn == "REAL_DRONE_SN"
 
-    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     manifest = json.loads((flight_dir / "manifest.json").read_text())
     assert manifest["drone_sn"] == "REAL_DRONE_SN"
 
@@ -110,26 +93,22 @@ async def test_post_rename_writes_continue_to_disk(minimal_config, tmp_path: Pat
     """关键回归：rename 之后 writer 不应失效。
     曾经的 bug：rename 时 drain+close 所有 writer 再重开，
     导致 writer/queue 状态错乱，rename 之后所有写入都停了。"""
-    cfg = dict(minimal_config)
-    cfg["flight_detection"]["rules"]["start"] = [
-        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
-    ]
-    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
     await rec.start_async_components()
 
-    # Pre-rename: 触发 RECORDING + 回填 drone_sn
+    # Pre-rename: 触发 RECORDING + 回填 drone_sn（step=1 → RECORDING，task_id 未知 → pending）
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
         json.dumps({
-            "wayline_mission_state": "executing",
-            "data": {"sub_device": {"device_sn": "SN_DRONE"}},
+            "data": {"flighttask_step_code": 1,
+                     "sub_device": {"device_sn": "SN_DRONE"}},
         }).encode(),
         100,
     )
     assert rec.flight_dir is not None
     assert rec.flight_dir.name.startswith("pending_")
 
-    # 触发 rename
+    # 触发 rename（dock_events 带 flight_id）
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/events",
         json.dumps({"method": "return_home_info",
@@ -146,15 +125,15 @@ async def test_post_rename_writes_continue_to_disk(minimal_config, tmp_path: Pat
             300 + i * 100,
         )
 
-    # 也持续录机场 osd 10 条
+    # 也持续录机场 osd 10 条（不含 flighttask_step_code，sticky 保持 step=1 → 继续 RECORDING）
     for i in range(10):
         await rec.on_mqtt_message(
             "thing/product/SN_DOCK/osd",
-            json.dumps({"wayline_mission_state": "executing", "i": i}).encode(),
+            json.dumps({"data": {"i": i}}).encode(),
             500 + i * 200,
         )
 
-    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     manifest = json.loads((flight_dir / "manifest.json").read_text())
 
     # 飞行器 osd: 30 条全部应在 manifest 里（rename 后写入）
@@ -180,19 +159,15 @@ async def test_post_rename_writes_continue_to_disk(minimal_config, tmp_path: Pat
 async def test_foreign_dock_topics_are_dropped(minimal_config, tmp_path: Path):
     """多机场共享 broker 时，非本机场 SN 的 topic 必须被 Recorder 丢弃，
     不能流入 manifest 或 jsonl。"""
-    cfg = dict(minimal_config)
-    cfg["flight_detection"]["rules"]["start"] = [
-        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
-    ]
-    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
     await rec.start_async_components()
 
-    # 启动录制：dock_osd 携带 sub_device.device_sn
+    # 启动录制：dock_osd 携带 flighttask_step_code=1 和 sub_device.device_sn
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
         json.dumps({
-            "wayline_mission_state": "executing",
-            "data": {"sub_device": {"device_sn": "SN_OURS_DRONE"}},
+            "data": {"flighttask_step_code": 1,
+                     "sub_device": {"device_sn": "SN_OURS_DRONE"}},
         }).encode(),
         500,
     )
@@ -221,7 +196,7 @@ async def test_foreign_dock_topics_are_dropped(minimal_config, tmp_path: Path):
         900,
     )
 
-    flight_dir = await rec.finalize_and_close(finalize_reason="manual_stop")
+    flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     manifest = json.loads((flight_dir / "manifest.json").read_text())
 
     topics_in_manifest = {t["topic"] for t in manifest["topics"]}
@@ -243,24 +218,22 @@ async def test_foreign_dock_topics_are_dropped(minimal_config, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_recorder_writes_pending_dir_before_task_id(minimal_config, tmp_path: Path):
     """task_id unknown → pending_<ts> dir; arrives → rename"""
-    cfg = dict(minimal_config)
-    cfg["flight_detection"]["rules"]["start"] = [
-        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
-    ]
-    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
     await rec.start_async_components()
 
+    # step=1 but no flight_id → pending dir
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "executing"}).encode(),
+        json.dumps({"data": {"flighttask_step_code": 1}}).encode(),
         500,
     )
     assert rec.flight_dir is not None
     assert rec.flight_dir.name.startswith("pending_")
 
+    # flight_id arrives via events → rename
     await rec.on_mqtt_message(
-        "thing/product/SN_DOCK/services",
-        json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T-RENAMED"}}).encode(),
+        "thing/product/SN_DOCK/events",
+        json.dumps({"data": {"flight_id": "T-RENAMED"}}).encode(),
         1000,
     )
     assert "T-RENAMED" in rec.flight_dir.name
@@ -271,40 +244,36 @@ async def test_recorder_rename_preserves_pre_rename_records_in_manifest(
     minimal_config, tmp_path: Path,
 ):
     """Records written to pending dir before rename must appear in final manifest counts."""
-    cfg = dict(minimal_config)
-    cfg["flight_detection"]["rules"]["start"] = [
-        {"source": "dock_osd", "field": "wayline_mission_state", "not_equals": "idle"}
-    ]
-    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
     await rec.start_async_components()
 
-    # 2 records to dock_osd pre-rename
+    # 2 records to dock_osd pre-rename (step=1 starts recording, no task_id)
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "executing", "n": 1}).encode(),
+        json.dumps({"data": {"flighttask_step_code": 1, "n": 1}}).encode(),
         500,
     )
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "executing", "n": 2}).encode(),
+        json.dumps({"data": {"n": 2}}).encode(),
         600,
     )
 
-    # rename trigger
+    # rename trigger via events
     await rec.on_mqtt_message(
-        "thing/product/SN_DOCK/services",
-        json.dumps({"method": "wayline_prepare", "data": {"flight_id": "T-MERGE"}}).encode(),
+        "thing/product/SN_DOCK/events",
+        json.dumps({"data": {"flight_id": "T-MERGE"}}).encode(),
         1000,
     )
 
     # 1 more record post-rename
     await rec.on_mqtt_message(
         "thing/product/SN_DOCK/osd",
-        json.dumps({"wayline_mission_state": "executing", "n": 3}).encode(),
+        json.dumps({"data": {"n": 3}}).encode(),
         1500,
     )
 
-    flight_dir = await rec.finalize_and_close(finalize_reason="auto_idle")
+    flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     manifest = json.loads((flight_dir / "manifest.json").read_text())
     assert "T-MERGE" in flight_dir.name
 
