@@ -60,6 +60,18 @@ sim-dji stop-record T-2026-001
     └── main.timing.json
 ```
 
+### 主镜头视频（SRS RTMP）
+
+机场把主镜头推流到 **SRS**，recorder 飞行期间从 SRS 拉流转写到 `video/main.mp4`（ffmpeg `-c copy`）。在 `recorder.yaml` 配置真实 SRS 拉流地址：
+
+```yaml
+video:
+  enabled: true
+  source_url_override: "rtmp://<srs主机>/live/<stream>"   # v1：填真实 SRS 拉流地址
+```
+
+`sim-dji record` 即自动录制；Ctrl-C / `stop-record` / 自动结束都会优雅停 ffmpeg 并回填 `manifest.video`。`--no-video`（或 `video.enabled=false`）关闭，不建 `video/`。需要 `ffmpeg` 在 PATH。详见操作手册 §3.5。
+
 ## 检查录制
 
 ```bash
@@ -192,7 +204,14 @@ ssh -L 8080:localhost:8080 <user>@<server>
 # 浏览器访问 http://localhost:8080
 ```
 
-详见操作手册 §6.5。
+可叠加站点**飞行区域**（XML 限制区/作业区多边形）+ PNG 离线底图，并用 `?calibrate=1` 实时对位校准：
+
+```bash
+sim-dji dashboard --port 8080 \
+  --flight-area-xml <area.xml> --flight-area-png <bg.png>
+```
+
+详见操作手册 §6.5 / §6.6。
 
 ---
 
@@ -226,5 +245,9 @@ ssh -L 8080:localhost:8080 <user>@<server>
 | `../2026-05-19-sim-dji-cloud-phase1-prp.md` | 阶段一实施计划（Recorder MVP） |
 | `../2026-05-21-sim-dji-cloud-phase2-prp.md` | 阶段二实施计划（Player + SelfCheck） |
 | `../2026-05-22-sim-dji-cloud-phase2-ui-prp.md` | 阶段二 UI 实施计划（dashboard） |
+| `../2026-05-25-sim-dji-cloud-flight-area-overlay-design.md` | 飞行区域叠加设计 |
+| `../2026-05-25-sim-dji-cloud-flight-area-overlay-prp.md` | 飞行区域叠加实施计划 |
+| `../2026-05-25-sim-dji-cloud-recorder-video-design.md` | 录制端视频（SRS RTMP）设计 |
+| `../2026-05-25-sim-dji-cloud-recorder-video-prp.md` | 录制端视频实施计划 |
 | `../2026-05-21-sim-dji-cloud-operations-manual.md` | **操作手册（常用入口）** |
 
