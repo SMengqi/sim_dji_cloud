@@ -147,6 +147,15 @@ sim-dji play ./recordings/<flight_dir>/ \
 
 把飞行目录的所有 topic 按原时序重发到指定 broker。被测业务系统作为订阅端连同一 broker 即可复现飞行。
 
+回放时还可把主镜头视频推回 SRS（与数据同步），被测系统/播放器从 SRS 拉流即可看到"实时"画面：
+
+```bash
+sim-dji play ./recordings/<flight_dir>/ --mqtt-url tcp://localhost:1883 --speed 1.0 \
+  --video-push-url "rtmp://<srs>/live/<stream>"
+```
+
+仅 `--speed 1.0` 生效；倍速/无视频/失败都跳过且不影响 MQTT 回放。详见操作手册 §5.2.1。
+
 ### 自检（录-放对称性回归）
 
 ```bash
@@ -249,5 +258,7 @@ sim-dji dashboard --port 8080 \
 | `../2026-05-25-sim-dji-cloud-flight-area-overlay-prp.md` | 飞行区域叠加实施计划 |
 | `../2026-05-25-sim-dji-cloud-recorder-video-design.md` | 录制端视频（SRS RTMP）设计 |
 | `../2026-05-25-sim-dji-cloud-recorder-video-prp.md` | 录制端视频实施计划 |
+| `../2026-05-26-sim-dji-cloud-playback-video-design.md` | 回放端视频推流（play→SRS）设计 |
+| `../2026-05-26-sim-dji-cloud-playback-video-prp.md` | 回放端视频推流实施计划 |
 | `../2026-05-21-sim-dji-cloud-operations-manual.md` | **操作手册（常用入口）** |
 

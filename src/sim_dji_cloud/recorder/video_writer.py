@@ -26,6 +26,9 @@ class VideoWriter:
             "ffmpeg",
             "-y",
             "-i", self.source_url,
+            # 只取视频流（+可选音频），丢弃源里的 data 流（如 dock 原生 RTMP 的
+            # "Stream Data:none"）；否则 -c copy 映射全部流会让 mp4 写不出文件头。
+            "-map", "0:v", "-map", "0:a?",
             "-c", "copy",
             "-movflags", "+faststart+frag_keyframe",
             "-f", "mp4",
