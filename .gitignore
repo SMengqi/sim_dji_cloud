@@ -17,6 +17,11 @@ __pycache__/
 *.mp4
 *.avi
 recordings/
+# run.sh 后台日志 + pid
+logs/
+
+# 本机启动脚本（含机器相关参数：SRS 地址、区域文件等）
+run.sh
 
 # IDE 配置（根据你用的编辑器）
 .vscode/
