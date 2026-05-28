@@ -5,7 +5,19 @@ from pathlib import Path
 from typing import Optional
 
 
-_DIR_RE = re.compile(r"^(.+?)__(.+?)__(\d{8}-\d{6})$")
+_DIR_RE_LEGACY = re.compile(r"^(.+?)__(.+?)__(\d{8}-\d{6})$")
+_DIR_RE_NEW = re.compile(r"^(.+)_(\d{8}-\d{6})(?:_\d{3})?$")
+
+
+def _parse_dir_name(name: str) -> tuple[str, str]:
+    """Return (task_id, dock_sn). 'unknown' for missing components."""
+    m = _DIR_RE_LEGACY.match(name)
+    if m:
+        return m.group(1), m.group(2)
+    m = _DIR_RE_NEW.match(name)
+    if m:
+        return "unknown", m.group(1)
+    return "unknown", "unknown"
 
 
 def _parse_topic_from_filename(filename: str) -> Optional[str]:
@@ -57,9 +69,7 @@ def repair_flight(flight_dir: Path, force: bool = False) -> int:
         return 1
 
     dir_name = flight_dir.name
-    m = _DIR_RE.match(dir_name)
-    task_id = m.group(1) if m else "unknown"
-    dock_sn = m.group(2) if m else "unknown"
+    task_id, dock_sn = _parse_dir_name(dir_name)
 
     topics_dir = flight_dir / "topics"
     if not topics_dir.exists():

@@ -195,5 +195,6 @@ async def test_rename_updates_video_output_dir(tmp_path):
 
     # 拿到 task_id -> 改名，视频 output_dir 应跟到新目录
     await rec._rename_pending_to_task("T1")
-    assert "T1" in rec.flight_dir.name
+    assert not rec.flight_dir.name.startswith("pending_"), \
+        f"Expected rename to have happened, got: {rec.flight_dir.name}"
     assert created[0].output_dir == rec.flight_dir / "video"

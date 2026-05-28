@@ -115,7 +115,8 @@ async def test_post_rename_writes_continue_to_disk(minimal_config, tmp_path: Pat
                     "data": {"flight_id": "T-POST-RENAME"}}).encode(),
         200,
     )
-    assert "T-POST-RENAME" in rec.flight_dir.name
+    assert not rec.flight_dir.name.startswith("pending_"), \
+        f"Expected rename to have happened, got: {rec.flight_dir.name}"
 
     # Post-rename：模拟持续 30 条飞行器 osd（之前 bug 会丢全部）
     for i in range(30):
@@ -236,7 +237,8 @@ async def test_recorder_writes_pending_dir_before_task_id(minimal_config, tmp_pa
         json.dumps({"data": {"flight_id": "T-RENAMED"}}).encode(),
         1000,
     )
-    assert "T-RENAMED" in rec.flight_dir.name
+    assert not rec.flight_dir.name.startswith("pending_"), \
+        f"Expected rename to have happened, got: {rec.flight_dir.name}"
 
 
 @pytest.mark.asyncio
@@ -275,10 +277,38 @@ async def test_recorder_rename_preserves_pre_rename_records_in_manifest(
 
     flight_dir = await rec.finalize_and_close(finalize_reason="task_idle")
     manifest = json.loads((flight_dir / "manifest.json").read_text())
-    assert "T-MERGE" in flight_dir.name
+    assert not flight_dir.name.startswith("pending_"), \
+        f"Expected rename to have happened, got: {flight_dir.name}"
 
     # dock_osd entry should reflect ALL 3 records (2 pre + 1 post)
     dock_osd = next(t for t in manifest["topics"] if t["topic"] == "thing/product/SN_DOCK/osd")
     assert dock_osd["count"] == 3
     assert dock_osd["first_recv_ts_ms"] == 500
     assert dock_osd["last_recv_ts_ms"] == 1500
+
+
+@pytest.mark.asyncio
+async def test_renamed_dir_uses_dock_sn_ts_format(minimal_config, tmp_path: Path):
+    """After task_id arrives, pending_<ms> dir is renamed to <dock_sn>_<YYYYMMDD-HHMMSS>."""
+    import re
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+
+    # step=1 but no flight_id -> pending dir
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"data": {"flighttask_step_code": 1}}).encode(),
+        500,
+    )
+    assert rec.flight_dir is not None
+    assert rec.flight_dir.name.startswith("pending_")
+
+    # flight_id arrives via events -> rename to new format
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/events",
+        json.dumps({"data": {"flight_id": "T-NEW-FORMAT"}}).encode(),
+        1000,
+    )
+    # New format: <dock_sn>_<YYYYMMDD-HHMMSS> (optional _<ms3> suffix on collision)
+    assert re.fullmatch(r"SN_DOCK_\d{8}-\d{6}(_\d{3})?", rec.flight_dir.name), \
+        f"Expected new format SN_DOCK_YYYYMMDD-HHMMSS, got: {rec.flight_dir.name}"

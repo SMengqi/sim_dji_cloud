@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from sim_dji_cloud.tools.repair_cmd import repair_flight
+from sim_dji_cloud.tools.repair_cmd import repair_flight, _parse_dir_name
 
 
 def test_repair_rebuilds_manifest_from_topics(tmp_path: Path):
@@ -51,3 +51,44 @@ def test_repair_force_overwrites(tmp_path: Path):
     m = json.loads((flight / "manifest.json").read_text())
     assert m["finalize_reason"] == "repaired"
     assert "junk" not in m
+
+
+# --- dual-format parsing tests ---
+
+def test_parse_legacy_format():
+    tid, sn = _parse_dir_name("UUID-XYZ__SN_DOCK__20260521-153732")
+    assert tid == "UUID-XYZ"
+    assert sn == "SN_DOCK"
+
+
+def test_parse_new_format():
+    tid, sn = _parse_dir_name("SN_DOCK_20260521-153732")
+    assert tid == "unknown"
+    assert sn == "SN_DOCK"
+
+
+def test_parse_new_format_with_ms3():
+    tid, sn = _parse_dir_name("SN_DOCK_20260521-153732_456")
+    assert tid == "unknown"
+    assert sn == "SN_DOCK"
+
+
+def test_parse_unrecognized():
+    tid, sn = _parse_dir_name("totally_unrelated_name")
+    assert tid == "unknown"
+    assert sn == "unknown"
+
+
+def test_repair_new_format_dir(tmp_path: Path):
+    """repair_flight works on new-format <dock_sn>_<ts> directory names."""
+    flight = tmp_path / "SN_DOCK_20260521-100000"
+    (flight / "topics").mkdir(parents=True)
+    (flight / "topics" / "thing__product__SN_DOCK__osd.0001.jsonl").write_text(
+        '{"recv_ts_ms":1000,"dji_ts_ms":1000,"direction":"up","topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+    )
+    code = repair_flight(flight)
+    assert code == 0
+    m = json.loads((flight / "manifest.json").read_text())
+    assert m["task_id"] == "unknown"
+    assert m["dock_sn"] == "SN_DOCK"
+    assert m["finalize_reason"] == "repaired"

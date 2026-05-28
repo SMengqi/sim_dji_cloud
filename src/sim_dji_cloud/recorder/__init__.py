@@ -117,7 +117,12 @@ class Recorder:
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(started_ms / 1000))
         task_id = self._detector.task_id
         if task_id:
-            name = f"{task_id}__{self.dock_sn}__{ts}"
+            base_name = f"{self.dock_sn}_{ts}"
+            candidate = self.storage_root / base_name
+            if candidate.exists():
+                ms3 = f"{started_ms % 1000:03d}"
+                base_name = f"{base_name}_{ms3}"
+            name = base_name
         else:
             name = f"pending_{started_ms}"
         self.flight_dir = self.storage_root / name
@@ -167,8 +172,13 @@ class Recorder:
         if not self.flight_dir.name.startswith("pending_"):
             return  # 已被另一并发调用 rename 完成
 
-        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime((self._task_started_ms or now_ms()) / 1000))
-        new_dir = self.flight_dir.parent / f"{task_id}__{self.dock_sn}__{ts}"
+        started_ms = self._task_started_ms or now_ms()
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(started_ms / 1000))
+        base_name = f"{self.dock_sn}_{ts}"
+        new_dir = self.flight_dir.parent / base_name
+        if new_dir.exists() and new_dir != self.flight_dir:
+            ms3 = f"{started_ms % 1000:03d}"
+            new_dir = self.flight_dir.parent / f"{base_name}_{ms3}"
 
         # 原子 rename。文件句柄继续有效（Linux inode 语义）。
         self.flight_dir.rename(new_dir)
