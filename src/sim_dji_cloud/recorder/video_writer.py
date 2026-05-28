@@ -1,6 +1,6 @@
 """Eager-launch + restart ffmpeg supervisor for recording RTMP video.
 
-Design (v3):
+Design (v3.1):
 
 The supervisor thread launches ffmpeg *immediately* — no probe phase. This
 matters because the v2 probe consumed a full GOP (~5 seconds) from the RTMP
@@ -9,39 +9,48 @@ forever (RTMP doesn't replay history to new subscribers). Under the
 record→play-video→record self-check workflow that 5 s loss compounded every
 cycle and the video eventually evaporated.
 
-Instead:
+Each attempt:
 
 1. **Eager launch.** Supervisor enters its loop and immediately ``Popen`` the
-   real ffmpeg writing to ``main_<epoch_ms>.mp4``. ffmpeg gets
-   ``-rw_timeout 5000000`` so an unreachable server / no-publisher endpoint
-   makes it exit within ~5 s on its own.
+   real ffmpeg writing to a placeholder ``main_<launch_ms>.mp4`` (epoch ms at
+   the moment of ``Popen``). ffmpeg gets ``-rw_timeout 5000000`` so an
+   unreachable / no-publisher endpoint makes it exit within ~5 s on its own.
 
-2. **Wait for ffmpeg to exit (or for ``stop()`` to fire).** The supervisor
-   polls the subprocess on a 0.5 s tick interleaved with the stop event so it
-   stays responsive.
+2. **Progress reader thread.** ffmpeg is also given
+   ``-progress pipe:1 -stats_period 0.1``. A daemon thread drains stdout and,
+   on the first non-zero ``out_time_us=…`` line, back-calculates the wall
+   clock of the first input frame as ``now_ms − out_time_us/1000`` and
+   **renames** the file to ``main_<first_frame_wall_ms>.mp4`` (POSIX rename is
+   atomic — ffmpeg's open fd keeps writing through the inode). The same
+   value is patched into the segment's ``ffmpeg_start_wall_ms`` so the
+   manifest is accurate.
 
-3. **Classify the exit.**
-   - If ``stop_event`` is set → the user asked us to finalize. Whatever was
-     written stays in the segment list; ``stop()`` SIGINTs ffmpeg so the mp4
-     trailer is written cleanly.
-   - Else if ``ran_sec >= success_min_seconds`` (default 15 s, ≥ 3× the
-     ``-rw_timeout``) → ffmpeg necessarily received real packets. Treat as a
-     completed recording even if the stream then ended; do **not** retry.
-   - Else (ffmpeg died fast and we didn't ask it to) → it was a failed start
-     (no publisher yet / transient handshake glitch). Delete the partial mp4,
-     pop the segment entry, sleep ``retry_interval_s``, retry.
+   This matters for downstream tools that align video PTS with MQTT
+   ``recv_ts_ms``: ``frame_at_PTS_X_recv_ms == ffmpeg_start_wall_ms + X``. With
+   the old "Popen time" timestamp, that equation was off by 1–3 s (RTMP
+   handshake + I-frame wait) and the error compounded across
+   record→play→record cycles.
 
-4. **stderr is appended, not overwritten.** ``main.ffmpeg.log`` is opened
-   in ``"a"`` mode each attempt with a ``=== ffmpeg attempt at wall_ms=… ===``
-   separator written before ffmpeg starts. This preserves failure messages
-   from earlier attempts for postmortem.
+3. **Wait for ffmpeg to exit (or for ``stop()`` to fire).** The supervisor
+   polls the subprocess on a 0.5 s tick interleaved with the stop event.
 
-What this is **not** doing:
-- Concatenating multiple successful ffmpeg runs into one logical recording.
-  If ffmpeg dies mid-flight after running for ≥ success_min_seconds, we stop
-  there and the rest of the flight isn't captured. Continuous re-recording
-  would need segment stitching in the manifest and a different ``stop_event``
-  contract; out of scope.
+4. **Classify the exit.**
+   - ffmpeg still alive when stop_event fires → user-initiated finalize, keep
+     the segment. ``stop()`` SIGINTs ffmpeg so the mp4 trailer is written.
+   - ``ran_sec >= success_min_seconds`` (default 15 s) → ffmpeg necessarily
+     received real packets, treat as completed recording, do **not** retry.
+   - Else → failed start (no publisher yet / transient glitch). Delete the
+     partial mp4 (under whichever name it currently has — placeholder or
+     renamed), pop the segment entry, sleep ``retry_interval_s``, retry.
+
+5. **stderr is appended, not overwritten.** ``main.ffmpeg.log`` is opened in
+   ``"a"`` mode each attempt with a ``=== ffmpeg attempt at wall_ms=… ===``
+   separator so failure messages across attempts are all preserved.
+
+Not in scope:
+- Concatenating multiple successful ffmpeg runs into one logical recording
+  (segment stitching). If ffmpeg dies mid-flight after running ≥ 15 s, we stop
+  there and the rest of the flight isn't captured.
 """
 
 from __future__ import annotations
@@ -60,7 +69,8 @@ from loguru import logger
 class VideoWriter:
     """Supervise an ffmpeg subprocess that pulls RTMP into ``video/main_<ms>.mp4``.
 
-    See module docstring for the eager-launch + restart-on-fast-exit design.
+    See module docstring for the eager-launch + restart-on-fast-exit +
+    first-frame-rename design.
 
     Parameters
     ----------
@@ -70,16 +80,18 @@ class VideoWriter:
         ``<flight_dir>/video/``. Created if missing.
     extra_args:
         Extra ffmpeg flags appended just before the output filename. The default
-        command already supplies ``-rw_timeout``, ``-c copy``, ``-f mp4`` and the
-        ``-map 0:v -map 0:a?`` pair to drop the data stream DJI sometimes injects.
+        command already supplies ``-rw_timeout``, ``-c copy``, ``-f mp4``, the
+        ``-map 0:v -map 0:a?`` pair, and ``-progress pipe:1 -stats_period 0.1``
+        (for the first-frame detector).
     retry_interval_s:
         Sleep between a failed-start (fast exit) and the next launch attempt.
     success_min_seconds:
         How long ffmpeg has to keep running before we count the recording as
-        "real" rather than "failed start". Must be greater than the ``-rw_timeout``
-        budget inside ``_build_cmd`` (5 s) plus some slack — 15 s is chosen so a
-        slow RTMP handshake on a flaky link still falls inside the rw_timeout
-        budget and gets retried, but any genuine packet ingestion is well past it.
+        "real" rather than "failed start". Must be greater than the
+        ``-rw_timeout`` budget inside ``_build_cmd`` (5 s) plus some slack —
+        15 s is chosen so a slow RTMP handshake still falls inside the
+        rw_timeout budget and gets retried, but any genuine packet ingestion
+        is well past it.
     """
 
     def __init__(
@@ -98,12 +110,15 @@ class VideoWriter:
         self._success_min_seconds = success_min_seconds
 
         self._proc: Optional[subprocess.Popen] = None
-        self._stderr_log = None   # file handle for main.ffmpeg.log (re-opened per attempt)
-        self._segments: list[dict] = []   # final list = only successful attempt(s)
-        self._filename: Optional[str] = None   # current attempt's filename
+        self._stderr_log = None
+        self._segments: list[dict] = []
+        self._filename: Optional[str] = None   # whichever name the current attempt's file has on disk
 
         self._stop_event = threading.Event()
         self._supervisor_thread: Optional[threading.Thread] = None
+        # Protects concurrent writes to ``_filename`` / ``_segments`` between
+        # the supervisor thread (cleanup) and the progress reader thread (rename).
+        self._state_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,17 +165,23 @@ class VideoWriter:
     def manifest_video_block(self, duration_ms: int) -> dict:
         """Return ``manifest.video`` block. ``file=None`` & ``segments=[]`` if no
         ffmpeg attempt was ever classified as successful.
+
+        Reads filename from the segment list (not ``self._filename``) so the
+        block is consistent with what's on disk even if rename happened in a
+        different thread.
         """
-        if not self._segments:
-            return {
-                "file": None,
-                "source_url": self.source_url,
-                "started_at_recv_ms": None,
-                "duration_ms": duration_ms,
-                "segments": [],
-            }
-        started = self._segments[0]["ffmpeg_start_wall_ms"]
-        video_rel = f"video/{self._filename}"
+        with self._state_lock:
+            if not self._segments:
+                return {
+                    "file": None,
+                    "source_url": self.source_url,
+                    "started_at_recv_ms": None,
+                    "duration_ms": duration_ms,
+                    "segments": [],
+                }
+            seg = self._segments[0]
+            started = seg["ffmpeg_start_wall_ms"]
+            video_rel = f"video/{seg['file']}"
         return {
             "file": video_rel,
             "source_url": self.source_url,
@@ -216,7 +237,6 @@ class VideoWriter:
             )
             self._cleanup_failed_attempt()
             if self._stop_event.is_set():
-                # stop() asked us to finalize; don't sleep into a retry.
                 break
             self._stop_event.wait(timeout=self._retry_interval_s)
 
@@ -229,54 +249,155 @@ class VideoWriter:
             )
 
     def _launch_ffmpeg(self) -> None:
-        """One ffmpeg attempt: open log in APPEND mode, write separator, Popen.
-
-        Records a tentative segment entry; ``_cleanup_failed_attempt`` removes
-        it if the attempt turns out to be a fast-failure.
+        """One ffmpeg attempt. Records a tentative segment entry and starts a
+        progress-reader daemon thread to detect the first frame and rename the
+        file to its wall-clock timestamp.
         """
         launch_ms = int(time.time() * 1000)
-        self._filename = f"main_{launch_ms}.mp4"
-        cmd = self._build_cmd(self._filename)
+        placeholder_filename = f"main_{launch_ms}.mp4"
+        cmd = self._build_cmd(placeholder_filename)
 
         # Append, not overwrite — preserve failure traces from earlier attempts.
         log_path = self.output_dir / "main.ffmpeg.log"
         self._stderr_log = open(log_path, "a")
         self._stderr_log.write(
-            f"\n=== ffmpeg attempt at wall_ms={launch_ms} (file={self._filename}) ===\n"
+            f"\n=== ffmpeg attempt at wall_ms={launch_ms} (file={placeholder_filename}) ===\n"
         )
         self._stderr_log.flush()
 
         self._proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,   # for -progress
             stderr=self._stderr_log,
         )
-        self._segments.append({
-            "file": self._filename,
-            "ffmpeg_start_wall_ms": launch_ms,
-            "pts_offset_ms": 0,
-        })
-        logger.info("ffmpeg launched: video/{} (pid={})", self._filename, self._proc.pid)
+        with self._state_lock:
+            self._filename = placeholder_filename
+            self._segments.append({
+                "file": placeholder_filename,
+                "ffmpeg_start_wall_ms": launch_ms,   # patched by progress reader
+                "pts_offset_ms": 0,
+            })
+        logger.info("ffmpeg launched: video/{} (pid={})", placeholder_filename, self._proc.pid)
+
+        progress_thread = threading.Thread(
+            target=self._read_progress_and_rename,
+            args=(self._proc, placeholder_filename),
+            name="video-progress",
+            daemon=True,
+        )
+        progress_thread.start()
+
+    def _read_progress_and_rename(
+        self,
+        proc: subprocess.Popen,
+        placeholder_filename: str,
+    ) -> None:
+        """Drain ffmpeg's ``-progress`` stdout. On the first non-zero
+        ``out_time_us=<N>`` line, back-calculate first-frame wall ms and rename
+        the output file. Keeps reading until the pipe closes (ffmpeg exits) so
+        the kernel pipe never fills up and blocks ffmpeg.
+        """
+        if proc.stdout is None:
+            return
+        renamed = False
+        try:
+            for raw in proc.stdout:
+                if renamed:
+                    continue
+                line = raw.decode("ascii", errors="ignore").strip()
+                if not line.startswith("out_time_us="):
+                    continue
+                try:
+                    us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                if us <= 0:
+                    # ffmpeg sometimes emits a zero block before any output;
+                    # skip and keep watching for the first real frame.
+                    continue
+                now_ms = int(time.time() * 1000)
+                first_frame_wall_ms = now_ms - us // 1000
+                self._rename_to_first_frame_time(
+                    placeholder_filename, first_frame_wall_ms
+                )
+                renamed = True
+        except Exception:
+            logger.exception("video progress reader errored")
+        finally:
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception:
+                pass
+
+    def _rename_to_first_frame_time(
+        self,
+        placeholder_filename: str,
+        first_frame_wall_ms: int,
+    ) -> None:
+        """Atomically rename ``main_<launch_ms>.mp4`` → ``main_<first_frame_ms>.mp4``
+        and patch the segment entry's ``file`` + ``ffmpeg_start_wall_ms``.
+
+        If the file-system rename fails (extremely rare — typically only if
+        cleanup got there first and deleted the placeholder), the in-memory
+        segment ``ffmpeg_start_wall_ms`` is still patched to the accurate
+        first-frame value. That way ``manifest.video`` stays correct even if
+        the on-disk filename is stale.
+        """
+        new_filename = f"main_{first_frame_wall_ms}.mp4"
+        if new_filename == placeholder_filename:
+            # Extremely tight Popen-to-first-frame loop (< 1 ms); nothing to do.
+            return
+
+        old_path = self.output_dir / placeholder_filename
+        new_path = self.output_dir / new_filename
+        rename_ok = False
+        try:
+            old_path.rename(new_path)   # POSIX-atomic; ffmpeg's fd unaffected
+            rename_ok = True
+        except FileNotFoundError:
+            # Cleanup may have just unlinked the placeholder; nothing to recover.
+            return
+        except Exception:
+            logger.exception(
+                "failed to rename {} → {}; manifest will still get accurate ts",
+                placeholder_filename, new_filename,
+            )
+
+        with self._state_lock:
+            # Only patch if this attempt's segment is still the tail of the list
+            # (cleanup hasn't popped it yet).
+            if self._segments and self._segments[-1]["file"] == placeholder_filename:
+                if rename_ok:
+                    self._segments[-1]["file"] = new_filename
+                    self._filename = new_filename
+                self._segments[-1]["ffmpeg_start_wall_ms"] = first_frame_wall_ms
+                logger.info(
+                    "first frame detected; first_frame_wall_ms={}{}",
+                    first_frame_wall_ms,
+                    f"; renamed video/{placeholder_filename} → video/{new_filename}"
+                    if rename_ok else " (rename failed; manifest ts patched anyway)",
+                )
 
     def _cleanup_failed_attempt(self) -> None:
         """Roll back the bookkeeping of an attempt that died too fast.
 
-        - Delete the partial mp4 if it exists (typically 0 bytes or a header stub).
-        - Pop the segment list entry we tentatively pushed at launch.
-        - Close the log handle so the next attempt re-opens with a fresh fd
-          (Popen's stderr= still works either way; closing is for tidiness and
-          ensures the separator written above precedes any next-attempt content).
+        Reads the *current* on-disk filename from the segment tail (could be
+        the placeholder or the post-rename name), deletes that file, pops the
+        segment, and closes the log handle.
         """
-        if self._filename is not None:
-            p = self.output_dir / self._filename
-            if p.exists():
-                try:
-                    p.unlink()
-                except Exception:
-                    logger.exception("failed to delete partial mp4 {}", p)
-            if self._segments and self._segments[-1]["file"] == self._filename:
+        with self._state_lock:
+            if self._segments:
+                seg = self._segments[-1]
+                filename = seg["file"]
+                p = self.output_dir / filename
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        logger.exception("failed to delete partial mp4 {}", p)
                 self._segments.pop()
-            self._filename = None
+                self._filename = None
 
         if self._stderr_log is not None:
             try:
@@ -289,18 +410,24 @@ class VideoWriter:
         return [
             "ffmpeg",
             "-y",
-            # 5s socket I/O timeout: makes ffmpeg exit non-zero quickly when the
-            # RTMP endpoint has no publisher yet, so the supervisor's restart loop
-            # can keep probing without consuming a GOP per probe like the old
-            # ffmpeg-probe did.
+            # 5s socket I/O timeout: ffmpeg exits non-zero quickly when the
+            # RTMP endpoint has no publisher yet, so the supervisor's restart
+            # loop can keep probing without consuming a GOP per probe like
+            # the old ffmpeg-probe did.
             "-rw_timeout", "5000000",
             "-i", self.source_url,
-            # Only take video stream (+ optional audio); drop data streams that
-            # some docks inject (e.g. "Stream Data:none") which break mp4 muxer.
+            # Only take video stream (+ optional audio); drop data streams
+            # some docks inject (e.g. "Stream Data:none") which break the mp4
+            # muxer.
             "-map", "0:v", "-map", "0:a?",
             "-c", "copy",
             "-movflags", "+faststart+frag_keyframe",
             "-f", "mp4",
+            # -progress on stdout + 0.1s stats_period: feeds the progress
+            # reader thread so it can back-calculate the first-frame wall ms
+            # and rename the output file accordingly.
+            "-progress", "pipe:1",
+            "-stats_period", "0.1",
             *self.extra_args,
             str(self.output_dir / filename),
         ]
