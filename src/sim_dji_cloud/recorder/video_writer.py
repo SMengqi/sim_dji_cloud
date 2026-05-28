@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from loguru import logger
+
 
 def _default_probe(url: str) -> bool:
     """Probe RTMP stream with ffprobe.  Returns True if the stream is reachable."""
@@ -80,6 +82,7 @@ class VideoWriter:
             daemon=True,
         )
         self._supervisor_thread.start()
+        logger.info("video supervisor started, probing {}", self.source_url)
 
     def is_alive(self) -> bool:
         """True iff ffmpeg subprocess is currently running."""
@@ -141,6 +144,12 @@ class VideoWriter:
                 self._launch_ffmpeg()
                 return
             self._stop_event.wait(timeout=self._retry_interval_s)
+        # 走到这里说明 stop_event 在我们探到流之前就被触发；本次飞行没有录到视频。
+        logger.warning(
+            "video supervisor exited without successful probe — no video recorded "
+            "for this flight (RTMP source {} never became reachable)",
+            self.source_url,
+        )
 
     def _launch_ffmpeg(self) -> None:
         """Called from supervisor thread once probe succeeds."""
@@ -161,6 +170,7 @@ class VideoWriter:
             "ffmpeg_start_wall_ms": launch_ms,
             "pts_offset_ms": 0,
         })
+        logger.info("ffmpeg launched: video/{} (pid={})", self._filename, self._proc.pid)
 
     def _build_cmd(self, filename: str) -> list[str]:
         return [

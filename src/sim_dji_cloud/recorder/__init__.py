@@ -147,7 +147,8 @@ class Recorder:
                     vw.start()
                     self._video_writer = vw
                     self._video_started_ms = started_ms
-                    logger.info("video recording started: {} -> {}", url, video_dir)
+                    # 真正的"已开始录"由 video_writer 内部在 ffmpeg 起来时打 "ffmpeg launched"；
+                    # supervisor 起来 / 没探到流退出 也都由 video_writer 自己日志，这里不再重复。
                 except Exception:
                     logger.exception("视频启动失败；继续录 MQTT（manifest.video=null）")
                     self._video_writer = None
