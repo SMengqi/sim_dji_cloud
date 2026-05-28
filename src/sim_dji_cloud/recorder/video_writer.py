@@ -10,26 +10,34 @@ from loguru import logger
 
 
 def _default_probe(url: str) -> bool:
-    """Probe RTMP stream with ffprobe.  Returns True if the stream is reachable.
+    """Probe RTMP / HTTP-FLV stream by attempting a bounded 1-second pull with ffmpeg.
 
-    重要：**不**传 ``-timeout``。ffmpeg 的 RTMP demuxer 会把 ``-timeout`` 解读为
-    "作为服务器 listen 等待客户端接入"的语义（URL 上会被改写出 ``?listen&listen_timeout=...``），
-    然后 ffprobe 会尝试**绑定**到目标 IP（非本机地址）当 server，立刻报
-    ``Cannot assign requested address``，根本不去当客户端连 dock——
-    结果就是流明明在推，probe 也永远返回 False，supervisor 永远等不到。
+    设计要点（两个坑都避开了）：
 
-    ``-rw_timeout``（单位微秒）才是客户端方向的 socket 读写超时；外层再用 subprocess
-    的 ``timeout`` 兜底，防止 ffprobe 因别的原因卡住。
+    1. **不**传 ``-timeout``。ffmpeg 的 RTMP demuxer 会把 ``-timeout`` 解读为
+       "作为服务器 listen 等待客户端接入"的语义（URL 上会被改写出 ``?listen&listen_timeout=...``），
+       ffprobe/ffmpeg 就尝试**绑定**到目标 IP（非本机地址）当 server，立刻报
+       ``Cannot assign requested address``——根本不去当客户端连 dock，
+       结果流明明在推，probe 也永远返回 False。
+
+    2. **不用** ``ffprobe -show_entries`` 这条路。DJI dock 推的 H.264 里带自定义
+       SEI（NAL type 245），ffprobe 处理这些 SEI 时会持续解析帧、不在 header
+       阶段退出，整个 probe 卡死直到外层 timeout，supervisor 永远进不到 ffmpeg 启动。
+       ``-rw_timeout`` 在这种"socket 一直有数据"的情况下也不会触发。
+
+    换成 ``ffmpeg -t 1 -f null -``：显式只拉 1 秒数据就退出，行为可预期：
+    流存在 → exit=0；流不在 → 连接失败/无数据快速非 0 退出。外层再用 subprocess
+    ``timeout=5`` 兜底，避免任何边角卡住整个 supervisor。
     """
     try:
         result = subprocess.run(
             [
-                "ffprobe",
-                "-rw_timeout", "2000000",   # 2s socket I/O 超时
+                "ffmpeg",
+                "-hide_banner", "-loglevel", "error", "-nostats",
+                "-rw_timeout", "2000000",   # 2s socket I/O 超时（防止连不上时挂很久）
+                "-t", "1",                  # 拉到 1 秒流就退出
                 "-i", url,
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
-                "-v", "error",
+                "-f", "null", "-",          # 解码后直接丢弃
             ],
             timeout=5,
             stdout=subprocess.DEVNULL,
