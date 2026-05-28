@@ -10,9 +10,9 @@ from loguru import logger
 
 
 def _default_probe(url: str) -> bool:
-    """Probe RTMP / HTTP-FLV stream by attempting a bounded 1-second pull with ffmpeg.
+    """Probe RTMP / HTTP-FLV stream by attempting a bounded short pull with ffmpeg.
 
-    设计要点（两个坑都避开了）：
+    设计要点（三个坑都避开了）：
 
     1. **不**传 ``-timeout``。ffmpeg 的 RTMP demuxer 会把 ``-timeout`` 解读为
        "作为服务器 listen 等待客户端接入"的语义（URL 上会被改写出 ``?listen&listen_timeout=...``），
@@ -22,29 +22,49 @@ def _default_probe(url: str) -> bool:
 
     2. **不用** ``ffprobe -show_entries`` 这条路。DJI dock 推的 H.264 里带自定义
        SEI（NAL type 245），ffprobe 处理这些 SEI 时会持续解析帧、不在 header
-       阶段退出，整个 probe 卡死直到外层 timeout，supervisor 永远进不到 ffmpeg 启动。
-       ``-rw_timeout`` 在这种"socket 一直有数据"的情况下也不会触发。
+       阶段退出，整个 probe 卡死直到外层 timeout。
 
-    换成 ``ffmpeg -t 1 -f null -``：显式只拉 1 秒数据就退出，行为可预期：
-    流存在 → exit=0；流不在 → 连接失败/无数据快速非 0 退出。外层再用 subprocess
-    ``timeout=5`` 兜底，避免任何边角卡住整个 supervisor。
+    3. **加 ``-c copy``**：第二版 probe 用 ``ffmpeg -t 1 -f null -`` 默认走的是
+       decode+re-encode 到 null，DJI 自定义 SEI 让 decoder 慢得离谱；同时 RTMP
+       handshake + 等 I-frame 也要花墙钟时间，I-frame 间隔 2~3s 是常态。两个一叠加，
+       原来 ``-rw_timeout=2s`` + subprocess ``timeout=5s`` 在 P2P RTMP 链路上根本
+       拿不到足够数据，probe 240 次全 False。加 ``-c copy`` 跳过 decode，
+       同时拉长两个 timeout 到能跨过一个 I-frame 间隔。
+
+    流存在 → 1 秒 PTS 内拷到字节，exit=0；流不在/URL 错 → 连接失败/socket 超时
+    快速非 0 退出。``stderr`` 保留，出问题用 debug 看 ffmpeg 报错。
     """
     try:
         result = subprocess.run(
             [
                 "ffmpeg",
-                "-hide_banner", "-loglevel", "error", "-nostats",
-                "-rw_timeout", "2000000",   # 2s socket I/O 超时（防止连不上时挂很久）
-                "-t", "1",                  # 拉到 1 秒流就退出
+                "-hide_banner", "-loglevel", "fatal", "-nostats",
+                # ``fatal`` 而非 ``error``：在某些 ffmpeg 版本上 libavformat 的 H.264 bitstream
+                # parser 会把 DJI 自定义 SEI（NAL 245）的 "truncated" 当 error level 喷出来，
+                # 量很大、CPU 也要花在 fprintf 上。这些"错误"实际上不影响 demux 切包，
+                # mpegts.js 能播、c copy 能录都是证据。fatal 级别只放真出大事的输出。
+                "-rw_timeout", "5000000",   # 5s socket I/O 超时（cover RTMP handshake + I-frame 间隔）
+                "-t", "1",                  # 拉到 1 秒 PTS 数据就退出
                 "-i", url,
-                "-f", "null", "-",          # 解码后直接丢弃
+                "-c", "copy",               # 不 decode，直接拷字节到 null
+                "-f", "null", "-",
             ],
-            timeout=5,
+            timeout=15,                     # subprocess 兜底：足够跨一个 GOP
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-        return result.returncode == 0
-    except Exception:
+        if result.returncode == 0:
+            return True
+        # 非 0 退出时把 ffmpeg 的 stderr 印出来，方便下次诊断"为什么 probe 还失败"。
+        err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        if err:
+            logger.debug("video probe failed (exit={}): {}", result.returncode, err[:500])
+        return False
+    except subprocess.TimeoutExpired:
+        logger.debug("video probe timed out after 15s pulling {}", url)
+        return False
+    except Exception as e:
+        logger.debug("video probe errored: {}", e)
         return False
 
 
