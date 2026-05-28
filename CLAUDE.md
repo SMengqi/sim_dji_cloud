@@ -71,10 +71,12 @@ Storage contract (frozen, do not break casually):
 ├── manifest.json                # topics[].files[] with offsets, gaps[], duration_ms, dock_sn, drone_sn
 ├── topics/
 │   └── thing__product__<sn>__<suffix>.NNNN.jsonl    # `/` → `__`, volume-rotated
-└── video/main.mp4 + main.timing.json
+└── video/main_<epoch_ms>.mp4 + main.timing.json + main.ffmpeg.log
 ```
 
 Each JSONL line: `{recv_ts_ms, dji_ts_ms, direction, topic, payload}`.
+
+`VideoWriter` (`recorder/video_writer.py`) is **eager-launch + restart-on-fast-exit**, no probe phase. On `start()` the supervisor thread `Popen`s ffmpeg immediately writing to `video/main_<epoch_ms>.mp4` with `-rw_timeout 5000000` so an unreachable / no-publisher RTMP endpoint makes ffmpeg exit non-zero within ~5s. If the run lasted < `success_min_seconds` (default **15s**, ≥ 3× rw_timeout) the supervisor treats it as a failed start, deletes the partial mp4, pops the segment entry, and retries after `retry_interval_s` (default 2s). If it ran ≥ 15s, supervisor treats it as a completed recording and exits the loop. `main.ffmpeg.log` is opened in **append mode** every attempt with a `=== ffmpeg attempt at wall_ms=… ===` separator so failure traces from earlier attempts accumulate. Why eager: the old probe-first design consumed ~5s of source data per probe (RTMP doesn't replay history to new subscribers), and that loss compounded every record→play→record self-check cycle.
 
 ### Playback uses virtual time, not wall clock
 
