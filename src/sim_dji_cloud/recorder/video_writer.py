@@ -10,13 +10,22 @@ from loguru import logger
 
 
 def _default_probe(url: str) -> bool:
-    """Probe RTMP stream with ffprobe.  Returns True if the stream is reachable."""
+    """Probe RTMP stream with ffprobe.  Returns True if the stream is reachable.
+
+    重要：**不**传 ``-timeout``。ffmpeg 的 RTMP demuxer 会把 ``-timeout`` 解读为
+    "作为服务器 listen 等待客户端接入"的语义（URL 上会被改写出 ``?listen&listen_timeout=...``），
+    然后 ffprobe 会尝试**绑定**到目标 IP（非本机地址）当 server，立刻报
+    ``Cannot assign requested address``，根本不去当客户端连 dock——
+    结果就是流明明在推，probe 也永远返回 False，supervisor 永远等不到。
+
+    ``-rw_timeout``（单位微秒）才是客户端方向的 socket 读写超时；外层再用 subprocess
+    的 ``timeout`` 兜底，防止 ffprobe 因别的原因卡住。
+    """
     try:
         result = subprocess.run(
             [
                 "ffprobe",
-                "-timeout", "2000000",
-                "-rw_timeout", "2000000",
+                "-rw_timeout", "2000000",   # 2s socket I/O 超时
                 "-i", url,
                 "-show_entries", "stream=index",
                 "-of", "csv=p=0",
