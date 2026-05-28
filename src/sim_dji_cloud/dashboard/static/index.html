@@ -68,6 +68,8 @@
         <span x-text="video.status"></span>
         <span style="flex:1"></span>
         <button @click="toggleMute()" x-text="video.muted ? '🔇 静音' : '🔊 有声'"></button>
+        <button @click="togglePip()" x-show="video.pipSupported"
+                x-text="video.inPip ? '↙ 收回' : '🪟 弹出'" title="放大到独立浮窗（可拖动/缩放/拖到别屏）"></button>
         <button @click="reloadVideo()">重连</button>
       </div>
     </div>
@@ -192,11 +194,16 @@ function dashboard() {
     startMarker: null,
     startIcon: null,
     pngOverlay: null,
-    video: { configured: false, url: '', muted: true, status: '未配置' },
+    video: { configured: false, url: '', muted: true, status: '未配置',
+             pipSupported: false, inPip: false },
     player: null,
     videoRetryTimer: null,
 
     async init() {
+      // Picture-in-Picture 仅 Chromium 系（Chrome/Edge/Opera）支持稳；
+      // Firefox/Safari 对 MediaSource 视频走 PiP 行为不稳，按浏览器能力开关。
+      this.video.pipSupported =
+        ('pictureInPictureEnabled' in document) && document.pictureInPictureEnabled;
       this.initMap();
       await this.loadFlightArea();
       await this.loadVideo();
@@ -278,6 +285,11 @@ function dashboard() {
       this.destroyPlayer();
       const el = this.$refs.video;
       this.video.status = '连接中';
+      // 同步 PiP 状态：用户也可能通过浏览器 / 系统的"关闭浮窗"按钮退出，要让 UI 跟着切回。
+      // addEventListener 多次调用同一 handler 不会重复绑定 — 这里每次 reload 都重新设没问题，
+      // 因为 mpegts 仍然 attach 在同一个 video 元素上。
+      el.addEventListener('enterpictureinpicture', () => { this.video.inPip = true; });
+      el.addEventListener('leavepictureinpicture', () => { this.video.inPip = false; });
       const p = mpegts.createPlayer(
         { type: 'flv', isLive: true, url: this.video.url },
         { liveBufferLatencyChasing: true, enableStashBuffer: false });
@@ -287,6 +299,22 @@ function dashboard() {
       p.load();
       el.play().catch(() => {});   // autoplay 受策略限制时忽略；muted 下一般可放
       this.player = p;
+    },
+
+    async togglePip() {
+      const el = this.$refs.video;
+      if (!el) return;
+      try {
+        if (document.pictureInPictureElement === el) {
+          await document.exitPictureInPicture();
+        } else {
+          await el.requestPictureInPicture();
+        }
+      } catch (e) {
+        // 浏览器策略可能在某些状态拒绝（未播放、未交互、不支持 MSE 走 PiP 等）。
+        // 不抛错给用户，只在控制台留痕；按钮还在，下一次能再点。
+        console.warn('PiP toggle failed:', e);
+      }
     },
 
     destroyPlayer() {

@@ -159,3 +159,20 @@ def test_index_html_embeds_video_player():
     assert 'class="video-panel"' in html
     assert "/api/video" in html
     assert "loadVideo" in html
+
+
+def test_index_html_has_pip_toggle():
+    """Dashboard exposes a Picture-in-Picture toggle: detect support via
+    document.pictureInPictureEnabled, provide togglePip()/requestPictureInPicture
+    glue, and bind a button gated on video.pipSupported.
+    """
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    assert "pictureInPictureEnabled" in html
+    assert "togglePip" in html
+    assert "requestPictureInPicture" in html
+    assert "video.pipSupported" in html
+    # enter/leave event listeners must be wired so OS-level close syncs UI state.
+    assert "enterpictureinpicture" in html
+    assert "leavepictureinpicture" in html
