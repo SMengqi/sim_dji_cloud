@@ -144,7 +144,7 @@ class Recorder:
                     video_dir = self.flight_dir / "video"
                     vw = self._video_writer_factory(
                         url, video_dir, vcfg.get("ffmpeg_extra_args", []))
-                    vw.start(started_ms)
+                    vw.start()
                     self._video_writer = vw
                     self._video_started_ms = started_ms
                     logger.info("video recording started: {} -> {}", url, video_dir)

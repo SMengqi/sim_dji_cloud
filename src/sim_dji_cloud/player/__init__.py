@@ -65,18 +65,22 @@ class Player:
             )
             self._tasks.append(task)
 
+        video_meta = self._manifest.get("video") or {}
+        video_rel = video_meta.get("file")  # e.g. "video/main_<ms>.mp4" or "video/main.mp4"
+        video_file = (self.flight_dir / video_rel) if video_rel else None
+        video_exists = bool(video_file and video_file.exists())
         plan = plan_video_push(
             self._manifest, self._video_push_url, self._speed,
-            (self.flight_dir / "video" / "main.mp4").exists(),
+            video_exists,
         )
         if plan is not None:
-            self._video_task = asyncio.create_task(self._run_video_push(plan))
+            self._video_task = asyncio.create_task(self._run_video_push(plan, video_file))
 
-    async def _run_video_push(self, plan: dict) -> None:
+    async def _run_video_push(self, plan: dict, video_file: "Path | None") -> None:
         try:
             await self._scheduler.wait_until_virt(plan["wait_virt_ms"])
             pusher = self._video_pusher_factory(
-                self.flight_dir / "video" / "main.mp4", self._video_push_url, [])
+                video_file, self._video_push_url, [])
             pusher.start(plan["ss_seconds"])
             self._video_pusher = pusher
             logger.info("video push started -> {}", self._video_push_url)

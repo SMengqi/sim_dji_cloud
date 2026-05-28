@@ -8,26 +8,32 @@ from sim_dji_cloud.recorder import Recorder
 
 class FakeVideoWriter:
     """测试替身：记录调用，不起 ffmpeg。签名与 VideoWriter 一致。"""
+
+    # A synthetic epoch-ms filename matching the new convention.
+    _FAKE_FILENAME = "main_1779937234567.mp4"
+    _FAKE_START_MS = 1779937234567
+
     def __init__(self, source_url, output_dir, extra_args=None):
         self.source_url = source_url
         self.output_dir = Path(output_dir)
         self.extra_args = extra_args
-        self.started_at = None
+        self.started = False
         self.stopped = False
 
-    def start(self, started_at_recv_ms):
-        self.started_at = started_at_recv_ms
+    def start(self) -> None:
+        self.started = True
 
     def stop(self, timeout_s=10.0):
         self.stopped = True
 
     def manifest_video_block(self, duration_ms):
+        rel = f"video/{self._FAKE_FILENAME}"
         return {
-            "file": "video/main.mp4",
+            "file": rel,
             "source_url": self.source_url,
-            "started_at_recv_ms": self.started_at,
+            "started_at_recv_ms": self._FAKE_START_MS,
             "duration_ms": duration_ms,
-            "segments": [{"start_ms": 0, "end_ms": duration_ms, "file": "video/main.mp4"}],
+            "segments": [{"start_ms": 0, "end_ms": duration_ms, "file": rel}],
         }
 
 
@@ -86,17 +92,20 @@ async def test_video_started_and_manifest_set(tmp_path):
     await _drive_flight(rec)
     flight_dir = await rec.finalize_and_close("auto_idle")
 
+    import re
     assert len(created) == 1
     vw = created[0]
     assert vw.source_url == "rtmp://srs/live/x"
     assert vw.output_dir.name == "video"
-    assert vw.started_at == 1000
+    assert vw.started is True
     assert vw.stopped is True
 
     manifest = json.loads((flight_dir / "manifest.json").read_text())
     assert manifest["video"]["source_url"] == "rtmp://srs/live/x"
-    assert manifest["video"]["file"] == "video/main.mp4"
-    assert manifest["video"]["started_at_recv_ms"] == 1000
+    assert re.match(r"^video/main_\d+\.mp4$", manifest["video"]["file"]), (
+        f"Expected video/main_<ms>.mp4, got: {manifest['video']['file']}"
+    )
+    assert manifest["video"]["started_at_recv_ms"] == FakeVideoWriter._FAKE_START_MS
 
 
 @pytest.mark.asyncio
