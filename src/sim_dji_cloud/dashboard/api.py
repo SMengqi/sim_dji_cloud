@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from sim_dji_cloud.dashboard.live_state import LiveState
@@ -16,6 +17,7 @@ def create_app(
     ws_push_interval_ms: int = 2000,
     flight_area: dict | None = None,
     flight_area_png: Path | None = None,
+    video_url: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="sim-dji dashboard")
 
@@ -49,6 +51,12 @@ def create_app(
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    @app.get("/api/video")
+    async def video_meta() -> JSONResponse:
+        if not video_url:
+            return JSONResponse({"configured": False})
+        return JSONResponse({"configured": True, "url": video_url, "type": "flv"})
+
     @app.get("/api/snapshot")
     async def snapshot() -> JSONResponse:
         return JSONResponse(state.snapshot())
@@ -74,5 +82,7 @@ def create_app(
         except Exception:
             logger.exception("dashboard ws error")
             return
+
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     return app

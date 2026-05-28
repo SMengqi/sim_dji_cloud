@@ -174,10 +174,14 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
 @click.option("--flight-area-png-bounds-latlon", default=None,
               help="PNG 地理边界经纬度 'swLat,swLng,neLat,neLng'（校准模式产出）；优先级最高。"
                    "也可写入 PNG 同名 '.bounds' 文件，未传参时自动读取")
+@click.option("--video-url", default=None,
+              help="SRS 主镜头 HTTP-FLV 地址,如 http://<srs>:8080/live/livestream.flv;"
+                   "提供后右侧栏顶部显示视频面板,缺省则不显示")
 def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
                   flight_area_xml: str | None, flight_area_png: str | None,
                   flight_area_png_bounds: str | None,
-                  flight_area_png_bounds_latlon: str | None) -> None:
+                  flight_area_png_bounds_latlon: str | None,
+                  video_url: str | None) -> None:
     from sim_dji_cloud.tools.dashboard_cmd import run_dashboard
     raise SystemExit(run_dashboard(
         mqtt_url=mqtt_url, host=host, port=port,
@@ -186,6 +190,7 @@ def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
         flight_area_png=flight_area_png,
         flight_area_png_bounds=flight_area_png_bounds,
         flight_area_png_bounds_latlon=flight_area_png_bounds_latlon,
+        video_url=video_url,
     ))
 
 

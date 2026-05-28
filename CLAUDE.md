@@ -93,6 +93,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 - Dock/drone routing uses learned device_sn (`_known_dock_sn` / `_known_drone_sn`), set the first time an OSD with `sub_device` arrives. After that, route purely by topic's device_sn.
 - HTML enum labels (`mode_code`, `flighttask_step_code`, `drone_in_dock`, `drc_state`) live in `static/index.html` as a JS `ENUM_MAP`. Adding new enums means editing both `LiveState._update_dock` (extract the field) and `ENUM_MAP` (label it). DJI Cloud API docs define the integer → meaning mapping.
 - `static/index.html` loads Leaflet + Alpine.js from CDN. The browser needs public-internet access; the server itself is just an HTTP server.
+- 右侧栏顶部可选内嵌 HTTP-FLV 视频（mpegts.js，vendored 于 `static/mpegts.min.js`，经 `/static` 挂载发布）；`--video-url` 缺省则隐藏，不影响现有页面。
 
 ### Config & flight-detection rules
 
@@ -125,4 +126,5 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 | `../2026-05-25-sim-dji-cloud-recorder-video-design.md` | Recorder video: pull RTMP from SRS → video/main.mp4 (design) |
 | `../2026-05-26-sim-dji-cloud-playback-video-design.md` | Playback video: play pushes video/main.mp4 → SRS RTMP (design) |
 | `../2026-05-27-sim-dji-cloud-continuous-record-design.md` | Continuous record: dock flighttask_step-driven multi-task, no auto-exit, video default-off (design) |
+| `../2026-05-27-sim-dji-cloud-dashboard-video-design.md` | Dashboard embedded video: mpegts.js HTTP-FLV player in sidebar (design) |
 | `../2026-05-21-sim-dji-cloud-operations-manual.md` | **End-user operations manual — first stop for "how do I run X"** |

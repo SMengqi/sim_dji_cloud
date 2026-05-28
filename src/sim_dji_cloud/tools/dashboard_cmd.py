@@ -18,6 +18,7 @@ def run_dashboard(
     flight_area_png: str | None = None,
     flight_area_png_bounds: str | None = None,
     flight_area_png_bounds_latlon: str | None = None,
+    video_url: str | None = None,
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -51,6 +52,7 @@ def run_dashboard(
         ws_push_interval_ms=ws_push_interval_ms,
         flight_area=flight_area,
         flight_area_png=Path(flight_area_png) if (flight_area and flight_area_png) else None,
+        video_url=video_url,
     )
 
     sub_holder: dict = {"sub": None}

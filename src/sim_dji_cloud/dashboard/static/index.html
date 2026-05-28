@@ -9,6 +9,7 @@
 <script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="/static/mpegts.min.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -40,6 +41,13 @@
   .topic-counts .row { padding: 1px 0; }
   .drone-icon .drone-rot { width: 48px; height: 48px; transform-origin: center center;
                            transition: transform 0.25s linear; }
+  [x-cloak] { display: none !important; }
+  .video-panel { margin-bottom: 10px; }
+  .video-panel video { display:block; width:100%; background:#000; border-radius:4px; aspect-ratio:16/9; }
+  .video-bar { display:flex; align-items:center; gap:8px; margin-top:4px; font-size:12px; color:#888; }
+  .video-bar button { background:#1a1a1a; color:#ccc; border:1px solid #2a2a2a; border-radius:4px;
+                      padding:2px 8px; cursor:pointer; font-size:12px; }
+  .video-bar button:hover { background:#2a2a2a; }
 </style>
 </head>
 <body x-data="dashboard()" x-init="init()">
@@ -53,6 +61,16 @@
   <div id="map"></div>
 
   <div class="sidebar">
+    <!-- 主镜头视频（--video-url 提供时显示；SRS HTTP-FLV，mpegts.js 播放） -->
+    <div class="video-panel" x-show="video.configured" x-cloak>
+      <video x-ref="video" muted playsinline></video>
+      <div class="video-bar">
+        <span x-text="video.status"></span>
+        <span style="flex:1"></span>
+        <button @click="toggleMute()" x-text="video.muted ? '🔇 静音' : '🔊 有声'"></button>
+        <button @click="reloadVideo()">重连</button>
+      </div>
+    </div>
     <div class="card" x-show="state.drone && state.drone.sn">
       <h2>飞行器 (<span x-text="state.drone.sn"></span>)</h2>
       <div class="row"><span class="k">飞行模式</span><span class="v" x-text="enumLabel('drone_mode', state.drone.mode_code)"></span></div>
@@ -174,10 +192,14 @@ function dashboard() {
     startMarker: null,
     startIcon: null,
     pngOverlay: null,
+    video: { configured: false, url: '', muted: true, status: '未配置' },
+    player: null,
+    videoRetryTimer: null,
 
     async init() {
       this.initMap();
       await this.loadFlightArea();
+      await this.loadVideo();
       this.connectWS();
     },
 
@@ -240,6 +262,49 @@ function dashboard() {
         // 未配置飞行区 -> 回退 OSM 在线底图（保持现有行为）
         this.addOsmBase();
       }
+    },
+
+    async loadVideo() {
+      let v = null;
+      try { v = await (await fetch('/api/video')).json(); } catch (e) { v = null; }
+      if (!v || !v.configured) { this.video.configured = false; return; }
+      this.video.configured = true;
+      this.video.url = v.url;
+      this.$nextTick(() => this.startPlayer());   // 等 x-show 渲染出 <video> 再绑定
+    },
+
+    startPlayer() {
+      if (!window.mpegts || !mpegts.isSupported()) { this.video.status = '浏览器不支持'; return; }
+      this.destroyPlayer();
+      const el = this.$refs.video;
+      this.video.status = '连接中';
+      const p = mpegts.createPlayer(
+        { type: 'flv', isLive: true, url: this.video.url },
+        { liveBufferLatencyChasing: true, enableStashBuffer: false });
+      p.attachMediaElement(el);
+      p.on(mpegts.Events.ERROR, () => { this.video.status = '已断开'; this.scheduleReload(); });
+      p.on(mpegts.Events.MEDIA_INFO, () => { this.video.status = '播放中'; });
+      p.load();
+      el.play().catch(() => {});   // autoplay 受策略限制时忽略；muted 下一般可放
+      this.player = p;
+    },
+
+    destroyPlayer() {
+      if (this.player) { try { this.player.destroy(); } catch (e) {} this.player = null; }
+    },
+
+    scheduleReload() {
+      if (this.videoRetryTimer) return;
+      this.videoRetryTimer = setTimeout(() => {
+        this.videoRetryTimer = null;
+        if (this.video.configured) this.startPlayer();
+      }, 3000);
+    },
+
+    reloadVideo() { this.startPlayer(); },
+    toggleMute() {
+      const el = this.$refs.video;
+      el.muted = !el.muted; this.video.muted = el.muted;
     },
 
     // PNG 对位校准：拖 SW/NE 角调缩放（含东西/南北独立），拖 ✛ 平移整体；

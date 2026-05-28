@@ -114,3 +114,48 @@ def test_flight_area_configured_without_png():
     assert body["configured"] is True
     assert "png_url" not in body
     assert client.get("/api/flight-area/background.png").status_code == 404
+
+
+def test_video_unconfigured():
+    app = create_app(LiveState())
+    client = TestClient(app)
+    r = client.get("/api/video")
+    assert r.status_code == 200
+    assert r.json() == {"configured": False}
+
+
+def test_video_configured():
+    url = "http://10.0.0.5:8080/live/livestream.flv"
+    app = create_app(LiveState(), video_url=url)
+    client = TestClient(app)
+    r = client.get("/api/video")
+    assert r.status_code == 200
+    assert r.json() == {"configured": True, "url": url, "type": "flv"}
+
+
+def test_static_serves_mpegts():
+    app = create_app(LiveState())
+    client = TestClient(app)
+    r = client.get("/static/mpegts.min.js")
+    assert r.status_code == 200
+    assert "javascript" in r.headers["content-type"].lower()
+    assert "createPlayer" in r.text
+
+
+def test_dashboard_help_shows_video_url():
+    from click.testing import CliRunner
+    from sim_dji_cloud.cli import main
+    res = CliRunner().invoke(main, ["dashboard", "--help"])
+    assert res.exit_code == 0
+    assert "--video-url" in res.output
+
+
+def test_index_html_embeds_video_player():
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    assert "/static/mpegts.min.js" in html
+    assert "mpegts.createPlayer" in html
+    assert 'class="video-panel"' in html
+    assert "/api/video" in html
+    assert "loadVideo" in html

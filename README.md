@@ -222,6 +222,14 @@ sim-dji dashboard --port 8080 \
 
 详见操作手册 §6.5 / §6.6。
 
+右侧栏可内嵌 SRS 主镜头 HTTP-FLV 实时画面（mpegts.js，库随包分发无需外网）：
+
+```bash
+sim-dji dashboard --port 8080 --video-url http://<srs>:8080/live/livestream.flv
+```
+
+详见操作手册 §6.5「仪表盘内嵌视频」。
+
 ---
 
 ## 📖 完整操作手册
