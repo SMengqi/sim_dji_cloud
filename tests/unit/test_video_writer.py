@@ -546,7 +546,104 @@ def test_timing_json_has_correct_segment_on_success(tmp_path: Path):
     seg = timing["segments"][0]
     assert seg["file"] == f"main_{expected_ms}.mp4"
     assert seg["ffmpeg_start_wall_ms"] == expected_ms
+    # Popen 时间戳：跟 start_wall_ms 在"没收到 first frame"路径下相等。
+    assert seg["ffmpeg_popen_wall_ms"] == expected_ms
     assert seg["pts_offset_ms"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 17. ffmpeg_popen_wall_ms 不会被 first-frame rename patch（保留"开始拉流"语义）
+# ---------------------------------------------------------------------------
+
+def test_ffmpeg_popen_wall_ms_unchanged_after_first_frame_rename(tmp_path: Path):
+    """rename 后 ffmpeg_start_wall_ms 被 patch 成第一帧墙钟，
+    但 ffmpeg_popen_wall_ms 必须保留为 Popen 那一刻的值（"开始拉流"语义）。
+    下游回放对齐可以用两个里随便挑一个做时间锚点。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    # 同 test 15 的时间安排：launch_ms=1000000, first_frame_wall_ms=1000001
+    times = iter([1000.000, 1000.034])
+    expected_launch_ms = 1000000
+    expected_first_frame_ms = 1000001
+    progress_lines = (b"out_time_us=33333\n", b"progress=continue\n")
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1000.034)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        # 等 rename 完成
+        new_path = video_dir / f"main_{expected_first_frame_ms}.mp4"
+        for _ in range(400):
+            if new_path.exists():
+                break
+            time.sleep(0.005)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    # 文件名被 rename 到第一帧
+    assert seg["file"] == f"main_{expected_first_frame_ms}.mp4"
+    # ffmpeg_start_wall_ms 是第一帧墙钟（被 progress reader patch 过）
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+    # ffmpeg_popen_wall_ms 是 Popen 那一刻，**不变**
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+
+    # manifest block 同时暴露两个时间锚
+    block = vw.manifest_video_block(duration_ms=10000)
+    assert block["started_at_recv_ms"] == expected_first_frame_ms
+    assert block["popen_at_recv_ms"] == expected_launch_ms
+
+
+# ---------------------------------------------------------------------------
+# 18. 空 manifest 也带 popen_at_recv_ms=None（前端 / player 读得一致）
+# ---------------------------------------------------------------------------
+
+def test_empty_manifest_has_popen_at_recv_ms_none(tmp_path: Path):
+    """没有任何成功 ffmpeg 的飞行，manifest.video 里 popen_at_recv_ms=None，
+    跟 started_at_recv_ms=None 平行，让消费者写一致逻辑。"""
+    video_dir = tmp_path / "video"
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        _make_partial_file(cmd, b"")
+        return _exited_proc(exit_code=1)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        time.sleep(0.05)
+        vw.stop()
+
+    block = vw.manifest_video_block(duration_ms=5000)
+    assert block["started_at_recv_ms"] is None
+    assert block["popen_at_recv_ms"] is None
 
 
 # ---------------------------------------------------------------------------

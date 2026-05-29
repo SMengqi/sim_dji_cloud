@@ -176,16 +176,24 @@ class VideoWriter:
                     "file": None,
                     "source_url": self.source_url,
                     "started_at_recv_ms": None,
+                    "popen_at_recv_ms": None,
                     "duration_ms": duration_ms,
                     "segments": [],
                 }
             seg = self._segments[0]
             started = seg["ffmpeg_start_wall_ms"]
+            # 老段（升级前的 timing.json）可能没有 ffmpeg_popen_wall_ms 字段，
+            # 这种情况下退回 started_at_recv_ms（语义上视频"开始拉流"≈"已开始录"）。
+            popen = seg.get("ffmpeg_popen_wall_ms", started)
             video_rel = f"video/{seg['file']}"
         return {
             "file": video_rel,
             "source_url": self.source_url,
             "started_at_recv_ms": started,
+            # popen_at_recv_ms：ffmpeg Popen 时的墙钟（"开始拉流"），可作为下游
+            # 视频对齐的备选锚点；如果回放时视频比数据晚，可以尝试用这个替代
+            # started_at_recv_ms 看效果。
+            "popen_at_recv_ms": popen,
             "duration_ms": duration_ms,
             "segments": [
                 {"start_ms": 0, "end_ms": duration_ms, "file": video_rel},
@@ -274,7 +282,14 @@ class VideoWriter:
             self._filename = placeholder_filename
             self._segments.append({
                 "file": placeholder_filename,
-                "ffmpeg_start_wall_ms": launch_ms,   # patched by progress reader
+                # ffmpeg_popen_wall_ms：Popen() 返回那一刻的墙钟，永远是"开始拉流"
+                # 的时间锚，progress reader **不会**改写它。下游回放时可以用它做
+                # 视频对齐的"早锚点"（vs ffmpeg_start_wall_ms 的"第一帧锚点"），
+                # 比较两种 anchor 哪种实测同步效果更好。
+                "ffmpeg_popen_wall_ms": launch_ms,
+                # ffmpeg_start_wall_ms：默认与 popen 相同，progress reader 拿到
+                # 第一帧后会被 patch 成"第一帧到达"的墙钟。
+                "ffmpeg_start_wall_ms": launch_ms,
                 "pts_offset_ms": 0,
             })
         logger.info("ffmpeg launched: video/{} (pid={})", placeholder_filename, self._proc.pid)
