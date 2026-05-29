@@ -138,3 +138,74 @@ async def test_push_start_failure_is_non_fatal(tmp_path):
     await p.start()
     await p.wait_until_done()  # 不抛
     assert len(published) == 1  # MQTT 照常重发
+
+
+# ---------------------------------------------------------------------------
+# Regression: ./run.sh stop play-video 发 SIGTERM，play_flight 必须把 video
+# pusher 也停掉，否则 ffmpeg 子进程会被孤儿化继续推流。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_play_flight_sigterm_stops_video_pusher(tmp_path, monkeypatch):
+    """复现并固化 fix：上游发 SIGTERM 时，play_flight 走 wait_task.cancel()
+    路径，让 Player.wait_until_done() 的 finally 跑到，
+    VideoPusher.stop() 被调用（→ 真实场景里给 ffmpeg 发 SIGINT 收尾），
+    不会留下孤儿 ffmpeg 继续推 RTMP。
+    """
+    import asyncio
+    import signal as _signal
+    import os
+    from sim_dji_cloud.tools import play_cmd
+    from sim_dji_cloud.player import Player as RealPlayer
+
+    # 1. publisher 的 publish 永远 block：让"飞行"一直进行中、不会自然结束，
+    #    从而把测试的退出路径强制走"收到信号 → cancel"那条分支。
+    class BlockingPublisher:
+        def __init__(self, **kw): pass
+        async def connect(self): pass
+        async def disconnect(self): self.disconnected = True
+        async def publish(self, topic, payload, qos=0):
+            await asyncio.Event().wait()   # 永久阻塞，直到被 cancel
+
+    monkeypatch.setattr(play_cmd, "MqttPublisher", BlockingPublisher)
+
+    # 2. 注入 fake VideoPusher，记录 stop() 是否被调到。
+    fake_pusher = FakeVideoPusher(
+        source_file=tmp_path / "video" / "main.mp4",
+        push_url="rtmp://srs/live/x",
+    )
+    def factory(src, url, extra=None):
+        return fake_pusher
+
+    # play_cmd 内部用默认 VideoPusher 构造 Player，没有暴露 factory，
+    # 这里 patch Player.__init__ 把 factory 注进去。
+    orig_init = RealPlayer.__init__
+    def patched_init(self, *args, **kwargs):
+        kwargs.setdefault("video_pusher_factory", factory)
+        orig_init(self, *args, **kwargs)
+    monkeypatch.setattr(RealPlayer, "__init__", patched_init)
+
+    # 3. 准备一个含视频的飞行目录。
+    flight = _flight(tmp_path, with_video=True)
+
+    # 4. 起 play_flight；它内部会 add_signal_handler(SIGTERM, stop_event.set)。
+    play_task = asyncio.create_task(play_cmd.play_flight(
+        flight_dir=flight, mqtt_url="tcp://localhost:1883",
+        speed=1.0, start_offset_ms=0, video_push_url="rtmp://srs/live/x",
+    ))
+
+    # 给 play_flight 一点时间起 publish 任务 + video push 任务（让 pusher
+    # 真的被 start 了，否则下面 stopped 断言意义就弱了）。
+    await asyncio.sleep(0.1)
+    assert fake_pusher.is_alive(), "前置条件：pusher 已 start，正模拟运行中"
+
+    # 5. 模拟 ./run.sh stop play-video → SIGTERM。
+    os.kill(os.getpid(), _signal.SIGTERM)
+
+    # 6. play_flight 必须在合理时间里返回 0 且 pusher.stop() 已调到。
+    result = await asyncio.wait_for(play_task, timeout=5.0)
+    assert result == 0
+    assert fake_pusher.stopped, (
+        "SIGTERM 收到后必须把 VideoPusher.stop() 调到，"
+        "否则真实场景里 ffmpeg 子进程会被孤儿化继续推流"
+    )
