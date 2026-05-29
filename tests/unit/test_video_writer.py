@@ -616,6 +616,181 @@ def test_ffmpeg_popen_wall_ms_unchanged_after_first_frame_rename(tmp_path: Path)
 
 
 # ---------------------------------------------------------------------------
+# 17.5. 缓冲场景：所有 progress 在 ffmpeg 退出时一次性 flush 出来，
+#       使用"最后一条" out_time_us 才能得到正确的第一帧时间。
+# ---------------------------------------------------------------------------
+
+def test_buffered_progress_flush_uses_latest_observation(tmp_path: Path):
+    """复现并固化生产 bug：ffmpeg stdout 走 libc block-buffered，所有 progress
+    在退出那一刻一次性 flush。如果按"首条非零 out_time_us"做反算，
+    `now - out_time_us` 会把 first frame 算到接近 exit 的时间（错），
+    必须用"最后一条" out_time_us 才对。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    # 时间线模拟（秒）：
+    #   T0 = 2000.000        ← Popen，对应 launch_ms = 2000000
+    #   T0 + 0.100           ← 第一帧到达（RTMP handshake 之后）
+    #   T0 + 15.500          ← ffmpeg 退出，libc 缓冲一次性 flush
+    # 所有 progress 都在 flush 那一刻被读到 → time.time() 都返回 2015.500
+    times = iter([2000.000, 2015.500, 2015.500, 2015.500, 2015.500])
+    expected_launch_ms = 2000000
+    # 最后一条 out_time_us = 15_400_000 (15.4s 流时长)
+    # → first_frame_wall_ms = 2015500 - 15400 = 2000100 (T0 + 100ms, 正确)
+    expected_first_frame_ms = 2000100
+
+    progress_lines = (
+        b"out_time_us=33333\n",       # 33ms 流，旧逻辑错算成 ~2015467
+        b"out_time_us=1000000\n",     # 1s 流
+        b"out_time_us=10000000\n",    # 10s 流
+        b"out_time_us=15400000\n",    # 15.4s 流（最后一条，正确锚点）
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 2015.500)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()  # ← stop() 必须 join progress thread 之后再写 timing.json
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["file"] == f"main_{expected_first_frame_ms}.mp4", (
+        f"buffered-flush 场景下应该用最后一条 out_time_us 反算，"
+        f"期望 main_{expected_first_frame_ms}.mp4，得到 {seg['file']}"
+    )
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms  # popen 不变
+
+
+# ---------------------------------------------------------------------------
+# 17.6. 老 ffmpeg 只输出 out_time_ms= 也要能解（不是只认 out_time_us=）
+# ---------------------------------------------------------------------------
+
+def test_progress_accepts_out_time_ms_fallback(tmp_path: Path):
+    """ffmpeg 4 之前的版本可能只输出 out_time_ms= 不带 out_time_us=。
+    progress reader 必须兼容这种格式，否则老 ffmpeg 上 first-frame rename
+    永远失败、文件名永远停在 popen-time。"""
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([1000.000, 1000.034])
+    expected_launch_ms = 1000000
+    expected_first_frame_ms = 1000001   # 1000034 - 33
+
+    # 只用 out_time_ms=（没有 out_time_us=）
+    progress_lines = (
+        b"frame=1\n",
+        b"out_time_ms=33\n",          # 33 ms PTS
+        b"progress=continue\n",
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1000.034)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["file"] == f"main_{expected_first_frame_ms}.mp4"
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+
+
+# ---------------------------------------------------------------------------
+# 17.7. 完全没看到 out_time_*：文件名保留 popen-time，timing.json 里
+#       ffmpeg_popen_wall_ms == ffmpeg_start_wall_ms（已经记的样子，
+#       下游能识别"未拿到第一帧时间"这个状态）
+# ---------------------------------------------------------------------------
+
+def test_no_out_time_observation_leaves_popen_filename(tmp_path: Path):
+    """progress 里没有任何 out_time_*（或全是 0）时，进入 fallback 路径：
+    不 rename，文件名保持 popen-time；timing.json 里两个时间戳相等。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    fake_now = 5000.000
+    expected_launch_ms = 5000000
+
+    # 全是无关行（没有 out_time_us / out_time_ms）
+    progress_lines = (
+        b"frame=1\n",
+        b"fps=0.00\n",
+        b"progress=continue\n",
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", return_value=fake_now):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    # 文件名保留 popen-time
+    assert seg["file"] == f"main_{expected_launch_ms}.mp4"
+    # 两个时间戳相等 = 下游能识别"没拿到第一帧时间"这个状态
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+    assert seg["ffmpeg_start_wall_ms"] == expected_launch_ms
+
+
+# ---------------------------------------------------------------------------
 # 18. 空 manifest 也带 popen_at_recv_ms=None（前端 / player 读得一致）
 # ---------------------------------------------------------------------------
 

@@ -116,6 +116,9 @@ class VideoWriter:
 
         self._stop_event = threading.Event()
         self._supervisor_thread: Optional[threading.Thread] = None
+        # 每次 attempt 起一个 progress reader 线程；stop() 必须 join 完才能
+        # 写 timing.json，否则会跟"reader 还在 rename"撞 race。
+        self._progress_threads: list[threading.Thread] = []
         # Protects concurrent writes to ``_filename`` / ``_segments`` between
         # the supervisor thread (cleanup) and the progress reader thread (rename).
         self._state_lock = threading.Lock()
@@ -140,7 +143,15 @@ class VideoWriter:
         return self._proc is not None and self._proc.poll() is None
 
     def stop(self, timeout_s: float = 10.0) -> None:
-        """Stop supervisor + finalize ffmpeg + write timing.json + close log."""
+        """Stop supervisor + finalize ffmpeg + drain progress readers + write
+        timing.json + close log.
+
+        Order matters: progress reader threads must finish (= apply their
+        final rename + patch to ``_segments[-1]``) **before** ``_write_timing``
+        snapshots ``_segments`` into ``main.timing.json``. Otherwise we'd
+        record the placeholder ``main_<popen_ms>.mp4`` filename even when the
+        rename was about to happen.
+        """
         self._stop_event.set()
         if self._supervisor_thread is not None:
             self._supervisor_thread.join(timeout=timeout_s)
@@ -152,6 +163,12 @@ class VideoWriter:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+
+        # ffmpeg now exited (or was killed); progress readers' stdout pipes
+        # close, their for-loops exit, their finally fires the rename. Join
+        # them so the rename lands in self._segments before _write_timing.
+        for t in self._progress_threads:
+            t.join(timeout=timeout_s)
 
         if self._stderr_log is not None:
             try:
@@ -301,49 +318,104 @@ class VideoWriter:
             daemon=True,
         )
         progress_thread.start()
+        self._progress_threads.append(progress_thread)
 
     def _read_progress_and_rename(
         self,
         proc: subprocess.Popen,
         placeholder_filename: str,
     ) -> None:
-        """Drain ffmpeg's ``-progress`` stdout. On the first non-zero
-        ``out_time_us=<N>`` line, back-calculate first-frame wall ms and rename
-        the output file. Keeps reading until the pipe closes (ffmpeg exits) so
-        the kernel pipe never fills up and blocks ffmpeg.
+        """Drain ffmpeg's ``-progress`` stdout. Track the LATEST observed
+        ``out_time_*`` and, after the pipe closes (ffmpeg exits or we stop it),
+        back-calculate first-frame wall ms from that latest observation,
+        then rename the output file.
+
+        Why **latest** and not **first**:
+
+        The formula ``first_frame_wall_ms = now_ms - out_time_us // 1000``
+        is correct **iff** ``now_ms`` is close to the wall clock at which the
+        observed progress block was *emitted*. In a real-time stream that's
+        automatic — each block flushes promptly. But ffmpeg's stdout for
+        ``-progress pipe:1`` goes through libc stdio block buffering (4KB) for
+        non-TTY pipes. For short recordings (~15s, ~150 blocks × ~200 B ≈ 30 KB)
+        the buffer may not fill mid-stream; at exit, the whole batch flushes
+        and our reader observes all blocks within milliseconds, *all with
+        ``now_ms`` ≈ exit_ms*. For the **first** block (small ``out_time_us``)
+        the formula then drifts by nearly the whole recording duration; for
+        the **last** block (largest ``out_time_us``) it stays correct.
+
+        Why we also accept ``out_time_ms=``:
+            Older ffmpeg releases (pre-4.x) emit only ``out_time_ms=`` and
+            ``out_time=hh:mm:ss.uuuuuu``; the ``out_time_us=`` line was added
+            later. Parsing both keeps us version-portable.
+
+        Why rename happens in ``finally`` (after pipe close), not inline:
+            Guarantees we always use the **latest** observation, including the
+            tail blocks flushed at ffmpeg exit. ``stop()`` joins this thread
+            before writing ``main.timing.json``, so the renamed filename
+            lands in the timing record.
         """
         if proc.stdout is None:
             return
-        renamed = False
+        line_count = 0
+        out_time_hits = 0
+        last_us: Optional[int] = None
+        last_observed_at_ms: Optional[int] = None
         try:
             for raw in proc.stdout:
-                if renamed:
-                    continue
+                line_count += 1
                 line = raw.decode("ascii", errors="ignore").strip()
-                if not line.startswith("out_time_us="):
-                    continue
-                try:
-                    us = int(line.split("=", 1)[1])
-                except ValueError:
+                # Parse out_time_us= preferentially; fall back to out_time_ms=.
+                us: Optional[int] = None
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                elif line.startswith("out_time_ms="):
+                    try:
+                        us = int(line.split("=", 1)[1]) * 1000
+                    except ValueError:
+                        continue
+                else:
                     continue
                 if us <= 0:
                     # ffmpeg sometimes emits a zero block before any output;
-                    # skip and keep watching for the first real frame.
+                    # skip but keep counting hits for diagnostic logging.
                     continue
-                now_ms = int(time.time() * 1000)
-                first_frame_wall_ms = now_ms - us // 1000
-                self._rename_to_first_frame_time(
-                    placeholder_filename, first_frame_wall_ms
-                )
-                renamed = True
+                out_time_hits += 1
+                last_us = us
+                last_observed_at_ms = int(time.time() * 1000)
         except Exception:
-            logger.exception("video progress reader errored")
+            logger.exception(
+                "video progress reader errored after {} lines", line_count,
+            )
         finally:
             try:
                 if proc.stdout is not None:
                     proc.stdout.close()
             except Exception:
                 pass
+        if last_us is None or last_observed_at_ms is None:
+            # 没看到任何可用的 out_time_*。常见原因：ffmpeg 太老（不支持 -progress）、
+            # progress 被 stderr 截获、连接没成功就退出。文件名维持 popen-time，
+            # 下游回放仍可用 popen_at_recv_ms 做锚点，只是没了 first-frame 精度。
+            logger.warning(
+                "video progress reader: read {} lines, {} usable out_time_* "
+                "observations but none > 0 → 没拿到第一帧时间，文件名保持 "
+                "popen-time；timing.json 里 ffmpeg_popen_wall_ms == "
+                "ffmpeg_start_wall_ms 是这种情况的标志",
+                line_count, out_time_hits,
+            )
+            return
+        first_frame_wall_ms = last_observed_at_ms - last_us // 1000
+        logger.info(
+            "video progress: {} lines observed, {} usable; latest out_time_us={} "
+            "at wall_ms={} → first_frame_wall_ms={}",
+            line_count, out_time_hits,
+            last_us, last_observed_at_ms, first_frame_wall_ms,
+        )
+        self._rename_to_first_frame_time(placeholder_filename, first_frame_wall_ms)
 
     def _rename_to_first_frame_time(
         self,
