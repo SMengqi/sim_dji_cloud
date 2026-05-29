@@ -231,3 +231,175 @@ def test_snapshot_returns_copy():
     snap2 = s.snapshot()
     assert snap2["drone"].get("mode_code") != 999
     assert len(snap2["drone_trail"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 飞行任务空闲时清空轨迹 + 后续不再累积
+# ---------------------------------------------------------------------------
+
+def test_trail_cleared_when_dock_reports_task_idle():
+    """dock OSD 报 flighttask_step_code=5（任务空闲）时，已累积的轨迹必须被清掉。"""
+    s = LiveState()
+    # 飞行中：dock 报 step=1，drone 喂位置，轨迹累积。
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 1, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=1000)
+    for i in range(5):
+        s.update("thing/product/SN_DRONE/osd", {
+            "data": {"latitude": 30.0 + i * 0.001, "longitude": 121.0,
+                     "battery": {"capacity_percent": 50}},
+        }, recv_ts_ms=1500 + i * 200)
+    assert len(s.snapshot()["drone_trail"]) == 5
+
+    # 任务结束：dock 报 step=5 → 轨迹立即清空。
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 5, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=2500)
+    assert s.snapshot()["drone_trail"] == []
+
+
+def test_trail_does_not_accumulate_while_dock_idle():
+    """dock 是 idle 时，后续 drone OSD 不应再把位置追加到轨迹里
+    （否则 drone 落地后报的 dock 位置会被反复堆成一团）。"""
+    s = LiveState()
+    # 先把 dock 钉成 idle。
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 5, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=1000)
+    # 然后 drone 发若干 OSD（带经纬度）。
+    for i in range(5):
+        s.update("thing/product/SN_DRONE/osd", {
+            "data": {"latitude": 30.0, "longitude": 121.0,
+                     "battery": {"capacity_percent": 50}},
+        }, recv_ts_ms=1500 + i * 200)
+    assert s.snapshot()["drone_trail"] == [], "idle 时不能再往轨迹里追加"
+
+
+def test_trail_resumes_when_dock_returns_to_recording():
+    """idle 之后 dock 回到 step=1，drone OSD 应该重新开始累积。"""
+    s = LiveState()
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 5, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=1000)
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {"latitude": 30.0, "longitude": 121.0, "battery": {"capacity_percent": 50}},
+    }, recv_ts_ms=1100)
+    assert s.snapshot()["drone_trail"] == []
+
+    # 新任务开始：dock 转回 step=1。
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 1, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=2000)
+    for i in range(3):
+        s.update("thing/product/SN_DRONE/osd", {
+            "data": {"latitude": 31.0 + i * 0.001, "longitude": 122.0,
+                     "battery": {"capacity_percent": 50}},
+        }, recv_ts_ms=2100 + i * 200)
+    trail = s.snapshot()["drone_trail"]
+    assert len(trail) == 3
+    assert trail[0] == [31.0, 122.0]
+
+
+def test_trail_permissive_before_first_dock_osd():
+    """开机瞬间 dock OSD 还没到，但 drone OSD 已经到了——这种情况下
+    宽容累积（用户在飞行中刷新页面时不应丢点）。"""
+    s = LiveState()
+    for i in range(3):
+        s.update("thing/product/SN_DRONE/osd", {
+            "data": {"latitude": 30.0 + i * 0.001, "longitude": 121.0,
+                     "battery": {"capacity_percent": 50}},
+        }, recv_ts_ms=1000 + i * 200)
+    assert len(s.snapshot()["drone_trail"]) == 3
+
+
+def test_trail_unchanged_when_dock_osd_omits_step_code():
+    """DJI 只在状态变化时下发 flighttask_step_code，缺该字段的 OSD 不应触发清空。"""
+    s = LiveState()
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"flighttask_step_code": 1, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=1000)
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {"latitude": 30.0, "longitude": 121.0, "battery": {"capacity_percent": 50}},
+    }, recv_ts_ms=1100)
+    # 后续 dock OSD 不带 flighttask_step_code（DJI sticky 行为）。
+    s.update("thing/product/SN_DOCK/osd", {
+        "data": {"temperature": 28.0, "sub_device": {"device_sn": "SN_DRONE"}},
+    }, recv_ts_ms=1200)
+    assert s.snapshot()["drone_trail"] == [[30.0, 121.0]], (
+        "OSD 没带 flighttask_step_code 时应沿用上次状态，不触发清空"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 相机变焦倍数 + 云台角
+# ---------------------------------------------------------------------------
+
+# 真实 DJI Dock 3 OSD 里 cameras[] 和 data.<payload_index> 子对象的字段子集；
+# 真实报文很大，这里只列我们关心的几个字段。
+_DRONE_OSD_WITH_CAMERA = {
+    "data": {
+        "latitude": 30.0, "longitude": 121.0,
+        "battery": {"capacity_percent": 50},
+        "99-0-0": {
+            "gimbal_pitch": -21.0,
+            "gimbal_yaw": 68.4,
+            "gimbal_roll": 0.0,
+            "zoom_factor": 2.27,        # 单镜头几何倍率，我们不取这个
+        },
+        "cameras": [
+            {
+                "payload_index": "99-0-0",
+                "zoom_factor": 4.06,    # 综合/活动倍率，我们取这个
+            },
+        ],
+    },
+}
+
+
+def test_drone_zoom_factor_from_cameras_array_not_payload_subobject():
+    """变焦倍数明确取 data.cameras[0].zoom_factor，
+    不取 data.<payload_index>.zoom_factor（两者数值不同，用户指定取前者）。"""
+    s = LiveState()
+    s.update("thing/product/SN_DRONE/osd", _DRONE_OSD_WITH_CAMERA, recv_ts_ms=1000)
+    drone = s.snapshot()["drone"]
+    assert drone["zoom_factor"] == 4.06, (
+        "zoom_factor 必须来自 cameras[0].zoom_factor (4.06)，"
+        "不是 data.99-0-0.zoom_factor (2.27)"
+    )
+
+
+def test_drone_gimbal_pitch_and_yaw_extracted_via_payload_index():
+    """云台角放在 data.<payload_index> 子对象里——
+    通过 cameras[0].payload_index 反查到那个子对象，取 gimbal_pitch / gimbal_yaw。"""
+    s = LiveState()
+    s.update("thing/product/SN_DRONE/osd", _DRONE_OSD_WITH_CAMERA, recv_ts_ms=1000)
+    drone = s.snapshot()["drone"]
+    assert drone["gimbal_pitch"] == -21.0
+    assert drone["gimbal_yaw"] == 68.4
+
+
+def test_drone_zoom_gimbal_absent_when_no_cameras_field():
+    """OSD 没 cameras 字段时（部分上报或老协议），zoom/gimbal 字段不出现，
+    不影响其他字段写入。"""
+    s = LiveState()
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {"latitude": 30.0, "longitude": 121.0, "battery": {"capacity_percent": 50}},
+    }, recv_ts_ms=1000)
+    drone = s.snapshot()["drone"]
+    assert "zoom_factor" not in drone
+    assert "gimbal_pitch" not in drone
+    assert "gimbal_yaw" not in drone
+
+
+def test_drone_zoom_gimbal_sticky_across_partial_osds():
+    """zoom/gimbal 在后续不带 cameras 的 OSD 里要保留（DJI 部分 OSD 不重复带这些字段）。"""
+    s = LiveState()
+    s.update("thing/product/SN_DRONE/osd", _DRONE_OSD_WITH_CAMERA, recv_ts_ms=1000)
+    # 后续一个不带 cameras 的 OSD。
+    s.update("thing/product/SN_DRONE/osd", {
+        "data": {"latitude": 30.01, "longitude": 121.0, "battery": {"capacity_percent": 49}},
+    }, recv_ts_ms=1200)
+    drone = s.snapshot()["drone"]
+    assert drone["zoom_factor"] == 4.06
+    assert drone["gimbal_pitch"] == -21.0
+    assert drone["gimbal_yaw"] == 68.4

@@ -82,6 +82,9 @@
       <div class="row"><span class="k">水平速度</span><span class="v" x-text="fmt(state.drone.horizontal_speed) + ' m/s'"></span></div>
       <div class="row"><span class="k">垂直速度</span><span class="v" x-text="fmt(state.drone.vertical_speed) + ' m/s'"></span></div>
       <div class="row"><span class="k">航向角</span><span class="v" x-text="fmt(state.drone.attitude_head) + '°'"></span></div>
+      <div class="row"><span class="k">变焦倍数</span><span class="v" x-text="fmt(state.drone.zoom_factor) + 'x'"></span></div>
+      <div class="row"><span class="k">云台俯仰角</span><span class="v" x-text="fmt(state.drone.gimbal_pitch) + '°'"></span></div>
+      <div class="row"><span class="k">云台偏航角</span><span class="v" x-text="fmt(state.drone.gimbal_yaw) + '°'"></span></div>
       <div class="row"><span class="k">卫星数(GPS/RTK)</span><span class="v" x-text="(state.drone.gps_satellites || 0) + ' / ' + (state.drone.rtk_satellites || 0)"></span></div>
       <div class="row"><span class="k">经纬度</span><span class="v" x-text="fmt(state.drone.latitude, 5) + ', ' + fmt(state.drone.longitude, 5)"></span></div>
     </div>
@@ -407,22 +410,29 @@ function dashboard() {
 
     updateMap() {
       const trail = this.state.drone_trail || [];
-      if (trail.length) {
-        this.trailLayer.setLatLngs(trail);
-        if (!this.startMarker) {
-          this.startMarker = L.marker(trail[0],
-            { icon: this.startIcon, title: '起飞点', zIndexOffset: 500 }).addTo(this.map);
-        }
-        const latest = trail[trail.length - 1];
-        if (!this.droneMarker) {
-          this.droneMarker = L.marker(latest,
-            { icon: this.droneIcon, title: '飞行器', zIndexOffset: 1000 }).addTo(this.map);
-          this.map.setView(latest, 18);
-        } else {
-          this.droneMarker.setLatLng(latest);
-        }
-        this.applyDroneHeading();
+      if (trail.length === 0) {
+        // 后端在 dock 报"任务空闲"时把轨迹清空。这里要把折线 + 起降标 +
+        // 飞行器标都从地图上撤下来，不然上一段飞行的图标会留着，看起来像
+        // 飞机还停在某处。下次有新轨迹时会自动重建。
+        this.trailLayer.setLatLngs([]);
+        if (this.startMarker) { this.map.removeLayer(this.startMarker); this.startMarker = null; }
+        if (this.droneMarker) { this.map.removeLayer(this.droneMarker); this.droneMarker = null; }
+        return;
       }
+      this.trailLayer.setLatLngs(trail);
+      if (!this.startMarker) {
+        this.startMarker = L.marker(trail[0],
+          { icon: this.startIcon, title: '起飞点', zIndexOffset: 500 }).addTo(this.map);
+      }
+      const latest = trail[trail.length - 1];
+      if (!this.droneMarker) {
+        this.droneMarker = L.marker(latest,
+          { icon: this.droneIcon, title: '飞行器', zIndexOffset: 1000 }).addTo(this.map);
+        this.map.setView(latest, 18);
+      } else {
+        this.droneMarker.setLatLng(latest);
+      }
+      this.applyDroneHeading();
     },
 
     // 按航向角旋转飞行器图标，使机头指向真实飞行方向。

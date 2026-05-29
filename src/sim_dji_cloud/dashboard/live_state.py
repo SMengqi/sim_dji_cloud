@@ -82,9 +82,21 @@ class LiveState:
         ("wind_speed", "wind_speed"),
     )
 
+    # 与 recorder/FlightDetector 同步的"正在作业"集合：
+    # 0=作业准备中、1=飞行作业中、2=作业后状态恢复。其它（典型 5=任务空闲）
+    # 视为"空闲"，dashboard 在收到这种状态时把已累积的飞行轨迹清空。
+    _RECORDING_STEP_CODES = (0, 1, 2)
+
     def _update_dock(self, sn: str, data: dict, recv_ts_ms: int) -> None:
         self._dock["sn"] = sn
         self._dock["last_recv_ts_ms"] = recv_ts_ms
+        # 在写入 dock 字段之前先看新的 flighttask_step_code，决定要不要清轨迹。
+        # 注意：DJI 只在状态变化时下发 flighttask_step_code，本 OSD 不带该字段时
+        # 视为"沿用上一次"，不触发清空。
+        new_step = data.get("flighttask_step_code")
+        if isinstance(new_step, int) and new_step not in self._RECORDING_STEP_CODES:
+            # 任务空闲 → 清空轨迹（幂等：空轨迹再清还是空）。
+            self._trail.clear()
         for src, dst in self._DOCK_FIELD_MAP:
             if src in data:
                 self._dock[dst] = data[src]
@@ -113,10 +125,35 @@ class LiveState:
                 self._drone["gps_satellites"] = position["gps_number"]
             if "rtk_number" in position:
                 self._drone["rtk_satellites"] = position["rtk_number"]
+        # 相机变焦倍数 + 云台角：DJI Dock 3 在 OSD 里这样组织——
+        #   data.cameras[]  : 每个挂载点一条，含 payload_index ("99-0-0") 与 zoom_factor
+        #   data.<payload_index> : 该挂载点的子对象，含 gimbal_pitch / gimbal_yaw / gimbal_roll
+        # 取 cameras[0]（Dock 3 / Matrice 3D 主荷载只有一个），并以它的 payload_index
+        # 反查 data 顶层里对应的子对象拿 gimbal 角。
+        # 注意：变焦倍数有意取 cameras[].zoom_factor（综合/活动倍率），
+        # 不取 data.<payload_index>.zoom_factor（单镜头几何倍率），两者数值不同。
+        cameras = data.get("cameras")
+        if isinstance(cameras, list) and cameras and isinstance(cameras[0], dict):
+            cam = cameras[0]
+            if "zoom_factor" in cam:
+                self._drone["zoom_factor"] = cam["zoom_factor"]
+            payload_idx = cam.get("payload_index")
+            mount = data.get(payload_idx) if isinstance(payload_idx, str) else None
+            if isinstance(mount, dict):
+                if "gimbal_pitch" in mount:
+                    self._drone["gimbal_pitch"] = mount["gimbal_pitch"]
+                if "gimbal_yaw" in mount:
+                    self._drone["gimbal_yaw"] = mount["gimbal_yaw"]
         lat = data.get("latitude")
         lon = data.get("longitude")
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            self._trail.append([lat, lon])
+            # 只在 dock 处于"正在作业"状态时累积轨迹。
+            # 未知（dock OSD 还没来过）时宽容收，避免开盘瞬间漏点；
+            # 一旦 dock 报了空闲（→ _update_dock 也会清掉历史），
+            # drone 这边就不再追加（否则 drone 落地后 dock 位置会被反复追加成一团）。
+            current_step = self._dock.get("flighttask_step_code")
+            if current_step is None or current_step in self._RECORDING_STEP_CODES:
+                self._trail.append([lat, lon])
 
     def snapshot(self) -> dict[str, Any]:
         """返回深拷贝，外部修改不影响内部。"""

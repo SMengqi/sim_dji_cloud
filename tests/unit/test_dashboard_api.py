@@ -176,3 +176,32 @@ def test_index_html_has_pip_toggle():
     # enter/leave event listeners must be wired so OS-level close syncs UI state.
     assert "enterpictureinpicture" in html
     assert "leavepictureinpicture" in html
+
+
+def test_index_html_drone_card_has_zoom_and_gimbal_rows():
+    """Drone card must render zoom_factor + gimbal_pitch + gimbal_yaw rows,
+    bound to state.drone.* fields that LiveState populates from
+    OSD cameras[].zoom_factor + data.<payload_index>.gimbal_*.
+    """
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    assert "变焦倍数" in html
+    assert "云台俯仰角" in html
+    assert "云台偏航角" in html
+    assert "state.drone.zoom_factor" in html
+    assert "state.drone.gimbal_pitch" in html
+    assert "state.drone.gimbal_yaw" in html
+
+
+def test_index_html_handles_empty_trail_by_removing_markers():
+    """When backend pushes an empty drone_trail (task went idle), the frontend
+    must remove the start + drone markers and clear the polyline, otherwise
+    the previous flight's markers stay stuck on the map.
+    """
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    assert "trail.length === 0" in html
+    assert "removeLayer(this.startMarker)" in html
+    assert "removeLayer(this.droneMarker)" in html
