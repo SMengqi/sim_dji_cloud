@@ -1,3 +1,5 @@
+import pytest
+
 from sim_dji_cloud.dashboard.live_state import LiveState
 
 
@@ -125,6 +127,15 @@ def test_events_ring_buffer():
     assert snap["events"][-1]["method"] == "event_4"
 
 
+def test_events_keep_full_payload_for_modal():
+    """events 也要保留完整 payload，前端 modal 能展开看 + 复制。"""
+    s = LiveState()
+    full = {"method": "device_online", "data": {"flight_id": "T-Y", "extra": [1, 2, 3]}}
+    s.update("thing/product/SN_DOCK/events", full, recv_ts_ms=1234)
+    snap = s.snapshot()
+    assert snap["events"][0]["payload"] == full
+
+
 def test_topic_counts_accumulate():
     s = LiveState()
     for _ in range(7):
@@ -138,13 +149,14 @@ def test_topic_counts_accumulate():
 
 
 def test_unknown_topic_only_counted_not_decoded():
-    """非 osd/events 的 topic 也算计数，但不解码字段。"""
+    """非 osd/events/drc/services 的 topic 也算计数，但不解码字段。"""
     s = LiveState()
-    s.update("thing/product/SN_DOCK/services", {"method": "foo", "data": {}},
+    s.update("thing/product/SN_DOCK/requests", {"method": "foo", "data": {}},
              recv_ts_ms=1000)
     snap = s.snapshot()
-    assert snap["topic_counts"]["thing/product/SN_DOCK/services"] == 1
+    assert snap["topic_counts"]["thing/product/SN_DOCK/requests"] == 1
     assert snap["dock"] == {}
+    assert snap["controls"] == []
 
 
 def test_partial_dock_osd_preserves_previous_fields():
@@ -403,3 +415,92 @@ def test_drone_zoom_gimbal_sticky_across_partial_osds():
     assert drone["zoom_factor"] == 4.06
     assert drone["gimbal_pitch"] == -21.0
     assert drone["gimbal_yaw"] == 68.4
+
+
+# ---------------------------------------------------------------------------
+# 控制消息环（drc/down + services）
+# ---------------------------------------------------------------------------
+
+def test_drc_down_message_captured_to_controls():
+    """thing/product/<sn>/drc/down (飞控指令) 走 controls 环；保留完整 payload。"""
+    s = LiveState()
+    drc_payload = {
+        "method": "stick_control",
+        "data": {"x": 0.5, "y": -0.2, "z": 0.0, "yaw": 30.0},
+    }
+    s.update("thing/product/SN_DOCK/drc/down", drc_payload, recv_ts_ms=1000)
+    controls = s.snapshot()["controls"]
+    assert len(controls) == 1
+    c = controls[0]
+    assert c["topic"] == "thing/product/SN_DOCK/drc/down"
+    assert c["suffix"] == "drc/down"
+    assert c["method"] == "stick_control"
+    assert c["recv_ts_ms"] == 1000
+    # 完整 payload 必须留下来，前端 modal 展开看
+    assert c["payload"] == drc_payload
+
+
+def test_services_message_captured_to_controls():
+    """thing/product/<sn>/services (航线/任务下行) 也走 controls 环。"""
+    s = LiveState()
+    svc_payload = {
+        "method": "flighttask_prepare",
+        "data": {"flight_id": "T-X", "file": {"url": "https://...", "fingerprint": "ab"}},
+    }
+    s.update("thing/product/SN_DOCK/services", svc_payload, recv_ts_ms=2000)
+    controls = s.snapshot()["controls"]
+    assert len(controls) == 1
+    c = controls[0]
+    assert c["topic"] == "thing/product/SN_DOCK/services"
+    assert c["suffix"] == "services"
+    assert c["method"] == "flighttask_prepare"
+    assert c["payload"] == svc_payload
+
+
+def test_controls_ring_caps_at_max():
+    """drc/down 在真实飞行里可达 30Hz；环必须封顶不无限增长。"""
+    s = LiveState(controls_ring_size=10)
+    for i in range(15):
+        s.update("thing/product/SN_DOCK/drc/down", {
+            "method": "stick_control",
+            "data": {"x": i * 0.1},
+        }, recv_ts_ms=1000 + i * 33)
+    controls = s.snapshot()["controls"]
+    assert len(controls) == 10
+    # 留下的是最新的 10 条
+    assert controls[0]["payload"]["data"]["x"] == pytest.approx(0.5)
+    assert controls[-1]["payload"]["data"]["x"] == pytest.approx(1.4)
+
+
+def test_controls_does_not_touch_dock_or_drone_state():
+    """控制消息只进 controls 环，不应该改 dock/drone 任何字段。"""
+    s = LiveState()
+    s.update("thing/product/SN_DOCK/drc/down",
+             {"method": "stick_control", "data": {"x": 1.0}}, recv_ts_ms=1000)
+    s.update("thing/product/SN_DOCK/services",
+             {"method": "takeoff_to_point", "data": {"latitude": 30.0}}, recv_ts_ms=1100)
+    snap = s.snapshot()
+    assert snap["dock"] == {}
+    assert snap["drone"] == {}
+
+
+def test_events_and_controls_are_independent_rings():
+    """events 与 controls 互不干扰。"""
+    s = LiveState()
+    s.update("thing/product/SN_DOCK/events",
+             {"method": "device_online", "data": {}}, recv_ts_ms=1000)
+    s.update("thing/product/SN_DOCK/drc/down",
+             {"method": "stick_control", "data": {}}, recv_ts_ms=1100)
+    s.update("thing/product/SN_DOCK/services",
+             {"method": "takeoff", "data": {}}, recv_ts_ms=1200)
+    snap = s.snapshot()
+    assert len(snap["events"]) == 1 and snap["events"][0]["method"] == "device_online"
+    assert len(snap["controls"]) == 2
+    assert [c["method"] for c in snap["controls"]] == ["stick_control", "takeoff"]
+
+
+def test_initial_snapshot_has_controls_field():
+    """空 LiveState 的 snapshot 也要包含 controls 字段（前端总能读到一个数组）。"""
+    s = LiveState()
+    snap = s.snapshot()
+    assert snap["controls"] == []

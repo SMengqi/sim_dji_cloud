@@ -7,10 +7,17 @@ from sim_dji_cloud.dashboard.live_state import LiveState
 from sim_dji_cloud.utils.time_ms import now_ms
 
 
-# Level B：只订 osd 与 events，避开 DRC 高频流和 services 噪音
+# Dashboard 订阅集合：
+#   osd       —— dock/drone 周期上报，driver of the state panels & trail
+#   events    —— dock 异步事件，左侧"最近事件"面板
+#   drc/down  —— 飞控下行（如 stick_control，30Hz 上限），右侧"控制消息"面板
+#   services —— 航线/任务等服务下行（如 takeoff、return_home），同右侧面板
+# 注意 drc/down 在真实飞行中是高频流，LiveState 用独立 controls_ring 限长。
 DEFAULT_PATTERNS = [
     "thing/product/+/osd",
     "thing/product/+/events",
+    "thing/product/+/drc/down",
+    "thing/product/+/services",
 ]
 
 

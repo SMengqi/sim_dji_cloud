@@ -26,7 +26,31 @@
   .sidebar { grid-column: 2; grid-row: 2; overflow-y: auto; padding: 12px;
              background: #0f0f0f; }
   .events { grid-column: 1 / 3; grid-row: 3; background: #0a0a0a; padding: 8px 16px;
-            overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+            font-family: ui-monospace, monospace; font-size: 12px;
+            display: flex; gap: 12px; overflow: hidden; }
+  .events-pane { flex: 1 1 50%; overflow-y: auto; }
+  .events-pane strong { display: block; margin-bottom: 4px; color: #ccc; }
+  .events-row { cursor: pointer; }
+  .events-row:hover { background: #1f1f1f; }
+  /* 点击行后弹出的明细 modal —— 半透明遮罩 + 居中卡片 + 可复制 payload */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+                    display: flex; align-items: center; justify-content: center; z-index: 9000; }
+  .modal-card { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px;
+                width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+  .modal-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+                border-bottom: 1px solid #2a2a2a; font-size: 13px; color: #ccc; }
+  .modal-head .grow { flex: 1; }
+  .modal-head button { background: #1a1a1a; color: #ccc; border: 1px solid #2a2a2a;
+                       border-radius: 4px; padding: 2px 10px; cursor: pointer; font-size: 12px; }
+  .modal-head button:hover { background: #2a2a2a; }
+  .modal-body { padding: 8px 12px; overflow: auto; font-family: ui-monospace, monospace;
+                font-size: 12px; color: #d0d0d0; white-space: pre; }
+  .modal-meta { padding: 6px 12px; font-size: 12px; color: #888;
+                border-bottom: 1px solid #1a1a1a; display: grid;
+                grid-template-columns: 80px 1fr; row-gap: 2px; }
+  .modal-meta .k { color: #666; }
+  .modal-meta .v { color: #ccc; word-break: break-all; }
   .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 4px;
           padding: 10px; margin-bottom: 10px; }
   .card h2 { font-size: 12px; margin: 0 0 8px 0; color: #888; text-transform: uppercase;
@@ -116,18 +140,56 @@
   </div>
 
   <div class="events">
-    <strong>最近事件</strong>
-    <table>
-      <tbody>
-        <template x-for="ev in (state.events || []).slice().reverse()" :key="ev.recv_ts_ms">
-          <tr>
-            <td style="width:160px;color:#666;" x-text="new Date(ev.recv_ts_ms).toLocaleTimeString()"></td>
-            <td style="width:280px;color:#aaa;" x-text="ev.method"></td>
-            <td style="color:#666;" x-text="ev.flight_id || ''"></td>
-          </tr>
-        </template>
-      </tbody>
-    </table>
+    <div class="events-pane">
+      <strong>最近事件 (events)</strong>
+      <table>
+        <tbody>
+          <template x-for="ev in (state.events || []).slice().reverse()" :key="ev.recv_ts_ms">
+            <tr class="events-row" @click="openModal('event', ev)">
+              <td style="width:120px;color:#666;" x-text="new Date(ev.recv_ts_ms).toLocaleTimeString()"></td>
+              <td style="width:240px;color:#aaa;" x-text="ev.method"></td>
+              <td style="color:#666;" x-text="ev.flight_id || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+    <div class="events-pane">
+      <strong>控制消息 (drc/down + services)</strong>
+      <table>
+        <tbody>
+          <!-- key 用 recv_ts_ms + idx 兜底，drc 30Hz 时 recv_ts_ms 可能重复 -->
+          <template x-for="(c, idx) in (state.controls || []).slice().reverse()"
+                    :key="c.recv_ts_ms + '_' + idx">
+            <tr class="events-row" @click="openModal('control', c)">
+              <td style="width:120px;color:#666;" x-text="new Date(c.recv_ts_ms).toLocaleTimeString()"></td>
+              <td style="width:110px;color:#7aa6ff;" x-text="c.suffix"></td>
+              <td style="color:#aaa;" x-text="c.method"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 行点击后的明细 modal：标题 + 元信息 + JSON payload + 复制 + 关闭 -->
+  <div class="modal-backdrop" x-show="modal.open" x-cloak
+       @click.self="closeModal()" @keydown.escape.window="closeModal()">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span x-text="modal.kind === 'control' ? '🎮 控制消息' : '📢 事件'"></span>
+        <span style="color:#666;" x-text="modal.method"></span>
+        <span class="grow"></span>
+        <button @click="copyModalToClipboard()" x-text="modal.copyLabel">📋 复制</button>
+        <button @click="closeModal()">✕ 关闭</button>
+      </div>
+      <div class="modal-meta">
+        <span class="k">时间</span><span class="v" x-text="modal.timeStr"></span>
+        <span class="k">Topic</span><span class="v" x-text="modal.topic"></span>
+        <span class="k">Method</span><span class="v" x-text="modal.method"></span>
+      </div>
+      <div class="modal-body" x-text="modal.payloadJson"></div>
+    </div>
   </div>
 
 <script>
@@ -189,7 +251,11 @@ function dashboard() {
   return {
     connected: false,
     updates: 0,
-    state: { dock: {}, drone: {}, drone_trail: [], events: [], topic_counts: {} },
+    state: { dock: {}, drone: {}, drone_trail: [], events: [], controls: [], topic_counts: {} },
+    // 明细 modal：点击 events / 控制消息 行后弹出，payloadJson 是 pretty-printed 文本，
+    // copyLabel 在按下"复制"后短暂变成"已复制 ✓"做反馈。
+    modal: { open: false, kind: '', topic: '', method: '', timeStr: '', payloadJson: '',
+             copyLabel: '📋 复制' },
     map: null,
     droneMarker: null,
     droneIcon: null,
@@ -317,6 +383,44 @@ function dashboard() {
         // 浏览器策略可能在某些状态拒绝（未播放、未交互、不支持 MSE 走 PiP 等）。
         // 不抛错给用户，只在控制台留痕；按钮还在，下一次能再点。
         console.warn('PiP toggle failed:', e);
+      }
+    },
+
+    // ----- events / 控制消息 行点击后的明细 modal -----
+    openModal(kind, item) {
+      // item 形如 LiveState 写出去的那条：含 recv_ts_ms / topic / method / payload [+ suffix]。
+      const ts = item.recv_ts_ms;
+      const d = new Date(ts);
+      const iso = d.toISOString();   // 复制贴到 issue 里用得上
+      this.modal = {
+        open: true,
+        kind: kind,                        // 'event' | 'control'
+        topic: item.topic || '',
+        method: item.method || '?',
+        timeStr: iso + '  (epoch_ms=' + ts + ')',
+        payloadJson: JSON.stringify(item.payload, null, 2),
+        copyLabel: '📋 复制',
+      };
+    },
+
+    closeModal() { this.modal.open = false; },
+
+    async copyModalToClipboard() {
+      // 复制一段方便贴到 issue / 群里的上下文："Topic / Time / Method / Payload"。
+      const txt =
+        'Topic: ' + this.modal.topic + '\n' +
+        'Time: ' + this.modal.timeStr + '\n' +
+        'Method: ' + this.modal.method + '\n' +
+        'Payload:\n' + this.modal.payloadJson + '\n';
+      try {
+        await navigator.clipboard.writeText(txt);
+        this.modal.copyLabel = '已复制 ✓';
+        setTimeout(() => { this.modal.copyLabel = '📋 复制'; }, 1200);
+      } catch (e) {
+        // 老浏览器或 HTTP（非 HTTPS）环境下 clipboard API 可能失败；fall back 到
+        // 在 modal-body 上做一次 select 让用户手动 Ctrl-C。
+        console.warn('clipboard write failed:', e);
+        this.modal.copyLabel = '复制失败 (Ctrl-C)';
       }
     },
 

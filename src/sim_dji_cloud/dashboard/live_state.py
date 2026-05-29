@@ -9,10 +9,18 @@ class LiveState:
     单进程线程不安全（无需锁）—— FastAPI 单线程 event loop + gmqtt 同一 loop。
     """
 
-    def __init__(self, events_ring_size: int = 20, trail_max: int = 500):
+    def __init__(
+        self,
+        events_ring_size: int = 20,
+        trail_max: int = 500,
+        controls_ring_size: int = 30,
+    ):
         self._dock: dict[str, Any] = {}
         self._drone: dict[str, Any] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=events_ring_size)
+        # 控制消息环：drc/down（飞控指令，如 stick_control）+ services（航线/任务）。
+        # 大小独立于 events 因为 DRC 在真实飞行中可能 30 Hz 推，比 events 密度高。
+        self._controls: deque[dict[str, Any]] = deque(maxlen=controls_ring_size)
         self._trail: deque[list[float]] = deque(maxlen=trail_max)
         self._topic_counts: dict[str, int] = {}
         self._known_dock_sn: str | None = None
@@ -48,6 +56,18 @@ class LiveState:
                 "topic": topic,
                 "method": payload.get("method", "?"),
                 "flight_id": data.get("flight_id"),
+                # 完整 payload 一起留，前端点击事件行后能弹 modal 看明细 + 复制。
+                "payload": payload,
+            })
+        elif suffix in ("drc/down", "services"):
+            # 控制消息：飞控指令（drc/down，如 stick_control）+ 航线/服务（services）。
+            # 完整 payload 一起留下，前端 modal 展开后能看 + 复制（30 条环冷启动后才会顶出来）。
+            self._controls.append({
+                "recv_ts_ms": recv_ts_ms,
+                "topic": topic,
+                "suffix": suffix,
+                "method": payload.get("method", "?"),
+                "payload": payload,
             })
 
     # (osd_data_key, snapshot_key) — dock 顶层字段映射
@@ -162,5 +182,6 @@ class LiveState:
             "drone": copy.deepcopy(self._drone),
             "drone_trail": [list(p) for p in self._trail],
             "events": [copy.deepcopy(e) for e in self._events],
+            "controls": [copy.deepcopy(c) for c in self._controls],
             "topic_counts": dict(self._topic_counts),
         }

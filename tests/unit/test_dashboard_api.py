@@ -205,3 +205,39 @@ def test_index_html_handles_empty_trail_by_removing_markers():
     assert "trail.length === 0" in html
     assert "removeLayer(this.startMarker)" in html
     assert "removeLayer(this.droneMarker)" in html
+
+
+def test_index_html_events_panel_is_split_and_renders_controls():
+    """Events strip is split: left = events, right = control messages (drc/down
+    + services). Both render from state.controls / state.events.
+    """
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    # Two panes
+    assert html.count('class="events-pane"') >= 2
+    # Pane titles
+    assert "最近事件" in html
+    assert "控制消息" in html
+    # Right pane iterates state.controls (the new ring)
+    assert "state.controls" in html
+    # Each row is clickable -> openModal
+    assert "openModal('event'" in html
+    assert "openModal('control'" in html
+
+
+def test_index_html_has_payload_modal():
+    """Click on an event/control row pops a modal showing the full payload
+    + a copy button. Backdrop click, ESC, and X close it.
+    """
+    app = create_app(LiveState())
+    client = TestClient(app)
+    html = client.get("/").text
+    assert "modal-backdrop" in html
+    assert "modal.payloadJson" in html
+    assert "copyModalToClipboard" in html
+    assert "closeModal" in html
+    # ESC key must close
+    assert "keydown.escape.window" in html
+    # Click on backdrop closes (but click inside card does not)
+    assert "click.self=\"closeModal()\"" in html
