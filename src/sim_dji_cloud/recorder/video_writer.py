@@ -1,6 +1,43 @@
 """Eager-launch + restart ffmpeg supervisor for recording RTMP video.
 
-Design (v3.1):
+Design (v3.2):
+
+Anchor (= ``ffmpeg_start_wall_ms``, file name's epoch) is chosen by a
+three-tier fallback chain, best-effort upgrade from left to right:
+
+    popen-time  ←  in-band PTS-delta back-calc (sanity-checked)
+                ←  ffprobe-based exit_wall − file_duration (authoritative)
+
+1. **Popen-time placeholder**: when ``_launch_ffmpeg`` runs, the file is
+   created as ``main_<launch_ms>.mp4`` and the segment is recorded with
+   ``ffmpeg_start_wall_ms == ffmpeg_popen_wall_ms == launch_ms``. This is
+   the "保留开始拉流的时间戳" baseline — works no matter what else
+   breaks. Off by RTMP-handshake delay (≈1–5 s early).
+
+2. **In-band PTS-delta back-calc** (in ``_read_progress_and_rename``):
+   while ffmpeg runs, we track first/last ``out_time_us`` from
+   ``-progress pipe:1`` and compute
+   ``first_frame_wall_ms = last_observed_at_ms − (last_us − first_us)/1000``.
+   Sanity-checked to fall in ``[popen_wall_ms, first_observed_at_ms]``;
+   rejected values keep popen-time. This handles linear/monotonic source
+   PTS even when it doesn't start at 0 (e.g. encoder uptime baseline).
+   Defeated by sources whose ``out_time_us`` is non-monotonic at wall
+   rate — sanity check then degrades gracefully to popen-time.
+
+3. **ffprobe-based override** (in ``_finalize_segment_via_ffprobe``,
+   called from ``stop()`` after ffmpeg exits): ``ffprobe`` the on-disk mp4
+   for its container duration, then back-calc
+   ``first_frame_wall_ms = exit_wall_ms − duration_ms``. ffprobe reads
+   the muxer's actual PTS so it's immune to ``-progress``'s
+   unreliability; this is the authoritative answer when ffprobe is
+   available. Sanity-checked the same way; rejection keeps the in-band
+   anchor.
+
+The reason both (2) and (3) exist: (2) makes the on-disk filename
+roughly correct as soon as ffmpeg has been running for a couple seconds
+(useful for tail-following / interactive observation), (3) corrects it
+authoritatively when ffmpeg finally exits (useful for downstream
+playback alignment).
 
 The supervisor thread launches ffmpeg *immediately* — no probe phase. This
 matters because the v2 probe consumed a full GOP (~5 seconds) from the RTMP
@@ -155,14 +192,30 @@ class VideoWriter:
         return self._proc is not None and self._proc.poll() is None
 
     def stop(self, timeout_s: float = 10.0) -> None:
-        """Stop supervisor + finalize ffmpeg + drain progress readers + write
-        timing.json + close log.
+        """Stop supervisor + finalize ffmpeg + drain progress readers +
+        run ffprobe-based finalize (authoritative anchor override) +
+        write timing.json + close log.
 
-        Order matters: progress reader threads must finish (= apply their
-        final rename + patch to ``_segments[-1]``) **before** ``_write_timing``
-        snapshots ``_segments`` into ``main.timing.json``. Otherwise we'd
+        Order matters:
+          1. Stop supervisor + signal ffmpeg to exit cleanly.
+          2. Capture ``exit_wall_ms`` AS SOON AS ffmpeg exited — this is the
+             "now" used by the ffprobe finalize formula
+             ``first_frame_wall_ms = exit_wall_ms - file_duration_ms``.
+          3. Join progress reader threads so any in-band rename completes
+             before ffprobe reads the file (otherwise the path read by
+             ffprobe might lag the most recent rename).
+          4. ``_finalize_segment_via_ffprobe`` overrides the in-band
+             anchor with a ffprobe-derived one when possible (more
+             authoritative — bypasses ffmpeg ``-progress``'s unreliable
+             ``out_time_us`` field entirely).
+          5. ``_write_timing`` snapshots ``_segments`` into ``main.timing.json``.
+
+        Progress readers must finish (= apply their final rename + patch to
+        ``_segments[-1]``) **before** ``_write_timing``. Otherwise we'd
         record the placeholder ``main_<popen_ms>.mp4`` filename even when the
-        rename was about to happen.
+        rename was about to happen. ffprobe finalize must run AFTER the
+        progress readers' join so it sees the latest filename and can
+        re-rename if it has a better anchor.
         """
         self._stop_event.set()
         if self._supervisor_thread is not None:
@@ -176,9 +229,13 @@ class VideoWriter:
                 self._proc.kill()
                 self._proc.wait()
 
-        # ffmpeg now exited (or was killed); progress readers' stdout pipes
-        # close, their for-loops exit, their finally fires the rename. Join
-        # them so the rename lands in self._segments before _write_timing.
+        # ffmpeg has now exited (cleanly or killed). Capture the wall —
+        # this is the upper anchor for ffprobe-based first-frame derivation.
+        exit_wall_ms = int(time.time() * 1000)
+
+        # ffmpeg exited → its stdout pipe closes → progress readers' for-loops
+        # exit and finally-rename fires. Join them so any in-band rename
+        # lands in self._segments before ffprobe reads the file.
         for t in self._progress_threads:
             t.join(timeout=timeout_s)
 
@@ -188,6 +245,12 @@ class VideoWriter:
             except Exception:
                 pass
             self._stderr_log = None
+
+        # Authoritative override: ffprobe the on-disk mp4 to learn the real
+        # recorded duration, then back-calc first-frame wall from exit_wall.
+        # ffprobe reads the muxer's actual PTS so it's immune to the
+        # ``-progress out_time_us`` unreliability that bit us on 2026-06-01.
+        self._finalize_segment_via_ffprobe(exit_wall_ms)
 
         self._write_timing()
 
@@ -569,6 +632,132 @@ class VideoWriter:
                     f"; renamed video/{placeholder_filename} → video/{new_filename}"
                     if rename_ok else " (rename failed; manifest ts patched anyway)",
                 )
+
+    def _finalize_segment_via_ffprobe(self, exit_wall_ms: int) -> None:
+        """Use ffprobe on the actual on-disk mp4 to derive first-frame wall
+        ms authoritatively, then rename + patch the tail segment.
+
+        Why this is more reliable than the in-band ``-progress`` back-calc:
+        ffmpeg ``-c copy`` writes a mp4 whose container PTS the muxer
+        rebases to start near 0; ``ffprobe -show_entries format=duration``
+        reads that real duration. Combined with ``exit_wall_ms`` (the
+        wall when ffmpeg stopped, captured in ``stop()``), we get
+        ``first_frame_wall_ms = exit_wall_ms - duration_ms`` without ever
+        touching ffmpeg's ``out_time_us`` field — which we have seen
+        report values inconsistent with the actual mp4 PTS (e.g. 2026-06-01
+        production log: ``out_time_us`` reported 25.9 hours across 98s of
+        wall time, but ``ffprobe`` on the same file showed PTS 0..92.981s).
+
+        Failure modes (any → return silently, keep in-band path's result):
+          - ffprobe not in PATH (``FileNotFoundError``)
+          - ffprobe non-zero exit (corrupt mp4, format unknown)
+          - duration string unparseable
+          - derived first_frame_wall_ms < popen_wall_ms (sanity check —
+            implausible since the first frame can't predate ``Popen``)
+
+        The in-band path's anchor (whether the back-calc result or the
+        popen-time fallback) is kept on failure, so the segment ALWAYS has
+        SOME anchor — best-effort upgrade, never a downgrade.
+        """
+        with self._state_lock:
+            if not self._segments:
+                return
+            seg = self._segments[-1]
+            current_filename = seg["file"]
+            popen_wall_ms = seg["ffmpeg_popen_wall_ms"]
+
+        file_path = self.output_dir / current_filename
+        if not file_path.exists():
+            # Cleanup may have unlinked the partial file; nothing to probe.
+            return
+
+        duration_ms = self._probe_duration_ms(file_path)
+        if duration_ms is None:
+            return  # ffprobe missing/failed; keep in-band path's result
+
+        first_frame_wall_ms = exit_wall_ms - duration_ms
+        if first_frame_wall_ms < popen_wall_ms:
+            logger.warning(
+                "ffprobe-derived first_frame_wall_ms={} is before "
+                "popen_wall_ms={} (Δ={}ms, file_duration={}ms, "
+                "exit_wall_ms={}); implausible — keeping in-band anchor. "
+                "Likely cause: ffprobe read a corrupted/incomplete duration "
+                "from the mp4 trailer.",
+                first_frame_wall_ms, popen_wall_ms,
+                popen_wall_ms - first_frame_wall_ms,
+                duration_ms, exit_wall_ms,
+            )
+            return
+
+        logger.info(
+            "ffprobe-derived first_frame_wall_ms={} "
+            "(exit_wall={} − duration={}ms, popen+{}ms); "
+            "overriding any in-band anchor",
+            first_frame_wall_ms, exit_wall_ms, duration_ms,
+            first_frame_wall_ms - popen_wall_ms,
+        )
+        self._rename_to_first_frame_time(current_filename, first_frame_wall_ms)
+
+    def _probe_duration_ms(self, file_path: Path) -> Optional[int]:
+        """Call ``ffprobe`` to get the container duration in milliseconds.
+
+        Returns ``None`` (with a WARNING log) on any failure — ffprobe
+        missing, non-zero exit, unparseable output, timeout. Caller is
+        expected to fall back to the in-band anchor in that case.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0",
+                    str(file_path),
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "ffprobe not in PATH; cannot derive accurate first-frame "
+                "time — keeping in-band anchor (popen-time fallback if "
+                "back-calc was also rejected). Install ffmpeg suite to "
+                "enable authoritative first-frame anchor.",
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ffprobe timed out on {} (>10s); keeping in-band anchor",
+                file_path.name,
+            )
+            return None
+        except Exception:
+            # Belt-and-suspenders: subprocess.run goes through Popen
+            # internally, and various test mocks / system quirks can break
+            # the communicate() unpack. Any unhandled error → silent
+            # degrade to in-band anchor, never crash stop().
+            logger.exception(
+                "ffprobe call raised unexpected exception; keeping in-band "
+                "anchor for {}", file_path.name,
+            )
+            return None
+
+        if result.returncode != 0:
+            logger.warning(
+                "ffprobe rc={} for {}; stderr: {}",
+                result.returncode, file_path.name,
+                result.stderr.strip()[:200],
+            )
+            return None
+
+        try:
+            duration_s = float(result.stdout.strip())
+        except ValueError:
+            logger.warning(
+                "ffprobe duration unparseable for {}: {!r}",
+                file_path.name, result.stdout.strip()[:60],
+            )
+            return None
+
+        return int(duration_s * 1000)
 
     def _cleanup_failed_attempt(self) -> None:
         """Roll back the bookkeeping of an attempt that died too fast.

@@ -969,6 +969,242 @@ def test_implausible_back_calc_falls_back_to_popen(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 19. ffprobe-based finalize：ffmpeg 退出后用 ffprobe 读真实 mp4 duration，
+#     算 first_frame_wall_ms = exit_wall_ms - duration_ms（更权威），
+#     覆盖 progress-based 的反算结果。
+# ---------------------------------------------------------------------------
+
+def _stub_ffprobe(duration_s: float | str | None, *, rc: int = 0,
+                  raise_exc: Exception | None = None):
+    """构造 subprocess.run 的 side_effect，模拟 ffprobe 输出 duration。
+
+    - duration_s: 输出到 stdout 的 duration（秒），用 str 直接写出去
+    - rc: 非 0 模拟 ffprobe 失败
+    - raise_exc: 抛出指定异常（e.g. FileNotFoundError 模拟 ffprobe 不在 PATH）
+    """
+    def side_effect(cmd, *args, **kwargs):
+        if raise_exc is not None:
+            raise raise_exc
+        result = MagicMock()
+        result.returncode = rc
+        if duration_s is None:
+            result.stdout = ""
+        else:
+            result.stdout = f"{duration_s}\n"
+        result.stderr = "" if rc == 0 else "simulated ffprobe error\n"
+        return result
+    return side_effect
+
+
+def test_ffprobe_finalize_overrides_with_accurate_anchor(tmp_path: Path):
+    """ffprobe 成功 → 用 exit_wall - duration 反算的 first_frame_wall_ms
+    覆盖 progress-based 的结果（更权威，因为 ffprobe 读的是 muxer 真实写下的
+    PTS，绕开了 ffmpeg -progress 字段不可靠的问题）。
+
+    时间线：
+        T_popen        = 1000.000s   → launch_ms = 1_000_000
+        T_first_obs    = 1000.034s   → progress reader 看到第一行
+        T_exit         = 1100.000s   → ffmpeg 退出（被 stop() SIGINT）
+        ffprobe duration = 95.000s
+        ⇒ first_frame_wall_ms = 1_100_000 - 95_000 = 1_005_000 (popen+5s)
+
+    progress reader 会基于 out_time_us=33333 也尝试反算并 rename 到
+    1000034。但 ffprobe 兜底覆盖它 → 最终文件名 main_1005000.mp4。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    # time.time() 消费顺序：
+    #   1. _launch_ffmpeg → launch_ms = 1000.000 (popen)
+    #   2. _read_progress_and_rename，单条 out_time_us=33333 观测 = 1000.034
+    #   3. stop() → exit_wall_ms = 1100.000
+    times = iter([1000.000, 1000.034, 1100.000])
+    expected_launch_ms = 1_000_000
+    expected_first_frame_ms = 1_005_000  # exit_wall(1100000) - ffprobe duration(95000)
+
+    # 只塞 1 条有效 out_time_us，避免 progress reader 多消费 time.time()。
+    progress_lines = (b"out_time_us=33333\n",)
+
+    def popen_side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1100.000)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=popen_side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.subprocess.run",
+               side_effect=_stub_ffprobe(95.000)), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["file"] == f"main_{expected_first_frame_ms}.mp4", (
+        f"ffprobe-derived anchor 应该覆盖 in-band 结果，"
+        f"期望 main_{expected_first_frame_ms}.mp4，得到 {seg['file']}"
+    )
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+
+    # 实际文件也得在新名字
+    assert (video_dir / f"main_{expected_first_frame_ms}.mp4").exists()
+
+
+def test_ffprobe_missing_keeps_in_band_anchor(tmp_path: Path):
+    """ffprobe 不在 PATH（subprocess.run 抛 FileNotFoundError）→ 沉默降级，
+    保留 in-band（progress-based）路径的结果。
+
+    progress reader 看到 out_time_us=33333 at wall=1000.034，
+    in-band 公式给出 first_frame_wall_ms = 1000034 - 0 = 1000034。
+    ffprobe 抛 FileNotFoundError → 不 override → 最终 = 1000034。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([1000.000, 1000.034, 1100.000])
+    expected_first_frame_ms = 1_000_034  # = in-band 结果（last_obs_wall）
+
+    progress_lines = (b"out_time_us=33333\n", b"progress=continue\n")
+
+    def popen_side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1100.000)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=popen_side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.subprocess.run",
+               side_effect=_stub_ffprobe(None, raise_exc=FileNotFoundError("ffprobe"))), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+
+
+def test_ffprobe_rc_nonzero_keeps_in_band_anchor(tmp_path: Path):
+    """ffprobe 退出码非 0（e.g. corrupt mp4）→ 沉默降级，
+    保留 in-band 路径结果。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([1000.000, 1000.034, 1100.000])
+    expected_first_frame_ms = 1_000_034
+
+    progress_lines = (b"out_time_us=33333\n",)
+
+    def popen_side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1100.000)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=popen_side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.subprocess.run",
+               side_effect=_stub_ffprobe("N/A", rc=1)), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+
+
+def test_ffprobe_implausible_duration_keeps_in_band_anchor(tmp_path: Path):
+    """ffprobe 报出来的 duration 大到把 first_frame 算到 popen 之前
+    （e.g. mp4 的 duration 元数据被损坏）→ sanity check 拒绝，
+    保留 in-band 路径结果（不写出物理上不可能的时间戳）。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([1000.000, 1000.034, 1100.000])
+    expected_first_frame_ms = 1_000_034  # = in-band 结果
+
+    progress_lines = (b"out_time_us=33333\n",)
+
+    def popen_side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 1100.000)
+
+    # exit_wall = 1100000，popen = 1000000。
+    # 若 duration = 200s → first_frame = 900000 < popen → 拒绝
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=popen_side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.subprocess.run",
+               side_effect=_stub_ffprobe(200.000)), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+
+
+# ---------------------------------------------------------------------------
 # 18. 空 manifest 也带 popen_at_recv_ms=None（前端 / player 读得一致）
 # ---------------------------------------------------------------------------
 
