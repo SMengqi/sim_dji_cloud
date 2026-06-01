@@ -563,10 +563,12 @@ def test_ffmpeg_popen_wall_ms_unchanged_after_first_frame_rename(tmp_path: Path)
     video_dir = tmp_path / "video"
     launched_event = threading.Event()
 
-    # 同 test 15 的时间安排：launch_ms=1000000, first_frame_wall_ms=1000001
+    # 同 test 15 的时间安排：launch_ms=1000000, first_frame_wall_ms=1000034
+    # 新公式：单条观测 → first_us == last_us，delta=0，
+    # first_frame_wall_ms = last_observed_at_ms = 1000034
     times = iter([1000.000, 1000.034])
     expected_launch_ms = 1000000
-    expected_first_frame_ms = 1000001
+    expected_first_frame_ms = 1000034
     progress_lines = (b"out_time_us=33333\n", b"progress=continue\n")
 
     def side_effect(*args, **kwargs):
@@ -625,6 +627,11 @@ def test_buffered_progress_flush_uses_latest_observation(tmp_path: Path):
     在退出那一刻一次性 flush。如果按"首条非零 out_time_us"做反算，
     `now - out_time_us` 会把 first frame 算到接近 exit 的时间（错），
     必须用"最后一条" out_time_us 才对。
+
+    新公式 ``last_obs_wall - (last_us - first_us)/1000`` 在 buffered-flush
+    场景下：last_obs_wall = exit_wall (所有行 flush 在 exit)，
+    first_us / last_us 是文件首末帧 PTS，差值 = 文件录制时长 →
+    first_frame_wall = exit_wall - duration = 正确。
     """
     video_dir = tmp_path / "video"
     launched_event = threading.Event()
@@ -636,15 +643,15 @@ def test_buffered_progress_flush_uses_latest_observation(tmp_path: Path):
     # 所有 progress 都在 flush 那一刻被读到 → time.time() 都返回 2015.500
     times = iter([2000.000, 2015.500, 2015.500, 2015.500, 2015.500])
     expected_launch_ms = 2000000
-    # 最后一条 out_time_us = 15_400_000 (15.4s 流时长)
-    # → first_frame_wall_ms = 2015500 - 15400 = 2000100 (T0 + 100ms, 正确)
-    expected_first_frame_ms = 2000100
+    # first_us=33333, last_us=15400000 → delta = 15366667us = 15366ms
+    # first_frame_wall_ms = 2015500 - 15366 = 2000134 (≈ T0 + 134ms)
+    expected_first_frame_ms = 2000134
 
     progress_lines = (
-        b"out_time_us=33333\n",       # 33ms 流，旧逻辑错算成 ~2015467
+        b"out_time_us=33333\n",       # 33ms 流：first_us（文件首帧 PTS）
         b"out_time_us=1000000\n",     # 1s 流
         b"out_time_us=10000000\n",    # 10s 流
-        b"out_time_us=15400000\n",    # 15.4s 流（最后一条，正确锚点）
+        b"out_time_us=15400000\n",    # 15.4s 流：last_us（文件末帧 PTS）
     )
 
     def side_effect(*args, **kwargs):
@@ -695,7 +702,8 @@ def test_progress_accepts_out_time_ms_fallback(tmp_path: Path):
 
     times = iter([1000.000, 1000.034])
     expected_launch_ms = 1000000
-    expected_first_frame_ms = 1000001   # 1000034 - 33
+    # 新公式：单条观测 → delta=0，first_frame_wall_ms = last_observed_at_ms
+    expected_first_frame_ms = 1000034
 
     # 只用 out_time_ms=（没有 out_time_us=）
     progress_lines = (
@@ -791,6 +799,88 @@ def test_no_out_time_observation_leaves_popen_filename(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 17.8. 生产 bug 复现：RTMP 源 PTS 不从 0 起（编码器累计运行时间），
+#       `-c copy` 不重写 PTS，旧公式 `now - last_us/1000` 反算出来的
+#       first_frame_wall_ms 比 popen 早几天。新公式用 PTS 增量。
+# ---------------------------------------------------------------------------
+
+def test_pts_not_starting_at_zero_uses_delta_against_first_observation(
+    tmp_path: Path,
+):
+    """日志重现（2026-05-29 17:07 录制）：
+
+        popen wall_ms          1780045635673   ≈ 17:07:15.673
+        latest out_time_us     588009000000    ≈ 588009s ≈ 6.8 天
+        latest observed wall   1780046231726   ≈ 17:17:11.726 (popen+596s)
+        旧公式 first_frame_wall_ms = 1780046231726 - 588009000
+                                  = 1779458222726  ← 5/22 00:37（错 6.8 天）
+
+    源 RTMP PTS 来自编码器累计运行时间，ffmpeg ``-c copy`` 不重写 PTS，
+    所以 ``out_time_us`` 是源 PTS 不是"输出已写时长"。修复：用首条 / 末条
+    观测的 PTS **增量** 当输出已写时长。
+
+    本测试构造一次 15.4s 录制：源 PTS 从 587413000000 us 起，到末尾
+    587428400000 us（涨 15.4s）。两次观测都是实时拿到的（非缓冲 flush）：
+
+        T_popen   = 3000.000s             → launch_ms       = 3000000
+        T_first   = 3000.100s (popen+100ms) → first PTS=587413000000
+        T_last    = 3015.500s (popen+15.4s) → last  PTS=587428400000
+
+    新公式 first_frame_wall_ms = 3015500 - (587428400000 - 587413000000)/1000
+                              = 3015500 - 15400 = 3000100 (= T_first 墙钟)
+
+    旧公式会把 first_frame 算到 (3015500 - 587428400) = 大负数，文件名直接
+    变成 ``main_-584412900.mp4`` 之类的乱码 → 这条断言能区分新旧实现。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([3000.000, 3000.100, 3015.500])
+    expected_launch_ms = 3000000
+    expected_first_frame_ms = 3000100  # = T_first 墙钟
+
+    progress_lines = (
+        b"out_time_us=587413000000\n",   # 源 PTS：编码器已运行 587413s
+        b"out_time_us=587428400000\n",   # 15.4s 后
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 3015.500)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    assert seg["file"] == f"main_{expected_first_frame_ms}.mp4", (
+        f"PTS-not-zero 场景应该用 (last_us - first_us) 增量倒推 first_frame_wall_ms，"
+        f"期望 main_{expected_first_frame_ms}.mp4，得到 {seg['file']}"
+    )
+    assert seg["ffmpeg_start_wall_ms"] == expected_first_frame_ms
+    # ffmpeg_popen_wall_ms 仍是 Popen 时刻（"开始拉流"语义不变）
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+
+
+# ---------------------------------------------------------------------------
 # 18. 空 manifest 也带 popen_at_recv_ms=None（前端 / player 读得一致）
 # ---------------------------------------------------------------------------
 
@@ -872,7 +962,8 @@ def test_first_frame_detected_renames_file_and_patches_manifest(tmp_path: Path):
     """Mock proc.stdout to emit a real-looking ffmpeg-progress block.
 
     The supervisor's progress-reader thread should pick up the first non-zero
-    out_time_us, back-calculate first_frame_wall_ms = now_ms - us//1000, then:
+    out_time_us, back-calculate first_frame_wall_ms via the PTS-delta formula
+    ``last_obs_wall - (last_us - first_us) // 1000``, then:
       (a) rename the placeholder mp4 on disk
       (b) patch self._segments[-1]["file"] and ["ffmpeg_start_wall_ms"]
     """
@@ -881,11 +972,12 @@ def test_first_frame_detected_renames_file_and_patches_manifest(tmp_path: Path):
     renamed_event = threading.Event()
 
     # time.time() returns 1000.000 at Popen, then 1000.034 when progress reader
-    # observes out_time_us=33333 (= 33 ms of output).
-    # Expected: launch_ms = 1000000; first_frame_wall_ms = 1000034 - 33 = 1000001.
+    # observes out_time_us=33333.
+    # 单条观测 → first_us == last_us，delta=0，
+    # first_frame_wall_ms = last_observed_at_ms = 1000034.
     times = iter([1000.000, 1000.034])
     expected_launch_ms = 1000000
-    expected_first_frame_ms = 1000001
+    expected_first_frame_ms = 1000034
 
     progress_lines = (
         b"frame=1\n",
@@ -957,11 +1049,12 @@ def test_rename_failure_leaves_placeholder_but_patches_manifest_ts(tmp_path: Pat
     launched_event = threading.Event()
 
     # time.time() returns 2000.000 at Popen, 2000.500 when progress reader sees
-    # out_time_us=750000 (= 750 ms of output).
-    # ⇒ launch_ms = 2000000;  first_frame_wall_ms = 2000500 - 750 = 1999750
+    # out_time_us=750000.
+    # 单条观测 → first_us == last_us，delta=0，
+    # ⇒ launch_ms = 2000000;  first_frame_wall_ms = last_observed_at_ms = 2000500
     times = iter([2000.000, 2000.500])
     expected_launch_ms = 2000000
-    expected_first_frame_ms = 1999750
+    expected_first_frame_ms = 2000500
 
     progress_lines = (b"out_time_us=750000\n", b"progress=continue\n")
 

@@ -17,13 +17,25 @@ Each attempt:
    unreachable / no-publisher endpoint makes it exit within ~5 s on its own.
 
 2. **Progress reader thread.** ffmpeg is also given
-   ``-progress pipe:1 -stats_period 0.1``. A daemon thread drains stdout and,
-   on the first non-zero ``out_time_us=…`` line, back-calculates the wall
-   clock of the first input frame as ``now_ms − out_time_us/1000`` and
-   **renames** the file to ``main_<first_frame_wall_ms>.mp4`` (POSIX rename is
-   atomic — ffmpeg's open fd keeps writing through the inode). The same
+   ``-progress pipe:1 -stats_period 0.1``. A daemon thread drains stdout,
+   tracks both the **first** and **latest** non-zero ``out_time_us=…``
+   observations plus the wall ms at which the latest one arrived, and
+   back-calculates the wall clock of the first input frame as
+   ``last_observed_at_ms - (last_us - first_us) // 1000``. It then
+   **renames** the file to ``main_<first_frame_wall_ms>.mp4`` (POSIX rename
+   is atomic — ffmpeg's open fd keeps writing through the inode). The same
    value is patched into the segment's ``ffmpeg_start_wall_ms`` so the
    manifest is accurate.
+
+   Why the PTS-delta form and not the older ``now_ms - out_time_us/1000``:
+   ffmpeg with ``-c copy`` from RTMP passes the source's PTS straight
+   through to the output. The source's PTS is the **encoder's monotonic
+   clock** (often "seconds since the encoder booted"), so it does NOT start
+   at 0. The old form silently assumed ``first_frame_pts == 0`` and produced
+   wall times days before ``popen_wall_ms`` whenever the encoder had been up
+   for any non-trivial time. ``(last_us - first_us)`` is the file's recorded
+   duration regardless of where the source PTS started, so subtracting it
+   from the latest wall observation lands on the actual first-frame wall.
 
    This matters for downstream tools that align video PTS with MQTT
    ``recv_ts_ms``: ``frame_at_PTS_X_recv_ms == ffmpeg_start_wall_ms + X``. With
@@ -325,24 +337,39 @@ class VideoWriter:
         proc: subprocess.Popen,
         placeholder_filename: str,
     ) -> None:
-        """Drain ffmpeg's ``-progress`` stdout. Track the LATEST observed
-        ``out_time_*`` and, after the pipe closes (ffmpeg exits or we stop it),
-        back-calculate first-frame wall ms from that latest observation,
-        then rename the output file.
+        """Drain ffmpeg's ``-progress`` stdout. Track the FIRST and LATEST
+        non-zero ``out_time_*`` observations and, after the pipe closes
+        (ffmpeg exits or we stop it), back-calculate first-frame wall ms via
+        the PTS-delta form, then rename the output file.
 
-        Why **latest** and not **first**:
+        Formula:
 
-        The formula ``first_frame_wall_ms = now_ms - out_time_us // 1000``
-        is correct **iff** ``now_ms`` is close to the wall clock at which the
-        observed progress block was *emitted*. In a real-time stream that's
-        automatic — each block flushes promptly. But ffmpeg's stdout for
-        ``-progress pipe:1`` goes through libc stdio block buffering (4KB) for
-        non-TTY pipes. For short recordings (~15s, ~150 blocks × ~200 B ≈ 30 KB)
-        the buffer may not fill mid-stream; at exit, the whole batch flushes
-        and our reader observes all blocks within milliseconds, *all with
-        ``now_ms`` ≈ exit_ms*. For the **first** block (small ``out_time_us``)
-        the formula then drifts by nearly the whole recording duration; for
-        the **last** block (largest ``out_time_us``) it stays correct.
+            first_frame_wall_ms = last_observed_at_ms - (last_us - first_us) // 1000
+
+        Why the **delta** form and not the older ``now_ms - out_time_us``:
+            ffmpeg ``-c copy`` from RTMP forwards the source's PTS directly
+            into the output. Most live encoders (e.g. DJI Dock) emit PTS that
+            is their **monotonic uptime**, not 0-relative. The old form
+            ``now - out_time_us/1000`` assumed ``first_frame_pts == 0`` and
+            therefore mis-attributed encoder uptime as "file duration",
+            producing wall times days before ``popen_wall_ms`` (one such
+            production log: 6.8 days early).
+
+            ``(last_us - first_us)`` is the file's recorded duration
+            regardless of where source PTS started, so subtracting it from
+            the latest wall observation lands on the actual first-frame
+            wall.
+
+        Why we still pick the **latest** wall observation:
+            ffmpeg's stdout for ``-progress pipe:1`` goes through libc stdio
+            block buffering (4KB) for non-TTY pipes. For short recordings
+            (~15s, ~30KB) the buffer may not fill mid-stream; at exit, the
+            whole batch flushes and our reader observes all blocks within
+            milliseconds, *all with ``now_ms`` ≈ exit_ms*. Using
+            ``last_observed_at_ms`` keeps the formula correct in both
+            real-time-progress and buffered-flush cases — the PTS-delta
+            captures the file duration; the latest wall captures the most
+            up-to-date alignment with reality.
 
         Why we also accept ``out_time_ms=``:
             Older ffmpeg releases (pre-4.x) emit only ``out_time_ms=`` and
@@ -350,15 +377,19 @@ class VideoWriter:
             later. Parsing both keeps us version-portable.
 
         Why rename happens in ``finally`` (after pipe close), not inline:
-            Guarantees we always use the **latest** observation, including the
-            tail blocks flushed at ffmpeg exit. ``stop()`` joins this thread
-            before writing ``main.timing.json``, so the renamed filename
-            lands in the timing record.
+            Guarantees we always use the **latest** observation, including
+            the tail blocks flushed at ffmpeg exit. ``stop()`` joins this
+            thread before writing ``main.timing.json``, so the renamed
+            filename lands in the timing record.
         """
         if proc.stdout is None:
             return
         line_count = 0
         out_time_hits = 0
+        # first_us：首条 >0 的 out_time_us，作为"文件首帧 PTS"的锚。
+        # 在 -c copy 下输出 PTS 直接来自源流，源 PTS 不从 0 开始，
+        # 必须减掉 first_us 才能得到"文件录制时长"。
+        first_us: Optional[int] = None
         last_us: Optional[int] = None
         last_observed_at_ms: Optional[int] = None
         try:
@@ -384,6 +415,8 @@ class VideoWriter:
                     # skip but keep counting hits for diagnostic logging.
                     continue
                 out_time_hits += 1
+                if first_us is None:
+                    first_us = us
                 last_us = us
                 last_observed_at_ms = int(time.time() * 1000)
         except Exception:
@@ -396,7 +429,11 @@ class VideoWriter:
                     proc.stdout.close()
             except Exception:
                 pass
-        if last_us is None or last_observed_at_ms is None:
+        if (
+            first_us is None
+            or last_us is None
+            or last_observed_at_ms is None
+        ):
             # 没看到任何可用的 out_time_*。常见原因：ffmpeg 太老（不支持 -progress）、
             # progress 被 stderr 截获、连接没成功就退出。文件名维持 popen-time，
             # 下游回放仍可用 popen_at_recv_ms 做锚点，只是没了 first-frame 精度。
@@ -408,12 +445,16 @@ class VideoWriter:
                 line_count, out_time_hits,
             )
             return
-        first_frame_wall_ms = last_observed_at_ms - last_us // 1000
+        # PTS-delta back-calc：(last_us - first_us) 是文件录制时长，
+        # 与源 PTS 是否从 0 起无关。
+        first_frame_wall_ms = last_observed_at_ms - (last_us - first_us) // 1000
         logger.info(
-            "video progress: {} lines observed, {} usable; latest out_time_us={} "
-            "at wall_ms={} → first_frame_wall_ms={}",
+            "video progress: {} lines observed, {} usable; first_us={}, "
+            "last_us={} at wall_ms={} → first_frame_wall_ms={} "
+            "(duration={}ms)",
             line_count, out_time_hits,
-            last_us, last_observed_at_ms, first_frame_wall_ms,
+            first_us, last_us, last_observed_at_ms, first_frame_wall_ms,
+            (last_us - first_us) // 1000,
         )
         self._rename_to_first_frame_time(placeholder_filename, first_frame_wall_ms)
 
