@@ -30,6 +30,7 @@ class Player:
         start_offset_ms: int = 0,
         video_push_url: str | None = None,
         video_pusher_factory: Callable[..., VideoPusher] = VideoPusher,
+        video_anchor_offset_ms: int = 0,
     ):
         self.flight_dir = Path(flight_dir)
         self._publisher = publisher
@@ -40,6 +41,7 @@ class Player:
         self._tasks: list[asyncio.Task] = []
         self._video_push_url = video_push_url
         self._video_pusher_factory = video_pusher_factory
+        self._video_anchor_offset_ms = video_anchor_offset_ms
         self._video_pusher: Optional[VideoPusher] = None
         self._video_task: Optional[asyncio.Task] = None
 
@@ -72,6 +74,7 @@ class Player:
         plan = plan_video_push(
             self._manifest, self._video_push_url, self._speed,
             video_exists,
+            anchor_offset_ms=self._video_anchor_offset_ms,
         )
         if plan is not None:
             self._video_task = asyncio.create_task(self._run_video_push(plan, video_file))

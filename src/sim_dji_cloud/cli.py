@@ -114,8 +114,12 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
 @click.option("--start-offset-ms", default=0, type=int, help="跳过开头多少毫秒，默认 0")
 @click.option("--video-push-url", default=None,
               help="把 video 目录下的 mp4 推到该 RTMP（如 rtmp://<srs>/live/<stream>），仅 speed=1.0 生效")
+@click.option("--video-anchor-offset-ms", default=0, type=int,
+              help="视频推流相对 first-frame 锚的偏移（毫秒，可正可负）。负值让视频比 first-frame 时刻"
+                   "提前 |N| ms 开始推，用于补偿 RTMP push → SRS GOP cache → 客户端 player buffer "
+                   "这段管道延迟。典型值：实测 SRS+客户端组合 dial-in 出来的常量，数秒量级。默认 0")
 def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int,
-             video_push_url: str | None) -> None:
+             video_push_url: str | None, video_anchor_offset_ms: int) -> None:
     from sim_dji_cloud.tools.play_cmd import play_flight
     raise SystemExit(asyncio.run(play_flight(
         flight_dir=Path(flight_dir),
@@ -123,6 +127,7 @@ def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int,
         speed=speed,
         start_offset_ms=start_offset_ms,
         video_push_url=video_push_url,
+        video_anchor_offset_ms=video_anchor_offset_ms,
     )))
 
 

@@ -11,8 +11,20 @@ from loguru import logger
 
 def plan_video_push(
     manifest: dict, push_url: str | None, speed: float, file_exists: bool,
+    anchor_offset_ms: int = 0,
 ) -> dict | None:
     """决定是否/如何推视频。任一条件不满足返回 None（跳过）。
+
+    Parameters
+    ----------
+    anchor_offset_ms:
+        在 ``wait_virt_ms`` 上叠加的常量偏移（毫秒，可正可负）。用来补偿
+        回放端 RTMP push → SRS GOP cache → 客户端 player buffer 这段
+        不可避免的管道延迟 L。负值表示让视频比 first-frame 时刻提前 |L| 毫秒
+        开始推，正好抵消管道延迟，视频和轨迹视觉同步。最终 wait 仍被
+        ``max(0, ...)`` 兜底为非负——offset 把 wait 拉到负值时无意义。
+        典型值由具体 SRS + 客户端组合决定（数秒量级），建议实测后写
+        run.sh / CLI。默认 0 维持向后兼容。
 
     返回 {"wait_virt_ms": <视频在飞行时间轴上的起点偏移>, "ss_seconds": 0.0}。
     """
@@ -28,7 +40,8 @@ def plan_video_push(
     if not file_exists:
         logger.warning("video/main.mp4 不存在，跳过视频推流")
         return None
-    offset = max(0, video.get("started_at_recv_ms", 0) - manifest.get("started_at_recv_ms", 0))
+    base = video.get("started_at_recv_ms", 0) - manifest.get("started_at_recv_ms", 0)
+    offset = max(0, base + anchor_offset_ms)
     return {"wait_virt_ms": offset, "ss_seconds": 0.0}
 
 
