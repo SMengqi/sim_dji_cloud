@@ -31,6 +31,7 @@ class Player:
         video_push_url: str | None = None,
         video_pusher_factory: Callable[..., VideoPusher] = VideoPusher,
         video_anchor_offset_ms: int = 0,
+        publish_clear_marker_on_stop: bool = True,
     ):
         self.flight_dir = Path(flight_dir)
         self._publisher = publisher
@@ -42,6 +43,9 @@ class Player:
         self._video_push_url = video_push_url
         self._video_pusher_factory = video_pusher_factory
         self._video_anchor_offset_ms = video_anchor_offset_ms
+        # SelfCheck loopback 关掉这个；否则合成 OSD 会被回环 Recorder 收掉，
+        # 跟原录制对不上、Comparator FAIL。其他正常播放场景默认开。
+        self._publish_clear_marker_on_stop = publish_clear_marker_on_stop
         self._video_pusher: Optional[VideoPusher] = None
         self._video_task: Optional[asyncio.Task] = None
 
@@ -129,4 +133,37 @@ class Player:
                     self._video_pusher.stop()
                 except Exception:
                     logger.exception("停止视频推流失败")
+            # 发一条合成 dock OSD 带 flighttask_step_code=5（任务空闲），让
+            # sim-dji dashboard 的 LiveState 清掉飞行轨迹。背景：dashboard 只在
+            # dock OSD 转到 idle 时清 trail，而 DJI 这字段只在状态变化时发——
+            # 录制半途 Ctrl-C 时录制里可能根本没这条 idle 信号，回放结束 / stop
+            # 后 dashboard 轨迹会卡在最后一帧。这里主动补一条。SelfCheck
+            # loopback 模式下通过 publish_clear_marker_on_stop=False 关掉，
+            # 避免污染录制-回放对称性。
+            if self._publish_clear_marker_on_stop:
+                await self._publish_dashboard_clear_marker()
             await self._publisher.disconnect()
+
+    async def _publish_dashboard_clear_marker(self) -> None:
+        """补发一条合成 dock OSD 让 dashboard 清轨迹（详见 wait_until_done finally
+        里的调用注释）。失败时只 log 不抛——这是 best-effort 的收尾动作，
+        不能影响停止流程。manifest 没 dock_sn 时静默跳过。
+        """
+        dock_sn = self._manifest.get("dock_sn")
+        if not dock_sn:
+            return
+        topic = f"thing/product/{dock_sn}/osd"
+        payload = json.dumps(
+            {"data": {"flighttask_step_code": 5}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            await self._publisher.publish(topic, payload)
+            logger.info(
+                "published synthetic idle marker to {} (dashboard trail clear)",
+                topic,
+            )
+        except Exception:
+            logger.exception(
+                "synthetic idle marker publish failed; dashboard 轨迹可能不会自动清",
+            )

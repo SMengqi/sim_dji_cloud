@@ -123,6 +123,9 @@ class SelfCheck:
             flight_dir=self.flight_dir,
             publisher=publisher,
             speed=100.0,
+            # Loopback 模式不能让 Player 自己加一条"清 dashboard 轨迹"的合成
+            # OSD：会被回环 Recorder 收掉，跟原录制对不上 → Comparator FAIL。
+            publish_clear_marker_on_stop=False,
         )
         await player.start()
         await player.wait_until_done()

@@ -137,7 +137,14 @@ async def test_push_start_failure_is_non_fatal(tmp_path):
                video_pusher_factory=lambda s, u, e: BoomPusher(s, u, e))
     await p.start()
     await p.wait_until_done()  # 不抛
-    assert len(published) == 1  # MQTT 照常重发
+    # 录制里 1 条；wait_until_done 收尾会追加一条合成 idle marker（清 dashboard
+    # 轨迹，详见 test_player_publishes_idle_marker_on_stop），过滤掉只看真实重发。
+    import json as _json
+    real = [
+        (t, p) for t, p in published
+        if _json.loads(p.decode()).get("data", {}).get("flighttask_step_code") != 5
+    ]
+    assert len(real) == 1  # MQTT 照常重发
 
 
 # ---------------------------------------------------------------------------
