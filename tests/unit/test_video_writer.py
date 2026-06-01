@@ -881,6 +881,94 @@ def test_pts_not_starting_at_zero_uses_delta_against_first_observation(
 
 
 # ---------------------------------------------------------------------------
+# 17.9. Sanity-check 兜底：source PTS 非线性 / 多 stream 时基冲突时，
+#       back-calc 算出的 first_frame_wall_ms 跑到 [popen, first_observed]
+#       之外，必须放弃 rename、保留 popen-time 文件名。
+# ---------------------------------------------------------------------------
+
+def test_implausible_back_calc_falls_back_to_popen(tmp_path: Path):
+    """2026-06-01 09:58 production log repro：
+
+        popen wall_ms       = 1780279102278   ≈ 09:58:22.278 CST
+        first_us            = 5293000          (5.3 s)
+        last_us             = 93270000000      (93270 s ≈ 25.9 hr)
+        实际 wall 流逝     ≈ 98 s              (popen → last observed)
+        ffprobe 显示 mp4 内部 PTS 是 0..92.981 s（正常）
+
+    ffmpeg ``-c copy`` 模式下 ``-progress out_time_us`` 报的数跟落盘 mp4
+    的 PTS 不一致——它报的是源 DTS / 多 stream 合成时间之类的东西，
+    跨 98 s wall 居然能跳 25.9 hr。新公式
+    ``last_obs - (last_us - first_us)/1000`` 得到的候选值落在 popen
+    **之前** 25 小时（物理上不可能：第一帧不可能在 ffmpeg 启动前就写出）。
+
+    Sanity check 把候选值约束在 ``[popen_wall_ms, first_observed_at_ms]``
+    内，超出就放弃 rename、文件名 / ``ffmpeg_start_wall_ms`` 都维持 popen 值
+    （= 用户最初的诉求"保留开始拉流的时间戳"）。
+
+    本测试构造同构的极端数据：
+        T_popen     = 5000.000 s       → launch_ms = 5_000_000
+        T_first_obs = 5005.293 s       → first_observed_at_ms = 5_005_293
+        T_last_obs  = 5098.000 s       → last_observed_at_ms  = 5_098_000
+        first_us    = 5_293_000        (5.3 s 流, 同生产日志)
+        last_us     = 93_270_000_000   (93270 s 流, 同生产日志)
+
+    候选 = 5098000 - (93270000000 - 5293000)/1000 = 5098000 - 93264707
+         = -88166707  ← 负数，肯定 < popen_wall_ms
+    sanity 拒绝 → 文件名保持 main_5000000.mp4，两个 ts 相等。
+    """
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    times = iter([5000.000, 5005.293, 5098.000])
+    expected_launch_ms = 5_000_000
+
+    progress_lines = (
+        b"out_time_us=5293000\n",       # 5.3s
+        b"out_time_us=93270000000\n",   # 25.9hr（同 06/01 production log）
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    def fake_time():
+        return next(times, 5098.000)
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time", side_effect=fake_time):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    # sanity 拒绝 → 文件名 / ffmpeg_start_wall_ms 都保持 popen-time
+    assert seg["file"] == f"main_{expected_launch_ms}.mp4", (
+        f"implausible back-calc 应该被 sanity check 拒绝、文件名保持 "
+        f"main_{expected_launch_ms}.mp4，得到 {seg['file']}"
+    )
+    assert seg["ffmpeg_start_wall_ms"] == expected_launch_ms
+    assert seg["ffmpeg_popen_wall_ms"] == expected_launch_ms
+
+    # manifest block 暴露的两个 anchor 也都是 popen 值
+    block = vw.manifest_video_block(duration_ms=10000)
+    assert block["started_at_recv_ms"] == expected_launch_ms
+    assert block["popen_at_recv_ms"] == expected_launch_ms
+
+
+# ---------------------------------------------------------------------------
 # 18. 空 manifest 也带 popen_at_recv_ms=None（前端 / player 读得一致）
 # ---------------------------------------------------------------------------
 

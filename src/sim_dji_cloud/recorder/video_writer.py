@@ -325,7 +325,7 @@ class VideoWriter:
 
         progress_thread = threading.Thread(
             target=self._read_progress_and_rename,
-            args=(self._proc, placeholder_filename),
+            args=(self._proc, placeholder_filename, launch_ms),
             name="video-progress",
             daemon=True,
         )
@@ -336,40 +336,72 @@ class VideoWriter:
         self,
         proc: subprocess.Popen,
         placeholder_filename: str,
+        popen_wall_ms: int,
     ) -> None:
         """Drain ffmpeg's ``-progress`` stdout. Track the FIRST and LATEST
-        non-zero ``out_time_*`` observations and, after the pipe closes
-        (ffmpeg exits or we stop it), back-calculate first-frame wall ms via
-        the PTS-delta form, then rename the output file.
+        non-zero ``out_time_*`` observations (and their wall times), back-
+        calculate first-frame wall ms via the PTS-delta form, sanity-check
+        the result against ``[popen_wall_ms, first_observed_at_ms]``, then —
+        only if the candidate is physically plausible — rename the output
+        file. If sanity check fails, the placeholder popen-time filename
+        stays put and we log enough diagnostic info to chase the root cause.
 
         Formula:
 
             first_frame_wall_ms = last_observed_at_ms - (last_us - first_us) // 1000
 
+        Sanity bound:
+
+            popen_wall_ms <= first_frame_wall_ms <= first_observed_at_ms
+
+        Lower bound is physical: the first frame can't possibly be written
+        before ffmpeg's ``Popen`` returns. Upper bound is observational: by
+        the time we read the first ``out_time_us > 0`` line from the pipe,
+        the first frame has already been muxed; so wall-of-first-frame can't
+        be in the future relative to first_observed.
+
         Why the **delta** form and not the older ``now_ms - out_time_us``:
             ffmpeg ``-c copy`` from RTMP forwards the source's PTS directly
-            into the output. Most live encoders (e.g. DJI Dock) emit PTS that
-            is their **monotonic uptime**, not 0-relative. The old form
-            ``now - out_time_us/1000`` assumed ``first_frame_pts == 0`` and
-            therefore mis-attributed encoder uptime as "file duration",
-            producing wall times days before ``popen_wall_ms`` (one such
-            production log: 6.8 days early).
+            into the output progress stream. Most live encoders (e.g. DJI
+            Dock) emit PTS that is their **monotonic uptime**, not 0-
+            relative. The old form ``now - out_time_us/1000`` assumed
+            ``first_frame_pts == 0`` and therefore mis-attributed encoder
+            uptime as "file duration", producing wall times days before
+            ``popen_wall_ms`` (one such production log: 6.8 days early).
 
-            ``(last_us - first_us)`` is the file's recorded duration
-            regardless of where source PTS started, so subtracting it from
-            the latest wall observation lands on the actual first-frame
-            wall.
+            ``(last_us - first_us)`` is the **observed** PTS delta;
+            subtracting it from the latest wall observation gives the wall
+            time when the first observed PTS frame was muxed. For a real-
+            time monotonic-PTS source this equals first-frame wall to within
+            ~100 ms.
 
-        Why we still pick the **latest** wall observation:
+        Why we **still need** the sanity check on top of the delta form:
+            Some sources/ffmpeg-versions report ``out_time_us`` that is
+            non-monotonic at wall-rate (e.g. 2026-06-01 production log:
+            ``first_us=5293000`` then ``last_us=93270000000`` across only
+            ~98s of wall time, a 25.9-hour jump). ``ffprobe`` on the same
+            file showed actual frame PTS = 0..92.981s, so the muxer wrote
+            sane PTS but ffmpeg's ``-progress`` field reported something
+            else entirely (suspected: source DTS, multi-stream timebase
+            clash, or a re-init discontinuity). The delta formula then
+            produces a "first frame wall" 25.9 hours **before** popen.
+
+            Rather than try to guess the root cause from outside, we just
+            reject any back-calc that lands outside the physically possible
+            window and degrade to popen-time naming — which is exactly the
+            "保留开始拉流的时间戳" semantics the user originally asked for.
+            Cost: anchor is RTMP-handshake-delay early (~1-5 s, consistent
+            and player-correctable) instead of arbitrarily wrong.
+
+        Why we still pick the **latest** wall observation in the formula:
             ffmpeg's stdout for ``-progress pipe:1`` goes through libc stdio
             block buffering (4KB) for non-TTY pipes. For short recordings
             (~15s, ~30KB) the buffer may not fill mid-stream; at exit, the
             whole batch flushes and our reader observes all blocks within
-            milliseconds, *all with ``now_ms`` ≈ exit_ms*. Using
-            ``last_observed_at_ms`` keeps the formula correct in both
-            real-time-progress and buffered-flush cases — the PTS-delta
-            captures the file duration; the latest wall captures the most
-            up-to-date alignment with reality.
+            milliseconds. Using ``last_observed_at_ms`` keeps the formula
+            correct in both real-time-progress and buffered-flush cases —
+            the PTS-delta captures the file duration; the latest wall
+            captures the most up-to-date alignment with reality.
 
         Why we also accept ``out_time_ms=``:
             Older ffmpeg releases (pre-4.x) emit only ``out_time_ms=`` and
@@ -380,16 +412,18 @@ class VideoWriter:
             Guarantees we always use the **latest** observation, including
             the tail blocks flushed at ffmpeg exit. ``stop()`` joins this
             thread before writing ``main.timing.json``, so the renamed
-            filename lands in the timing record.
+            filename (or the popen-time fallback) lands in the timing
+            record.
         """
         if proc.stdout is None:
             return
         line_count = 0
         out_time_hits = 0
-        # first_us：首条 >0 的 out_time_us，作为"文件首帧 PTS"的锚。
-        # 在 -c copy 下输出 PTS 直接来自源流，源 PTS 不从 0 开始，
-        # 必须减掉 first_us 才能得到"文件录制时长"。
+        # first_us：首条 >0 的 out_time_us。在 -c copy 下我们 *希望* 它等于
+        # 文件首帧 PTS，从而 (last_us - first_us) 是文件实际录制时长。
+        # 不是所有源都满足这个假设——sanity check 在下面兜底。
         first_us: Optional[int] = None
+        first_observed_at_ms: Optional[int] = None
         last_us: Optional[int] = None
         last_observed_at_ms: Optional[int] = None
         try:
@@ -415,10 +449,12 @@ class VideoWriter:
                     # skip but keep counting hits for diagnostic logging.
                     continue
                 out_time_hits += 1
+                now_ms = int(time.time() * 1000)
                 if first_us is None:
                     first_us = us
+                    first_observed_at_ms = now_ms
                 last_us = us
-                last_observed_at_ms = int(time.time() * 1000)
+                last_observed_at_ms = now_ms
         except Exception:
             logger.exception(
                 "video progress reader errored after {} lines", line_count,
@@ -432,6 +468,7 @@ class VideoWriter:
         if (
             first_us is None
             or last_us is None
+            or first_observed_at_ms is None
             or last_observed_at_ms is None
         ):
             # 没看到任何可用的 out_time_*。常见原因：ffmpeg 太老（不支持 -progress）、
@@ -445,18 +482,44 @@ class VideoWriter:
                 line_count, out_time_hits,
             )
             return
-        # PTS-delta back-calc：(last_us - first_us) 是文件录制时长，
-        # 与源 PTS 是否从 0 起无关。
-        first_frame_wall_ms = last_observed_at_ms - (last_us - first_us) // 1000
+        # PTS-delta back-calc 候选值。
+        first_frame_wall_ms_candidate = (
+            last_observed_at_ms - (last_us - first_us) // 1000
+        )
+        # Sanity check：候选值必须落在 [popen_wall_ms, first_observed_at_ms]。
+        # 越界说明 out_time_us 非 wall-rate 单调（多 stream 时基冲突、源 PTS
+        # discontinuity、或 ffmpeg 报的根本不是 output PTS），back-calc 不可信。
+        if not (
+            popen_wall_ms <= first_frame_wall_ms_candidate <= first_observed_at_ms
+        ):
+            logger.warning(
+                "video back-calc out of plausible window — keeping popen-time "
+                "filename. first_us={}, last_us={}, duration_implied={}ms, "
+                "popen_wall_ms={}, first_observed_at_ms={}, "
+                "last_observed_at_ms={}, candidate={}. "
+                "Likely cause: source RTMP PTS non-monotonic at wall rate "
+                "(timebase clash / discontinuity / ffmpeg version reporting "
+                "source DTS instead of output PTS). Verify file is fine via "
+                "`ffprobe -show_packets v:0`; if mp4 PTS is sane 0..N, the "
+                "lying field is ffmpeg's -progress, not the data.",
+                first_us, last_us, (last_us - first_us) // 1000,
+                popen_wall_ms, first_observed_at_ms, last_observed_at_ms,
+                first_frame_wall_ms_candidate,
+            )
+            return
         logger.info(
             "video progress: {} lines observed, {} usable; first_us={}, "
             "last_us={} at wall_ms={} → first_frame_wall_ms={} "
-            "(duration={}ms)",
+            "(duration={}ms, popen+{}ms)",
             line_count, out_time_hits,
-            first_us, last_us, last_observed_at_ms, first_frame_wall_ms,
+            first_us, last_us, last_observed_at_ms,
+            first_frame_wall_ms_candidate,
             (last_us - first_us) // 1000,
+            first_frame_wall_ms_candidate - popen_wall_ms,
         )
-        self._rename_to_first_frame_time(placeholder_filename, first_frame_wall_ms)
+        self._rename_to_first_frame_time(
+            placeholder_filename, first_frame_wall_ms_candidate,
+        )
 
     def _rename_to_first_frame_time(
         self,
