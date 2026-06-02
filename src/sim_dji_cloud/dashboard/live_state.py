@@ -1,6 +1,8 @@
 import copy
 from collections import deque
-from typing import Any
+from typing import Any, Callable
+
+from loguru import logger
 
 
 class LiveState:
@@ -14,6 +16,7 @@ class LiveState:
         events_ring_size: int = 20,
         trail_max: int = 500,
         controls_ring_size: int = 30,
+        on_flight_idle: list[Callable[[], None]] | None = None,
     ):
         self._dock: dict[str, Any] = {}
         self._drone: dict[str, Any] = {}
@@ -25,6 +28,9 @@ class LiveState:
         self._topic_counts: dict[str, int] = {}
         self._known_dock_sn: str | None = None
         self._known_drone_sn: str | None = None
+        # listener 在 flighttask_step_code 转到 idle 时被调
+        # （dashboard 用来同步清 EventsArchive）
+        self._on_flight_idle_listeners: list[Callable[[], None]] = list(on_flight_idle or [])
 
     def update(self, topic: str, payload: dict[str, Any], recv_ts_ms: int) -> None:
         self._topic_counts[topic] = self._topic_counts.get(topic, 0) + 1
@@ -117,6 +123,11 @@ class LiveState:
         if isinstance(new_step, int) and new_step not in self._RECORDING_STEP_CODES:
             # 任务空闲 → 清空轨迹（幂等：空轨迹再清还是空）。
             self._trail.clear()
+            for cb in self._on_flight_idle_listeners:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("flight-idle listener failed; continuing")
         for src, dst in self._DOCK_FIELD_MAP:
             if src in data:
                 self._dock[dst] = data[src]

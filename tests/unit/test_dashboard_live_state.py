@@ -504,3 +504,61 @@ def test_initial_snapshot_has_controls_field():
     s = LiveState()
     snap = s.snapshot()
     assert snap["controls"] == []
+
+
+def test_flight_idle_listener_fires_when_step_code_leaves_recording():
+    """收到 dock OSD 带 flighttask_step_code=5 时，所有注册的 listener 都被调用。"""
+    calls = {"a": 0, "b": 0}
+    state = LiveState(on_flight_idle=[
+        lambda: calls.__setitem__("a", calls["a"] + 1),
+        lambda: calls.__setitem__("b", calls["b"] + 1),
+    ])
+    # 先发一条 recording 状态确立 dock_sn
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1000,
+    )
+    assert calls == {"a": 0, "b": 0}, "recording 状态不该触发"
+    # 再发一条 idle (=5)
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 5}},
+        recv_ts_ms=2000,
+    )
+    assert calls == {"a": 1, "b": 1}
+
+
+def test_flight_idle_listener_exception_isolated_per_listener():
+    """某个 listener 抛错不影响其它 listener、不阻断 trail.clear。"""
+    other_called = []
+
+    def boom():
+        raise RuntimeError("listener went boom")
+
+    state = LiveState(on_flight_idle=[
+        boom,
+        lambda: other_called.append(True),
+    ])
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1000,
+    )
+    state.update(
+        topic="thing/product/SN_DRONE/osd",
+        payload={"data": {"latitude": 30.0, "longitude": 120.0}},
+        recv_ts_ms=1500,
+    )
+    snap = state.snapshot()
+    assert len(snap["drone_trail"]) == 1
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 5}},
+        recv_ts_ms=2000,
+    )
+    # boom listener 抛错被吞，其它 listener 仍被调用，trail 仍被清
+    assert other_called == [True]
+    assert state.snapshot()["drone_trail"] == []

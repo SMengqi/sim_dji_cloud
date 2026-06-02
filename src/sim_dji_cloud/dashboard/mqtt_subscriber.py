@@ -31,11 +31,13 @@ class MqttSubscriber:
         port: int,
         client_id: str,
         subscribe_patterns: Optional[list[str]] = None,
+        archive=None,
     ):
         self._state = state
         self._host = host
         self._port = port
         self._patterns = subscribe_patterns or DEFAULT_PATTERNS
+        self._archive = archive
         self._client = gmqtt.Client(client_id)
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message_internal
@@ -55,7 +57,10 @@ class MqttSubscriber:
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload_obj = {}
         try:
-            self._state.update(topic, payload_obj, now_ms())
+            recv_ts_ms = now_ms()
+            self._state.update(topic, payload_obj, recv_ts_ms)
+            if self._archive is not None:
+                self._archive.append(topic, payload_obj, recv_ts_ms)
         except Exception:
             logger.exception("dashboard state update failed for {}", topic)
         return 0
