@@ -48,3 +48,11 @@ def test_cli_help_lists_dashboard():
     r = CliRunner().invoke(main, ["--help"])
     assert r.exit_code == 0
     assert "dashboard" in r.output
+
+
+def test_dashboard_cli_accepts_recordings_root():
+    """sim-dji dashboard --recordings-root 选项存在。"""
+    runner = CliRunner()
+    result = runner.invoke(main, ["dashboard", "--help"])
+    assert result.exit_code == 0
+    assert "--recordings-root" in result.output

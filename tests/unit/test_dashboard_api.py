@@ -241,3 +241,151 @@ def test_index_html_has_payload_modal():
     assert "keydown.escape.window" in html
     # Click on backdrop closes (but click inside card does not)
     assert "click.self=\"closeModal()\"" in html
+
+
+def _client_with_archive(tmp_path):
+    """构造带 archive + recordings_root 的 TestClient。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+    from sim_dji_cloud.dashboard.events_archive import EventsArchive
+
+    archive = EventsArchive(soft_cap=10**6)
+    state = LiveState()
+    app = create_app(state=state, archive=archive, recordings_root=tmp_path)
+    return TestClient(app), archive
+
+
+def test_get_timeline_live_returns_session_and_entries(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    archive.append("thing/product/SN/events",
+                   {"method": "alarm"}, recv_ts_ms=1000)
+    archive.append("thing/product/SN/drc/down",
+                   {"method": "stick"}, recv_ts_ms=1500)
+    r = client.get("/api/timeline")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["source"] == "live"
+    assert data["session_started_at_ms"] == 1000
+    assert [e["method"] for e in data["entries"]] == ["alarm", "stick"]
+    assert data["truncated"] is False
+
+
+def test_get_timeline_kinds_filter_events_only(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    archive.append("thing/product/SN/events", {"method": "e"}, recv_ts_ms=1)
+    archive.append("thing/product/SN/drc/down", {"method": "c"}, recv_ts_ms=2)
+    r = client.get("/api/timeline?kinds=event")
+    assert [e["method"] for e in r.json()["entries"]] == ["e"]
+
+
+def test_get_timeline_since_ms_filter(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    for ts in [10, 20, 30, 40]:
+        archive.append("thing/product/SN/events",
+                       {"method": str(ts)}, recv_ts_ms=ts)
+    r = client.get("/api/timeline?since_ms=25")
+    assert [e["method"] for e in r.json()["entries"]] == ["30", "40"]
+
+
+def test_get_timeline_limit_truncates_with_flag(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    for ts in range(20):
+        archive.append("thing/product/SN/events",
+                       {"method": str(ts)}, recv_ts_ms=ts)
+    r = client.get("/api/timeline?limit=3")
+    data = r.json()
+    assert data["truncated"] is True
+    assert len(data["entries"]) == 3
+
+
+def test_get_timeline_offline_source_reads_flight_dir(tmp_path):
+    from tests.unit.test_events_archive_from_flight_dir import _build_minimal_flight
+    flight = _build_minimal_flight(tmp_path)
+    client, _ = _client_with_archive(tmp_path)
+    rel = flight.relative_to(tmp_path)
+    r = client.get(f"/api/timeline?source={rel}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["session_started_at_ms"] == 50   # manifest started_at
+    methods = [e["method"] for e in data["entries"]]
+    assert methods == ["alarm_1", "stick_control", "alarm_2", "wayline_create"]
+
+
+def test_get_timeline_offline_source_not_found(tmp_path):
+    client, _ = _client_with_archive(tmp_path)
+    r = client.get("/api/timeline?source=no_such_dir")
+    assert r.status_code == 404
+
+
+def test_get_timeline_offline_source_path_traversal_rejected(tmp_path):
+    client, _ = _client_with_archive(tmp_path)
+    r = client.get("/api/timeline?source=../etc")
+    assert r.status_code == 400
+
+
+def test_get_timeline_offline_source_outside_root_rejected(tmp_path):
+    client, _ = _client_with_archive(tmp_path)
+    r = client.get(f"/api/timeline?source=/tmp/anywhere_else_{id(tmp_path)}")
+    assert r.status_code == 400
+
+
+def test_export_csv_header_and_basic_row(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    archive.append("thing/product/SN/events",
+                   {"method": "alarm", "data": {"x": 1}},
+                   recv_ts_ms=1780297017006)
+    r = client.get("/api/timeline/export.csv")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert "attachment" in r.headers["content-disposition"]
+    lines = r.text.strip().split("\n")
+    assert lines[0] == "recv_ts_ms,recv_ts_iso,virt_offset_ms,kind,topic,method,payload_json"
+    assert "1780297017006" in lines[1]
+    assert "event" in lines[1]
+    assert "alarm" in lines[1]
+
+
+def test_export_csv_payload_json_quoted_safely(tmp_path):
+    import csv as _csv
+    import io
+    import json as _json
+    client, archive = _client_with_archive(tmp_path)
+    archive.append("thing/product/SN/events",
+                   {"method": "x", "data": {"note": 'hello, "world"\nline2'}},
+                   recv_ts_ms=1000)
+    r = client.get("/api/timeline/export.csv")
+    reader = _csv.reader(io.StringIO(r.text))
+    rows = list(reader)
+    assert rows[0][0] == "recv_ts_ms"
+    payload_json = rows[1][6]
+    # csv.reader properly unquotes the cell; json.loads recovers the original data
+    decoded = _json.loads(payload_json)
+    assert decoded["data"]["note"] == 'hello, "world"\nline2'
+
+
+def test_export_csv_filename_uses_flight_basename_for_offline(tmp_path):
+    from tests.unit.test_events_archive_from_flight_dir import _build_minimal_flight
+    flight = _build_minimal_flight(tmp_path)
+    client, _ = _client_with_archive(tmp_path)
+    rel = flight.relative_to(tmp_path)
+    r = client.get(f"/api/timeline/export.csv?source={rel}")
+    assert flight.name in r.headers["content-disposition"]
+
+
+def test_export_csv_filename_uses_live_for_live(tmp_path):
+    client, archive = _client_with_archive(tmp_path)
+    archive.append("thing/product/SN/events", {"method": "x"}, recv_ts_ms=1)
+    r = client.get("/api/timeline/export.csv")
+    assert "timeline_live_" in r.headers["content-disposition"]
+
+
+def test_timeline_router_not_mounted_when_archive_none(tmp_path):
+    """create_app(archive=None) → /api/timeline 不挂，FastAPI 自然 404。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+
+    app = create_app(state=LiveState(), archive=None, recordings_root=tmp_path)
+    c = TestClient(app)
+    assert c.get("/api/timeline").status_code == 404

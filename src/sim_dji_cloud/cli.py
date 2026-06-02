@@ -182,11 +182,13 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
 @click.option("--video-url", default=None,
               help="SRS 主镜头 HTTP-FLV 地址,如 http://<srs>:8080/live/livestream.flv;"
                    "提供后右侧栏顶部显示视频面板,缺省则不显示")
+@click.option("--recordings-root", default="./recordings", type=click.Path(),
+              help="dashboard 离线 timeline 读取的 flight_dir 根目录，默认 ./recordings")
 def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
                   flight_area_xml: str | None, flight_area_png: str | None,
                   flight_area_png_bounds: str | None,
                   flight_area_png_bounds_latlon: str | None,
-                  video_url: str | None) -> None:
+                  video_url: str | None, recordings_root: str) -> None:
     from sim_dji_cloud.tools.dashboard_cmd import run_dashboard
     raise SystemExit(run_dashboard(
         mqtt_url=mqtt_url, host=host, port=port,
@@ -196,6 +198,7 @@ def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
         flight_area_png_bounds=flight_area_png_bounds,
         flight_area_png_bounds_latlon=flight_area_png_bounds_latlon,
         video_url=video_url,
+        recordings_root=Path(recordings_root),
     ))
 
 

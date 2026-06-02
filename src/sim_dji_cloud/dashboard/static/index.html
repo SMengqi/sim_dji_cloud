@@ -72,6 +72,33 @@
   .video-bar button { background:#1a1a1a; color:#ccc; border:1px solid #2a2a2a; border-radius:4px;
                       padding:2px 8px; cursor:pointer; font-size:12px; }
   .video-bar button:hover { background:#2a2a2a; }
+  .timeline-drawer {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    background: #1e1e1e; color: #ddd;
+    border-top: 1px solid #444;
+    font: 12px/1.4 -apple-system, sans-serif;
+    z-index: 50;
+    display: flex; flex-direction: column;
+  }
+  .timeline-drawer .handle {
+    height: 18px;
+    cursor: ns-resize;
+    background: #2a2a2a;
+    display: flex; align-items: center; padding: 0 8px; gap: 12px;
+    flex-wrap: wrap;
+  }
+  .timeline-drawer .handle button {
+    background: none; border: 0; color: #ddd; cursor: pointer;
+  }
+  .timeline-drawer .handle select,
+  .timeline-drawer .handle label {
+    color: #ddd; font-size: 12px;
+  }
+  .timeline-drawer .body { flex: 1; display: flex; flex-direction: column; padding: 4px 8px 8px; }
+  .timeline-drawer canvas { flex: 1; width: 100%; background: #111; }
+  .timeline-drawer .truncated-badge {
+    color: #ff6b6b; background: #2a1414; padding: 0 6px; border-radius: 3px; font-size: 11px;
+  }
 </style>
 </head>
 <body x-data="dashboard()" x-init="init()">
@@ -192,6 +219,30 @@
     </div>
   </div>
 
+<div class="timeline-drawer"
+     :style="`height: ${timeline.open ? timeline.height + 18 : 18}px`">
+  <div class="handle" @mousedown="startDragTimeline($event)">
+    <button @click.stop="toggleTimeline()">
+      <span x-text="timeline.open ? '▼' : '▲'"></span> 📊 时间线
+    </button>
+    <select x-model="timeline.source" @change="reloadTimeline()">
+      <option value="live">live</option>
+    </select>
+    <label><input type="checkbox" value="event"
+                  x-model="timeline.kinds" @change="reloadTimeline()"> events</label>
+    <label><input type="checkbox" value="control"
+                  x-model="timeline.kinds" @change="reloadTimeline()"> controls</label>
+    <button @click.stop="downloadTimelineCsv()">⬇ CSV</button>
+    <span class="truncated-badge" x-show="timeline.truncated"
+          title="结果超过 limit (5000)，显示最新部分">截断</span>
+    <span x-show="timeline.error" x-text="timeline.error"
+          style="color:#ff6b6b"></span>
+  </div>
+  <div class="body" x-show="timeline.open">
+    <canvas x-ref="timelineCanvas"></canvas>
+  </div>
+</div>
+
 <script>
 const ENUM_MAP = {
   dock_mode: {
@@ -267,6 +318,17 @@ function dashboard() {
              pipSupported: false, inPip: false },
     player: null,
     videoRetryTimer: null,
+    timeline: {
+      open: false,
+      height: 80,
+      source: "live",
+      kinds: ["event", "control"],
+      entries: [],
+      sessionStartedAtMs: null,
+      truncated: false,
+      loading: false,
+      error: null,
+    },
 
     async init() {
       // Picture-in-Picture 仅 Chromium 系（Chrome/Edge/Opera）支持稳；
@@ -508,6 +570,9 @@ function dashboard() {
           this.state = JSON.parse(ev.data);
           this.updates += 1;
           this.updateMap();
+          if (this.timeline.open && this.timeline.source === "live") {
+            this.reloadTimeline();
+          }
         } catch (e) { console.error(e); }
       };
     },
@@ -561,6 +626,90 @@ function dashboard() {
       if (v === null || v === undefined) return '-';
       const label = (ENUM_MAP[group] || {})[v];
       return label ? `${v} (${label})` : String(v);
+    },
+
+    toggleTimeline() {
+      this.timeline.open = !this.timeline.open;
+      if (this.timeline.open) this.reloadTimeline();
+    },
+
+    startDragTimeline(ev) {
+      const startY = ev.clientY;
+      const startH = this.timeline.height;
+      const move = (e) => {
+        this.timeline.height = Math.min(400, Math.max(40, startH + (startY - e.clientY)));
+        this.scheduleTimelineRedraw();
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    },
+
+    reloadTimeline() {
+      if (!this.timeline.open) return;
+      this.timeline.loading = true;
+      this.timeline.error = null;
+      const params = new URLSearchParams({
+        source: this.timeline.source,
+        kinds: this.timeline.kinds.join(",") || "event,control",
+        limit: "5000",
+      });
+      fetch(`/api/timeline?${params}`)
+        .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+        .then(data => {
+          this.timeline.entries = data.entries || [];
+          this.timeline.sessionStartedAtMs = data.session_started_at_ms;
+          this.timeline.truncated = data.truncated;
+          this.scheduleTimelineRedraw();
+        })
+        .catch(err => { this.timeline.error = `加载失败: ${err}`; })
+        .finally(() => { this.timeline.loading = false; });
+    },
+
+    downloadTimelineCsv() {
+      const params = new URLSearchParams({
+        source: this.timeline.source,
+        kinds: this.timeline.kinds.join(",") || "event,control",
+      });
+      window.location = `/api/timeline/export.csv?${params}`;
+    },
+
+    scheduleTimelineRedraw() {
+      if (this._timelineRaf) return;
+      this._timelineRaf = requestAnimationFrame(() => {
+        this._timelineRaf = null;
+        this.drawTimeline();
+      });
+    },
+
+    drawTimeline() {
+      const canvas = this.$refs.timelineCanvas;
+      if (!canvas) return;
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const ents = this.timeline.entries;
+      if (!ents.length) return;
+      const t0 = this.timeline.sessionStartedAtMs ?? ents[0].recv_ts_ms;
+      const t1 = ents[ents.length - 1].recv_ts_ms;
+      const span = Math.max(1, t1 - t0);
+      const laneH = rect.height / 2;
+
+      ents.forEach(e => {
+        const x = ((e.recv_ts_ms - t0) / span) * (rect.width - 8) + 4;
+        const lane = e.kind === "event" ? 0 : 1;
+        const y = lane * laneH + laneH * 0.1;
+        ctx.fillStyle = e.kind === "event" ? "#d4351c" : "#1d70b8";
+        ctx.fillRect(x - 2, y, 4, laneH * 0.8);
+      });
     },
   };
 }

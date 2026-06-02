@@ -4,6 +4,7 @@ import uvicorn
 from loguru import logger
 
 from sim_dji_cloud.dashboard import create_app, LiveState, MqttSubscriber
+from sim_dji_cloud.dashboard.events_archive import EventsArchive
 from sim_dji_cloud.dashboard.flight_area import (
     load_flight_area, parse_png_bounds, parse_png_bounds_latlon, read_sidecar_bounds,
 )
@@ -19,6 +20,7 @@ def run_dashboard(
     flight_area_png_bounds: str | None = None,
     flight_area_png_bounds_latlon: str | None = None,
     video_url: str | None = None,
+    recordings_root: Path = Path("recordings"),
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -46,13 +48,16 @@ def run_dashboard(
     elif flight_area_png:
         logger.warning("提供了 --flight-area-png 但未提供 --flight-area-xml，PNG 已忽略")
 
-    state = LiveState()
+    archive = EventsArchive(soft_cap=5000)
+    state = LiveState(on_flight_idle=[archive.reset])
     app = create_app(
         state,
         ws_push_interval_ms=ws_push_interval_ms,
         flight_area=flight_area,
         flight_area_png=Path(flight_area_png) if (flight_area and flight_area_png) else None,
         video_url=video_url,
+        archive=archive,
+        recordings_root=recordings_root,
     )
 
     sub_holder: dict = {"sub": None}
@@ -60,7 +65,7 @@ def run_dashboard(
     @app.on_event("startup")
     async def _on_startup() -> None:
         sub = MqttSubscriber(state, host=broker_host, port=broker_port,
-                             client_id="sim-dji-dashboard")
+                             client_id="sim-dji-dashboard", archive=archive)
         try:
             await sub.connect()
             sub_holder["sub"] = sub
