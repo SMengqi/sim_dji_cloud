@@ -230,6 +230,14 @@ sim-dji dashboard --port 8080 --video-url http://<srs>:8080/live/livestream.flv
 
 详见操作手册 §6.5「仪表盘内嵌视频」。
 
+底部抽屉式事件时间线：events + controls 两 lane 横向铺开，支持按 kind 过滤、CSV 导出、live + offline 两种数据源。Live 模式自动跟随飞行任务边界清空（同轨迹清空逻辑）。Offline 模式参数：
+
+```bash
+sim-dji dashboard --recordings-root ./recordings
+```
+
+浏览器访问后点底部 "📊 时间线" 展开。
+
 ---
 
 ## 📖 完整操作手册

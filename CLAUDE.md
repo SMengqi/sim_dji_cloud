@@ -96,6 +96,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 - HTML enum labels (`mode_code`, `flighttask_step_code`, `drone_in_dock`, `drc_state`) live in `static/index.html` as a JS `ENUM_MAP`. Adding new enums means editing both `LiveState._update_dock` (extract the field) and `ENUM_MAP` (label it). DJI Cloud API docs define the integer → meaning mapping.
 - `static/index.html` loads Leaflet + Alpine.js from CDN. The browser needs public-internet access; the server itself is just an HTTP server.
 - 右侧栏顶部可选内嵌 HTTP-FLV 视频（mpegts.js，vendored 于 `static/mpegts.min.js`，经 `/static` 挂载发布）；`--video-url` 缺省则隐藏，不影响现有页面。
+- `EventsArchive` (`dashboard/events_archive.py`) 是与 `LiveState` 并列的内存层。`MqttSubscriber` 收到消息时先调 `state.update(...)` 再调 `archive.append(...)`。Archive 按 topic suffix 路由：`events` → kind="event"，`drc/down` / `services` → kind="control"，其它 (`osd` 等) 跳过。两 deque maxlen=5000 软上限 LRU 兜底；`LiveState.on_flight_idle` listener 在 `flighttask_step_code` 转 idle 时调 `archive.reset()`，跟 `_trail.clear()` 同步触发。Archive 内部 `threading.Lock` 保护 deque 操作，允许 asyncio loop（MqttSubscriber）与 FastAPI threadpool（API handler）跨线程访问。Offline 模式由 `read_archive_from_flight_dir(flight_dir)` 现读 JSONL 构造临时 archive；不缓存。REST `/api/timeline` 和 `/api/timeline/export.csv` 由 `_timeline_router` 挂；`archive=None` 时整段路由不挂（FastAPI 自然 404），保持旧测试 / selfcheck 零接触。`--recordings-root` 选项决定 offline 模式从哪个目录里找 flight_dir。
 
 ### Config & flight-detection rules
 
