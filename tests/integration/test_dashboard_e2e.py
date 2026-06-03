@@ -125,3 +125,66 @@ async def test_dashboard_archive_clears_on_real_idle_marker(
 
     await pub.disconnect()
     await sub.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_play_start_stop_status_e2e(mosquitto_broker, tmp_path, monkeypatch):
+    """端到端：起 mosquitto + dashboard app；POST /api/play/start 起 play
+    子进程；GET /api/play/status 看到 running；POST /api/play/stop 收尾；
+    GET 再看到 stopped。
+
+    复用 mosquitto_broker fixture (tests/integration/conftest.py)。
+    play 子进程会真起一个 sim-dji play，需要 fixture flight_dir。
+    用 tests/fixtures/real_flight_basic/ (220s 真机 fixture)。
+    """
+    from pathlib import Path
+    from sim_dji_cloud.dashboard.play_controller import PlayController
+
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test_token_e2e")
+
+    fixture_path = Path(__file__).parent.parent / "fixtures" / "real_flight_basic"
+    if not fixture_path.exists():
+        pytest.skip("real_flight_basic fixture missing")
+    recordings_root = fixture_path.parent
+
+    pc = PlayController(recordings_root=recordings_root, log_dir=tmp_path / "logs")
+    state = LiveState()
+    app = create_app(state=state, play_controller=pc, recordings_root=recordings_root)
+    client = TestClient(app)
+
+    # 初始：stopped
+    r = client.get("/api/play/status")
+    assert r.status_code == 200
+    assert r.json()["state"] == "stopped"
+
+    # POST start
+    r = client.post(
+        "/api/play/start",
+        json={
+            "flight_dir": "real_flight_basic",
+            "mqtt_url": f"tcp://127.0.0.1:{mosquitto_broker}",
+            "speed": 100.0,
+        },
+        headers={"Authorization": "Bearer test_token_e2e"},
+    )
+    assert r.status_code == 201, r.text
+    pid = r.json()["pid"]
+
+    await asyncio.sleep(0.5)
+
+    # GET status: running
+    r = client.get("/api/play/status")
+    assert r.json()["state"] == "running"
+    assert r.json()["pid"] == pid
+
+    # POST stop
+    r = client.post(
+        "/api/play/stop",
+        headers={"Authorization": "Bearer test_token_e2e"},
+    )
+    assert r.status_code == 200
+    assert r.json()["state"] == "stopped"
+
+    # GET status: stopped
+    r = client.get("/api/play/status")
+    assert r.json()["state"] == "stopped"

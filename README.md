@@ -238,6 +238,29 @@ sim-dji dashboard --recordings-root ./recordings
 
 浏览器访问后点底部 "📊 时间线" 展开。
 
+HTTP 控制（程序化启停 play）：
+
+```bash
+# dashboard 启动（需 DASHBOARD_TOKEN 才开启 write API；未设则 POST 返 503）
+export DASHBOARD_TOKEN=$(openssl rand -hex 16)
+sim-dji dashboard --recordings-root ./recordings --log-dir ./logs
+
+# 起 play
+curl -X POST http://localhost:8080/api/play/start \
+    -H "Authorization: Bearer $DASHBOARD_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"flight_dir": "recordings/<flight>", "speed": 1.0}'
+
+# 看状态
+curl http://localhost:8080/api/play/status
+
+# 停
+curl -X POST http://localhost:8080/api/play/stop \
+    -H "Authorization: Bearer $DASHBOARD_TOKEN"
+```
+
+POST 端点都需要 Bearer token；GET status 公开。dashboard 跟 `./run.sh launch/stop play` 共享同一份 pid 文件，两套入口可混用。
+
 ---
 
 ## 📖 完整操作手册
