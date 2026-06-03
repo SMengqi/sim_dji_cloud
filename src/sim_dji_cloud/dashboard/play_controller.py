@@ -165,13 +165,42 @@ class PlayController:
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
+        """True iff pid exists AND is not a zombie.
+
+        `os.kill(pid, 0)` alone is insufficient — zombie child processes
+        still have a valid pid and signal 0 succeeds, but the process has
+        actually exited. Read /proc/<pid>/status State: field to exclude `Z`;
+        also call waitpid(WNOHANG) to reap the zombie if we are the parent.
+
+        Linux-only (reads /proc); the project is Linux server-only.
+        """
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
+            # Process exists but belongs to another user (we can't reap it);
+            # treat as alive
             return True
+
+        # Process exists; now check it is not a zombie
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        if line.split()[1] == "Z":
+                            # Zombie detected; try to reap it (if we are parent;
+                            # if not, ChildProcessError is raised and ignored)
+                            try:
+                                os.waitpid(pid, os.WNOHANG)
+                            except (ChildProcessError, OSError):
+                                pass
+                            return False
+                        break
+        except (FileNotFoundError, OSError):
+            # /proc read failed (rare); conservatively treat as not alive
+            return False
+        return True
 
     def _cleanup_state_files(self) -> None:
         for p in (self._pid_file, self._meta_file):

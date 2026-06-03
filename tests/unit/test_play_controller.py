@@ -143,3 +143,70 @@ def test_status_log_tail_returns_last_n_lines(tmp_path):
     tail_lines = s["log_tail"].splitlines()
     assert len(tail_lines) == 20
     assert tail_lines[-1] == "line 49"
+
+
+def test_pid_alive_returns_false_for_zombie(monkeypatch):
+    """Child process is dead but not reaped (zombie) → _pid_alive returns False.
+
+    Regression test for 2026-06-02 production bug: os.kill(pid, 0) succeeds
+    for zombie processes, causing status() to falsely report state="running".
+    """
+    # Mock os.kill(pid, 0) to succeed (simulate pid existing)
+    monkeypatch.setattr(
+        "sim_dji_cloud.dashboard.play_controller.os.kill",
+        lambda pid, sig: None
+    )
+
+    # Mock open to return /proc/<pid>/status with State: Z (zombie)
+    fake_status = (
+        "Name:\tsim-dji\n"
+        "Umask:\t0022\n"
+        "State:\tZ (zombie)\n"
+        "Tgid:\t99999\n"
+    )
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if str(path).startswith("/proc/") and str(path).endswith("/status"):
+            from io import StringIO
+            return StringIO(fake_status)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    # Mock waitpid to succeed (simulate successful reap)
+    monkeypatch.setattr(
+        "sim_dji_cloud.dashboard.play_controller.os.waitpid",
+        lambda pid, flags: (pid, 0)
+    )
+
+    assert PlayController._pid_alive(99999) is False
+
+
+def test_pid_alive_returns_true_for_running_non_zombie(monkeypatch):
+    """Running process (State: R/S) → _pid_alive returns True.
+
+    Regression protection: ensure zombie detection doesn't break normal
+    process detection.
+    """
+    # Mock os.kill(pid, 0) to succeed (simulate pid existing)
+    monkeypatch.setattr(
+        "sim_dji_cloud.dashboard.play_controller.os.kill",
+        lambda pid, sig: None
+    )
+
+    # Mock open to return /proc/<pid>/status with State: S (sleeping, normal)
+    fake_status = "Name:\tsim-dji\nState:\tS (sleeping)\n"
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if str(path).startswith("/proc/") and str(path).endswith("/status"):
+            from io import StringIO
+            return StringIO(fake_status)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    assert PlayController._pid_alive(99999) is True
