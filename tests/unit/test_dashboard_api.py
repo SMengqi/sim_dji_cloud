@@ -533,3 +533,35 @@ def test_play_router_not_mounted_without_controller(tmp_path):
     app = create_app(state=LiveState(), play_controller=None, recordings_root=tmp_path)
     c = TestClient(app)
     assert c.get("/api/play/status").status_code == 404
+
+
+def test_index_html_injects_default_video_push_url(tmp_path):
+    """GET / 返回的 HTML 含 default_video_push_url 的 meta tag。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+
+    state = LiveState()
+    app = create_app(
+        state=state,
+        recordings_root=tmp_path,
+        default_video_push_url="rtmp://srs/live/test",
+    )
+    c = TestClient(app)
+    r = c.get("/")
+    assert r.status_code == 200
+    assert 'name="default-video-push-url" content="rtmp://srs/live/test"' in r.text
+
+
+def test_index_html_default_video_push_url_empty_when_not_set(tmp_path):
+    """default_video_push_url 未设时 meta tag content="" 。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+
+    state = LiveState()
+    app = create_app(state=state, recordings_root=tmp_path)
+    c = TestClient(app)
+    r = c.get("/")
+    assert r.status_code == 200
+    assert 'name="default-video-push-url" content=""' in r.text

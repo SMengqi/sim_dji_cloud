@@ -562,3 +562,179 @@ def test_flight_idle_listener_exception_isolated_per_listener():
     # boom listener 抛错被吞，其它 listener 仍被调用，trail 仍被清
     assert other_called == [True]
     assert state.snapshot()["drone_trail"] == []
+
+
+def test_reset_clears_all_state():
+    """reset 后 dock / drone / events / controls / trail / topic_counts /
+    known_*_sn 都清空。"""
+    state = LiveState()
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"},
+                          "temperature": 25}},
+        recv_ts_ms=1000,
+    )
+    state.update(
+        topic="thing/product/SN_DRONE/osd",
+        payload={"data": {"latitude": 30.0, "longitude": 120.0,
+                          "mode_code": 5}},
+        recv_ts_ms=1500,
+    )
+    state.update(
+        topic="thing/product/SN_DOCK/events",
+        payload={"method": "device_alarm_event", "data": {}},
+        recv_ts_ms=2000,
+    )
+    state.update(
+        topic="thing/product/SN_DOCK/drc/down",
+        payload={"method": "stick_control", "data": {}},
+        recv_ts_ms=2500,
+    )
+
+    snap_before = state.snapshot()
+    assert snap_before["dock"], "precondition: dock not empty"
+    assert snap_before["drone"], "precondition: drone not empty"
+    assert snap_before["events"], "precondition: events not empty"
+    assert snap_before["controls"], "precondition: controls not empty"
+    assert snap_before["drone_trail"], "precondition: trail not empty"
+
+    state.reset()
+
+    snap_after = state.snapshot()
+    assert snap_after["dock"] == {}
+    assert snap_after["drone"] == {}
+    assert snap_after["events"] == []
+    assert snap_after["controls"] == []
+    assert snap_after["drone_trail"] == []
+    assert snap_after["topic_counts"] == {}
+    # explicit reset (not via idle path) MUST also clear identity bindings,
+    # because POST /api/state/reset (Task 3) uses it for flight switching.
+    assert state._known_dock_sn is None
+    assert state._known_drone_sn is None
+
+
+def test_reset_triggers_listeners():
+    """reset 调所有注册的 on_flight_idle listener。"""
+    calls = {"a": 0, "b": 0}
+    state = LiveState(on_flight_idle=[
+        lambda: calls.__setitem__("a", calls["a"] + 1),
+        lambda: calls.__setitem__("b", calls["b"] + 1),
+    ])
+    state.reset()
+    assert calls == {"a": 1, "b": 1}
+
+
+def test_reset_listener_exception_isolated():
+    """某 listener 抛错不影响其它 listener + reset 完成。"""
+    other_called = []
+
+    def boom():
+        raise RuntimeError("boom")
+
+    state = LiveState(on_flight_idle=[
+        boom,
+        lambda: other_called.append(True),
+    ])
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1000,
+    )
+    assert state.snapshot()["dock"]
+    state.reset()
+    assert other_called == [True]
+    assert state.snapshot()["dock"] == {}
+
+
+def test_update_dock_idle_now_calls_full_reset():
+    """idle marker (flighttask_step_code=5) 现在触发全量 reset，不只是 trail.clear。
+    回归保护：原来只清 trail；改后 dock / drone / events 也都清。"""
+    state = LiveState()
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1000,
+    )
+    state.update(
+        topic="thing/product/SN_DRONE/osd",
+        payload={"data": {"latitude": 30.0, "longitude": 120.0}},
+        recv_ts_ms=1500,
+    )
+    state.update(
+        topic="thing/product/SN_DOCK/events",
+        payload={"method": "alarm"},
+        recv_ts_ms=2000,
+    )
+    snap = state.snapshot()
+    assert snap["drone_trail"] and snap["events"], "precondition"
+
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 5}},
+        recv_ts_ms=3000,
+    )
+    snap = state.snapshot()
+    assert snap["drone"] == {}
+    assert snap["drone_trail"] == []
+    assert snap["events"] == []
+
+
+def test_update_dock_idle_then_fields_repopulated():
+    """reset 后这条 OSD 的字段仍被写进 dock —— 不是完全空白。
+    用户期望"看到 dock 报了 idle"，所以 step_code=5 应该回写。"""
+    state = LiveState()
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1000,
+    )
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 5,
+                          "temperature": 27}},
+        recv_ts_ms=2000,
+    )
+    snap = state.snapshot()
+    assert snap["dock"].get("flighttask_step_code") == 5
+    assert snap["dock"].get("temperature") == 27
+    assert snap["dock"].get("sn") == "SN_DOCK"
+
+
+def test_idle_marker_preserves_dock_routing_for_next_no_sub_device_osd():
+    """Idle marker resets state but must NOT lose the dock_sn binding —
+    next dock OSD without sub_device must still route to _update_dock,
+    not be misrouted to _update_drone via the update() fallthrough.
+
+    Regression for the bug where reset() nulled _known_dock_sn and the
+    subsequent steady-state OSD (which DJI sends without sub_device)
+    fell through to _update_drone.
+    """
+    state = LiveState()
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"},
+                          "temperature": 25}},
+        recv_ts_ms=1000,
+    )
+    # Idle OSD typically lacks sub_device (DJI only sends sub_device on state change).
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 5}},
+        recv_ts_ms=2000,
+    )
+    # Next dock OSD also lacks sub_device (steady-state idle).
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"temperature": 30}},
+        recv_ts_ms=3000,
+    )
+    snap = state.snapshot()
+    assert snap["dock"].get("temperature") == 30, \
+        "post-idle steady-state OSD must be routed to dock"
+    assert "temperature" not in snap["drone"], \
+        "post-idle steady-state OSD must NOT leak into drone state"

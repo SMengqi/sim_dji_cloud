@@ -186,11 +186,15 @@ def selfcheck_cmd(flight_dir: str, tolerance_ms: int, report_dir: str | None) ->
               help="dashboard 离线 timeline 读取的 flight_dir 根目录，默认 ./recordings")
 @click.option("--log-dir", default="./logs", type=click.Path(),
               help="HTTP 控制 play 子进程的 pid 文件 + 日志目录，默认 ./logs（跟 run.sh LOG_DIR 共享）")
+@click.option("--default-video-push-url", default="", type=str,
+              help="dashboard 切飞行时默认带的视频推流 URL（如 rtmp://srs/live/livestream）；"
+                   "留空则切飞行不推视频")
 def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
                   flight_area_xml: str | None, flight_area_png: str | None,
                   flight_area_png_bounds: str | None,
                   flight_area_png_bounds_latlon: str | None,
-                  video_url: str | None, recordings_root: str, log_dir: str) -> None:
+                  video_url: str | None, recordings_root: str, log_dir: str,
+                  default_video_push_url: str) -> None:
     from sim_dji_cloud.tools.dashboard_cmd import run_dashboard
     raise SystemExit(run_dashboard(
         mqtt_url=mqtt_url, host=host, port=port,
@@ -202,6 +206,7 @@ def dashboard_cmd(mqtt_url: str, host: str, port: int, ws_push_interval_ms: int,
         video_url=video_url,
         recordings_root=Path(recordings_root),
         log_dir=Path(log_dir),
+        default_video_push_url=default_video_push_url,
     ))
 
 

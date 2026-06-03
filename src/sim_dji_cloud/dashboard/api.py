@@ -44,6 +44,7 @@ def create_app(
     archive: EventsArchive | None = None,
     recordings_root: Path = Path("recordings"),
     play_controller: PlayController | None = None,
+    default_video_push_url: str = "",
 ) -> FastAPI:
     app = FastAPI(title="sim-dji dashboard")
 
@@ -94,7 +95,13 @@ def create_app(
             return HTMLResponse(
                 "<!doctype html><html><body><p>dashboard ui (index.html missing)</p></body></html>"
             )
-        return HTMLResponse(html_path.read_text(encoding="utf-8"))
+        html = html_path.read_text(encoding="utf-8")
+        if default_video_push_url:
+            html = html.replace(
+                '<meta name="default-video-push-url" content="">',
+                f'<meta name="default-video-push-url" content="{default_video_push_url}">',
+            )
+        return HTMLResponse(html)
 
     @app.websocket("/ws/stream")
     async def ws_stream(ws: WebSocket) -> None:
@@ -116,6 +123,10 @@ def create_app(
 
     if play_controller is not None:
         app.include_router(_play_router(play_controller))
+
+    app.include_router(_flights_router(Path(recordings_root)))
+
+    app.include_router(_state_reset_router(state, archive))
 
     return app
 
@@ -263,5 +274,77 @@ def _play_router(pc: PlayController) -> APIRouter:
     @r.get("/status")
     def get_play_status():
         return pc.status()
+
+    return r
+
+
+def _scan_flights(recordings_root: Path) -> list[dict]:
+    """扫 recordings_root 下子目录，提取 5 字段，按 started_at_ms 倒序。
+
+    跳过：非目录 / 以 . 开头 / 缺 manifest.json / manifest 损坏。
+    """
+    if not recordings_root.is_dir():
+        return []
+    flights = []
+    for child in recordings_root.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        manifest_path = child / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            m = json.loads(manifest_path.read_text())
+        except (ValueError, OSError):
+            logger.warning(
+                "flights scan: skip {} (manifest unreadable)", child.name,
+            )
+            continue
+        started = m.get("started_at_recv_ms")
+        ended = m.get("ended_at_recv_ms")
+        duration = (
+            (ended - started)
+            if (isinstance(started, int) and isinstance(ended, int))
+            else None
+        )
+        video = m.get("video") or {}
+        has_video = bool(video.get("file"))
+        flights.append({
+            "id": child.name,
+            "started_at_ms": started,
+            "duration_ms": duration,
+            "has_video": has_video,
+            "dock_sn": m.get("dock_sn", ""),
+        })
+    flights.sort(key=lambda f: f["started_at_ms"] or 0, reverse=True)
+    return flights
+
+
+def _flights_router(recordings_root: Path) -> APIRouter:
+    r = APIRouter(prefix="/api")
+
+    @r.get("/flights")
+    def list_flights():
+        return {"flights": _scan_flights(recordings_root)}
+
+    return r
+
+
+def _state_reset_router(
+    state: LiveState, archive: EventsArchive | None,
+) -> APIRouter:
+    """POST /api/state/reset — 鉴权后清 LiveState（含 trail / events / controls /
+    topic_counts / known_*_sn）+ EventsArchive（若挂载）。
+
+    无条件挂载：state 必传；archive 可能为 None（handler 内部 guard）。
+    require_token 走 secure-by-default：DASHBOARD_TOKEN 未设 → 503，header 缺/错 → 401。
+    """
+    r = APIRouter(prefix="/api/state")
+
+    @r.post("/reset")
+    def reset_state(_=Depends(require_token)):
+        state.reset()
+        if archive is not None:
+            archive.reset()
+        return {"state": "reset"}
 
     return r

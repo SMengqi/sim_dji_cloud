@@ -261,6 +261,20 @@ curl -X POST http://localhost:8080/api/play/stop \
 
 POST 端点都需要 Bearer token；GET status 公开。dashboard 跟 `./run.sh launch/stop play` 共享同一份 pid 文件，两套入口可混用。
 
+### 多飞行切换
+
+dashboard 顶部下拉一键切换正在回放的录制：
+
+```bash
+export DASHBOARD_TOKEN=$(openssl rand -hex 16)
+sim-dji dashboard --port 8099 \
+    --recordings-root ./recordings \
+    --log-dir ./logs \
+    --default-video-push-url rtmp://srs/live/livestream
+```
+
+浏览器打开 `http://<host>:8099/`，顶部飞行下拉列出 `recordings/` 下所有飞行；选某个 → 自动 stop 旧 play + 清 dashboard 状态 + start 新 play；选 Live → 看真机实时 MQTT。URL `?flight=<id>` 支持直达。POST 端点用 Bearer token 守护（首次操作 prompt，sessionStorage 缓存）。
+
 ---
 
 ## 📖 完整操作手册

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="default-video-push-url" content="">
 <title>sim-dji dashboard</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
@@ -99,9 +100,41 @@
   .timeline-drawer .truncated-badge {
     color: #ff6b6b; background: #2a1414; padding: 0 6px; border-radius: 3px; font-size: 11px;
   }
+  .flight-selector {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; background: #1e1e1e;
+    border-bottom: 1px solid #444; color: #ddd; font-size: 13px;
+  }
+  .flight-selector select {
+    background: #2a2a2a; color: #ddd;
+    border: 1px solid #555; padding: 3px 6px;
+  }
+  .flight-selector button {
+    background: #2a2a2a; color: #ddd;
+    border: 1px solid #555; cursor: pointer; padding: 2px 8px;
+  }
+  .flight-selector button:disabled { opacity: 0.5; cursor: wait; }
+  .flight-selector .error { color: #ff6b6b; }
 </style>
 </head>
 <body x-data="dashboard()" x-init="init()">
+  <div class="flight-selector">
+    <label>飞行:
+      <select x-model="flights.selected"
+              @change="onFlightChange()"
+              :disabled="switching">
+        <option value="live">Live (真机)</option>
+        <template x-for="f in flights.list" :key="f.id">
+          <option :value="f.id"
+                  :title="`${f.dock_sn} · ${f.id}`"
+                  x-text="formatFlightLabel(f)"></option>
+        </template>
+      </select>
+    </label>
+    <button @click="reloadFlightsList()" :disabled="flights.loading">↻</button>
+    <span x-show="switching">切换中...</span>
+    <span x-show="flights.error" class="error" x-text="flights.error"></span>
+  </div>
   <header>
     <h1>sim-dji dashboard</h1>
     <span class="conn-status" :class="connected ? 'up' : 'down'"
@@ -329,6 +362,113 @@ function dashboard() {
       loading: false,
       error: null,
     },
+    flights: {
+      list: [],
+      selected: "live",
+      loading: false,
+      error: null,
+    },
+    defaultVideoPushUrl: "",
+    switching: false,
+
+    async onFlightChange() {
+      if (this.switching) return;
+      this.switching = true;
+      this.flights.error = null;
+      const sel = this.flights.selected;
+      try {
+        await this.callApi("POST", "/api/play/stop", null).catch(e => {
+          if (e.status !== 404) throw e;
+        });
+        await this.callApi("POST", "/api/state/reset", {});
+        if (sel !== "live") {
+          const body = {
+            flight_dir: sel,
+            speed: 1.0,
+            ...(this.defaultVideoPushUrl
+                ? { video_push_url: this.defaultVideoPushUrl,
+                    video_anchor_offset_ms: -4000 }
+                : {}),
+          };
+          await this.callApi("POST", "/api/play/start", body);
+        }
+        const params = new URLSearchParams(window.location.search);
+        if (sel === "live") params.delete("flight");
+        else params.set("flight", sel);
+        window.history.replaceState({}, "",
+          `?${params}` + window.location.hash);
+      } catch (e) {
+        this.flights.error = `切换失败: ${e.detail || e.message || e}`;
+      } finally {
+        this.switching = false;
+      }
+    },
+
+    async callApi(method, path, body) {
+      const headers = { "Content-Type": "application/json" };
+      if (method !== "GET") {
+        const token = this.getOrPromptToken();
+        if (!token) throw new Error("token required");
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+      const res = await fetch(path, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status}`);
+        err.status = res.status;
+        err.detail = (await res.json().catch(() => ({}))).detail;
+        if (res.status === 401) {
+          sessionStorage.removeItem("dashboard_token");
+        }
+        throw err;
+      }
+      return res.status === 204 ? null : res.json();
+    },
+
+    getOrPromptToken() {
+      let t = sessionStorage.getItem("dashboard_token");
+      if (!t) {
+        t = prompt("Dashboard token (DASHBOARD_TOKEN env var):");
+        if (t) sessionStorage.setItem("dashboard_token", t);
+      }
+      return t;
+    },
+
+    async reloadFlightsList() {
+      this.flights.loading = true;
+      try {
+        const data = await this.callApi("GET", "/api/flights", null);
+        this.flights.list = data.flights || [];
+      } catch (e) {
+        this.flights.error = `加载列表失败: ${e.message}`;
+      } finally {
+        this.flights.loading = false;
+      }
+    },
+
+    formatFlightLabel(f) {
+      const date = f.started_at_ms ? new Date(f.started_at_ms) : null;
+      const ts = date
+        ? `${date.getFullYear()}-` +
+          `${String(date.getMonth()+1).padStart(2,"0")}-` +
+          `${String(date.getDate()).padStart(2,"0")} ` +
+          `${String(date.getHours()).padStart(2,"0")}:` +
+          `${String(date.getMinutes()).padStart(2,"0")}`
+        : "??";
+      const dur = this.formatDuration(f.duration_ms);
+      const video = f.has_video ? " 📹" : "";
+      return `${ts}  ·  ${dur}${video}`;
+    },
+
+    formatDuration(ms) {
+      if (!ms) return "?";
+      const s = Math.round(ms / 1000);
+      const m = Math.floor(s / 60);
+      return m > 0 ? `${m}m${s % 60}s` : `${s}s`;
+    },
 
     async init() {
       // Picture-in-Picture 仅 Chromium 系（Chrome/Edge/Opera）支持稳；
@@ -339,6 +479,19 @@ function dashboard() {
       await this.loadFlightArea();
       await this.loadVideo();
       this.connectWS();
+
+      // D 子特性 (multi-flight switch)
+      this.defaultVideoPushUrl = document.querySelector(
+        'meta[name="default-video-push-url"]'
+      )?.content || "";
+
+      this.reloadFlightsList().then(() => {
+        const flightFromUrl = new URLSearchParams(window.location.search).get("flight");
+        if (flightFromUrl && this.flights.list.find(f => f.id === flightFromUrl)) {
+          this.flights.selected = flightFromUrl;
+          this.onFlightChange();
+        }
+      });
     },
 
     initMap() {

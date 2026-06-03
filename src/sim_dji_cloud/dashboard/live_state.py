@@ -32,6 +32,32 @@ class LiveState:
         # （dashboard 用来同步清 EventsArchive）
         self._on_flight_idle_listeners: list[Callable[[], None]] = list(on_flight_idle or [])
 
+    def reset(self) -> None:
+        """全清所有内存状态。dashboard 切飞行 / 收到 idle marker / 手动 reset 时调。
+
+        清掉:
+          - _dock / _drone (dict)
+          - _events / _controls / _trail (deque)
+          - _topic_counts (dict)
+          - _known_dock_sn / _known_drone_sn
+
+        所有 on_flight_idle listener 也会被触发（复用现有 hook）。
+        线程不安全；FastAPI/asyncio 单线程 loop 或 sync handler threadpool 串行调用。
+        """
+        self._dock.clear()
+        self._drone.clear()
+        self._events.clear()
+        self._controls.clear()
+        self._trail.clear()
+        self._topic_counts.clear()
+        self._known_dock_sn = None
+        self._known_drone_sn = None
+        for cb in self._on_flight_idle_listeners:
+            try:
+                cb()
+            except Exception:
+                logger.exception("on-flight-idle listener failed; continuing")
+
     def update(self, topic: str, payload: dict[str, Any], recv_ts_ms: int) -> None:
         self._topic_counts[topic] = self._topic_counts.get(topic, 0) + 1
 
@@ -114,20 +140,24 @@ class LiveState:
     _RECORDING_STEP_CODES = (0, 1, 2)
 
     def _update_dock(self, sn: str, data: dict, recv_ts_ms: int) -> None:
-        self._dock["sn"] = sn
-        self._dock["last_recv_ts_ms"] = recv_ts_ms
-        # 在写入 dock 字段之前先看新的 flighttask_step_code，决定要不要清轨迹。
+        # 先看新的 flighttask_step_code，决定要不要全量 reset。
         # 注意：DJI 只在状态变化时下发 flighttask_step_code，本 OSD 不带该字段时
-        # 视为"沿用上一次"，不触发清空。
+        # 视为"沿用上一次"，不触发 reset。
         new_step = data.get("flighttask_step_code")
         if isinstance(new_step, int) and new_step not in self._RECORDING_STEP_CODES:
-            # 任务空闲 → 清空轨迹（幂等：空轨迹再清还是空）。
-            self._trail.clear()
-            for cb in self._on_flight_idle_listeners:
-                try:
-                    cb()
-                except Exception:
-                    logger.exception("flight-idle listener failed; continuing")
+            # 任务空闲 → 全量 reset（dock / drone / events / controls / trail /
+            # topic_counts / known_*_sn 全清；listener 也由 reset 触发）。
+            # reset 后下面的字段写回继续生效——该 OSD 自身的字段（含
+            # flighttask_step_code=idle、sn、last_recv_ts_ms 等）会被重新写进 _dock，
+            # 保证 dashboard 仍能看到"dock 报了 idle"。
+            self.reset()
+            # reset() nulled _known_dock_sn; re-establish it from this OSD's sender so
+            # the next steady-state dock OSD (typically no sub_device) still routes here
+            # instead of falling through to _update_drone. _known_drone_sn gets re-learned
+            # from the next state-change OSD that carries sub_device.
+            self._known_dock_sn = sn
+        self._dock["sn"] = sn
+        self._dock["last_recv_ts_ms"] = recv_ts_ms
         for src, dst in self._DOCK_FIELD_MAP:
             if src in data:
                 self._dock[dst] = data[src]

@@ -23,6 +23,7 @@ def run_dashboard(
     video_url: str | None = None,
     recordings_root: Path = Path("recordings"),
     log_dir: Path = Path("logs"),
+    default_video_push_url: str = "",
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -65,6 +66,7 @@ def run_dashboard(
         archive=archive,
         recordings_root=recordings_root,
         play_controller=play_controller,
+        default_video_push_url=default_video_push_url,
     )
 
     sub_holder: dict = {"sub": None}

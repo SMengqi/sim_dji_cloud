@@ -66,3 +66,13 @@ def test_dashboard_cli_accepts_log_dir():
     result = runner.invoke(main, ["dashboard", "--help"])
     assert result.exit_code == 0
     assert "--log-dir" in result.output
+
+
+def test_dashboard_cli_accepts_default_video_push_url():
+    """sim-dji dashboard --default-video-push-url 选项存在。"""
+    from click.testing import CliRunner
+    from sim_dji_cloud.cli import main
+    runner = CliRunner()
+    result = runner.invoke(main, ["dashboard", "--help"])
+    assert result.exit_code == 0
+    assert "--default-video-push-url" in result.output

@@ -188,3 +188,82 @@ async def test_play_start_stop_status_e2e(mosquitto_broker, tmp_path, monkeypatc
     # GET status: stopped
     r = client.get("/api/play/status")
     assert r.json()["state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_switch_flight_e2e(mosquitto_broker, tmp_path, monkeypatch):
+    """端到端：起 mosquitto + dashboard app + 2 个 fixture flight；
+    调编排 stop → reset → start B，验证 /api/play/status 反映切换 +
+    LiveState 在切换间被清。
+
+    复用 mosquitto_broker fixture (tests/integration/conftest.py)。
+    """
+    import asyncio
+    import json
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.events_archive import EventsArchive
+    from sim_dji_cloud.dashboard.live_state import LiveState
+    from sim_dji_cloud.dashboard.play_controller import PlayController
+
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test_token_e2e")
+
+    recordings_root = tmp_path / "recordings"
+    recordings_root.mkdir()
+    for name, started in [("flight_A", 1780000000000),
+                          ("flight_B", 1780466400000)]:
+        flight = recordings_root / name
+        flight.mkdir()
+        (flight / "topics").mkdir()
+        (flight / "manifest.json").write_text(json.dumps({
+            "schema_version": 1, "status": "ok", "task_id": "T-T",
+            "dock_sn": f"SN_{name.upper()}", "drone_sn": "SN_DRONE",
+            "started_at_recv_ms": started,
+            "ended_at_recv_ms": started + 1000,
+            "gaps": [], "topics": [],
+        }))
+
+    archive = EventsArchive(soft_cap=100)
+    state = LiveState(on_flight_idle=[archive.reset])
+    pc = PlayController(recordings_root=recordings_root, log_dir=tmp_path / "logs")
+    app = create_app(state=state, archive=archive, play_controller=pc,
+                     recordings_root=recordings_root)
+    client = TestClient(app)
+
+    # Seed some state to verify reset actually clears it
+    state.update(
+        topic="thing/product/SN_DOCK/osd",
+        payload={"data": {"flighttask_step_code": 1,
+                          "sub_device": {"device_sn": "SN_DRONE"}}},
+        recv_ts_ms=1,
+    )
+    assert state.snapshot()["dock"], "precondition: state has data"
+
+    # 1. stop returns 404 (nothing running)
+    r = client.post("/api/play/stop",
+                    headers={"Authorization": "Bearer test_token_e2e"})
+    assert r.status_code == 404
+
+    # 2. reset clears state
+    r = client.post("/api/state/reset", json={},
+                    headers={"Authorization": "Bearer test_token_e2e"})
+    assert r.status_code == 200
+    assert state.snapshot()["dock"] == {}
+
+    # 3. start flight_B
+    r = client.post(
+        "/api/play/start",
+        json={"flight_dir": "flight_B",
+              "mqtt_url": f"tcp://127.0.0.1:{mosquitto_broker}",
+              "speed": 100.0},
+        headers={"Authorization": "Bearer test_token_e2e"},
+    )
+    assert r.status_code == 201
+
+    await asyncio.sleep(0.5)
+    r = client.get("/api/play/status")
+    assert r.status_code == 200
+
+    # cleanup
+    client.post("/api/play/stop",
+                headers={"Authorization": "Bearer test_token_e2e"})
