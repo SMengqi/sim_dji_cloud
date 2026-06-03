@@ -56,3 +56,13 @@ def test_dashboard_cli_accepts_recordings_root():
     result = runner.invoke(main, ["dashboard", "--help"])
     assert result.exit_code == 0
     assert "--recordings-root" in result.output
+
+
+def test_dashboard_cli_accepts_log_dir():
+    """sim-dji dashboard --log-dir 选项存在。"""
+    from click.testing import CliRunner
+    from sim_dji_cloud.cli import main
+    runner = CliRunner()
+    result = runner.invoke(main, ["dashboard", "--help"])
+    assert result.exit_code == 0
+    assert "--log-dir" in result.output

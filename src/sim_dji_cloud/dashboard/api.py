@@ -5,16 +5,31 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from pydantic import BaseModel
 
+from sim_dji_cloud.dashboard.auth import require_token
 from sim_dji_cloud.dashboard.events_archive import (
     EventsArchive,
     read_archive_from_flight_dir,
 )
 from sim_dji_cloud.dashboard.live_state import LiveState
+from sim_dji_cloud.dashboard.play_controller import (
+    PlayController,
+    PlayAlreadyRunning,
+    NotRunning,
+)
+
+
+class PlayStartBody(BaseModel):
+    flight_dir: str
+    speed: float = 1.0
+    mqtt_url: str = "tcp://localhost:1883"
+    video_push_url: str | None = None
+    video_anchor_offset_ms: int = 0
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -28,6 +43,7 @@ def create_app(
     video_url: str | None = None,
     archive: EventsArchive | None = None,
     recordings_root: Path = Path("recordings"),
+    play_controller: PlayController | None = None,
 ) -> FastAPI:
     app = FastAPI(title="sim-dji dashboard")
 
@@ -97,6 +113,9 @@ def create_app(
 
     if archive is not None:
         app.include_router(_timeline_router(archive, Path(recordings_root)))
+
+    if play_controller is not None:
+        app.include_router(_play_router(play_controller))
 
     return app
 
@@ -211,5 +230,38 @@ def _timeline_router(archive: EventsArchive, recordings_root: Path) -> APIRouter
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    return r
+
+
+def _play_router(pc: PlayController) -> APIRouter:
+    r = APIRouter(prefix="/api/play")
+
+    @r.post("/start", status_code=201)
+    def start_play(body: PlayStartBody, _=Depends(require_token)):
+        try:
+            return pc.start(
+                body.flight_dir,
+                speed=body.speed,
+                mqtt_url=body.mqtt_url,
+                video_push_url=body.video_push_url,
+                video_anchor_offset_ms=body.video_anchor_offset_ms,
+            )
+        except PlayAlreadyRunning as e:
+            raise HTTPException(status_code=409,
+                                detail=f"play already running, pid={e.pid}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @r.post("/stop")
+    def stop_play(_=Depends(require_token)):
+        try:
+            return pc.stop()
+        except NotRunning:
+            raise HTTPException(status_code=404, detail="no play running")
+
+    @r.get("/status")
+    def get_play_status():
+        return pc.status()
 
     return r

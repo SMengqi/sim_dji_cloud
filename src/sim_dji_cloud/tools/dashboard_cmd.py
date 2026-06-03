@@ -8,6 +8,7 @@ from sim_dji_cloud.dashboard.events_archive import EventsArchive
 from sim_dji_cloud.dashboard.flight_area import (
     load_flight_area, parse_png_bounds, parse_png_bounds_latlon, read_sidecar_bounds,
 )
+from sim_dji_cloud.dashboard.play_controller import PlayController
 
 
 def run_dashboard(
@@ -21,6 +22,7 @@ def run_dashboard(
     flight_area_png_bounds_latlon: str | None = None,
     video_url: str | None = None,
     recordings_root: Path = Path("recordings"),
+    log_dir: Path = Path("logs"),
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -50,6 +52,10 @@ def run_dashboard(
 
     archive = EventsArchive(soft_cap=5000)
     state = LiveState(on_flight_idle=[archive.reset])
+    play_controller = PlayController(
+        recordings_root=recordings_root,
+        log_dir=log_dir,
+    )
     app = create_app(
         state,
         ws_push_interval_ms=ws_push_interval_ms,
@@ -58,6 +64,7 @@ def run_dashboard(
         video_url=video_url,
         archive=archive,
         recordings_root=recordings_root,
+        play_controller=play_controller,
     )
 
     sub_holder: dict = {"sub": None}

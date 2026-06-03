@@ -389,3 +389,147 @@ def test_timeline_router_not_mounted_when_archive_none(tmp_path):
     app = create_app(state=LiveState(), archive=None, recordings_root=tmp_path)
     c = TestClient(app)
     assert c.get("/api/timeline").status_code == 404
+
+
+def _client_with_play(tmp_path):
+    """构造带 play_controller 的 TestClient。PlayController 用真类，
+    但 _pid_alive 和 subprocess.Popen 在测试里 mock。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+    from sim_dji_cloud.dashboard.play_controller import PlayController
+
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    (recordings / "flight_A").mkdir()
+    logs = tmp_path / "logs"
+
+    pc = PlayController(recordings_root=recordings, log_dir=logs)
+    state = LiveState()
+    app = create_app(state=state, play_controller=pc, recordings_root=recordings)
+    return TestClient(app), pc, recordings
+
+
+def test_play_start_503_when_no_token_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
+    client, _, _ = _client_with_play(tmp_path)
+    r = client.post("/api/play/start", json={"flight_dir": "flight_A"})
+    assert r.status_code == 503
+    assert "DASHBOARD_TOKEN" in r.json()["detail"]
+
+
+def test_play_start_401_when_wrong_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, _, _ = _client_with_play(tmp_path)
+    r = client.post(
+        "/api/play/start",
+        json={"flight_dir": "flight_A"},
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert r.status_code == 401
+
+
+def test_play_start_201_when_correct_token(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, pc, _ = _client_with_play(tmp_path)
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    fake_proc.pid = 54321
+    with patch("sim_dji_cloud.dashboard.play_controller.subprocess.Popen",
+               return_value=fake_proc), \
+         patch("sim_dji_cloud.dashboard.play_controller.PlayController._pid_alive",
+               return_value=True):
+        r = client.post(
+            "/api/play/start",
+            json={"flight_dir": "flight_A"},
+            headers={"Authorization": "Bearer secret123"},
+        )
+    assert r.status_code == 201
+    data = r.json()
+    assert data["state"] == "running"
+    assert data["pid"] == 54321
+
+
+def test_play_start_400_when_path_traversal(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, _, _ = _client_with_play(tmp_path)
+    r = client.post(
+        "/api/play/start",
+        json={"flight_dir": "../etc"},
+        headers={"Authorization": "Bearer secret123"},
+    )
+    assert r.status_code == 400
+
+
+def test_play_start_409_when_already_running(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, pc, _ = _client_with_play(tmp_path)
+    pc.log_dir.mkdir(parents=True, exist_ok=True)
+    (pc.log_dir / "play.pid").write_text("99999\n")
+    with patch("sim_dji_cloud.dashboard.play_controller.PlayController._pid_alive",
+               return_value=True):
+        r = client.post(
+            "/api/play/start",
+            json={"flight_dir": "flight_A"},
+            headers={"Authorization": "Bearer secret123"},
+        )
+    assert r.status_code == 409
+    assert "99999" in r.json()["detail"]
+
+
+def test_play_stop_200_when_running(tmp_path, monkeypatch):
+    import signal
+    from unittest.mock import patch
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, pc, _ = _client_with_play(tmp_path)
+    pc.log_dir.mkdir(parents=True, exist_ok=True)
+    (pc.log_dir / "play.pid").write_text("12345\n")
+
+    alive_state = {"v": True}
+
+    def fake_kill(pid, sig):
+        if sig == signal.SIGTERM:
+            alive_state["v"] = False
+
+    with patch("sim_dji_cloud.dashboard.play_controller.os.kill",
+               side_effect=fake_kill), \
+         patch("sim_dji_cloud.dashboard.play_controller.PlayController._pid_alive",
+               side_effect=lambda pid: alive_state["v"]):
+        r = client.post(
+            "/api/play/stop",
+            headers={"Authorization": "Bearer secret123"},
+        )
+    assert r.status_code == 200
+    assert r.json()["state"] == "stopped"
+
+
+def test_play_stop_404_when_not_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    client, _, _ = _client_with_play(tmp_path)
+    r = client.post(
+        "/api/play/stop",
+        headers={"Authorization": "Bearer secret123"},
+    )
+    assert r.status_code == 404
+
+
+def test_play_status_no_token_required(tmp_path, monkeypatch):
+    """GET status 公开，不带 Authorization 也 200。"""
+    monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
+    client, _, _ = _client_with_play(tmp_path)
+    r = client.get("/api/play/status")
+    assert r.status_code == 200
+    assert r.json()["state"] == "stopped"
+
+
+def test_play_router_not_mounted_without_controller(tmp_path):
+    """create_app(play_controller=None) → /api/play/* 不挂，FastAPI 自然 404。"""
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+
+    app = create_app(state=LiveState(), play_controller=None, recordings_root=tmp_path)
+    c = TestClient(app)
+    assert c.get("/api/play/status").status_code == 404
