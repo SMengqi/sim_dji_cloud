@@ -114,7 +114,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 
 ## Non-obvious operational notes
 
-- `install.sh` uses `pip install -e ".[test]" --upgrade --upgrade-strategy eager` and then explicitly imports `fastapi/uvicorn/websockets/httpx` as a sanity check. This is intentional — `-e` alone doesn't resync dependencies on existing venvs, which has bitten us when pyproject grew new deps.
+- `install.sh` uses `pip install -e ".[test]" --upgrade --upgrade-strategy eager` and then explicitly imports `fastapi/uvicorn/websockets/httpx/aiohttp` as a sanity check. This is intentional — `-e` alone doesn't resync dependencies on existing venvs, which has bitten us when pyproject grew new deps.
 - Plain TCP (port 1883) vs TLS (port 8883) — the YAML `mqtt.tls` flag must match the actual broker. A mismatch surfaces as `ConnectionResetError` during handshake.
 - The CLI `record` loop is **long-running and does NOT auto-exit**. Each 1s tick calls `rec._detector.tick(now_ms())`; on `FlightState.FINALIZING` it `finalize_and_close` + `reset_for_next_flight` and **keeps looping** for the next task (multi-task per process). Only Ctrl-C / SIGTERM / `stop-record` set `stop_event` to exit, and the `finally` finalizes any in-progress flight on the way out (`reason=manual_stop`). Video is default-off (`video.enabled: false`); `--video` opts in.
 - `recordings/` and `*.yaml` are gitignored; only `*.yaml.example` is tracked.

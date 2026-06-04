@@ -85,7 +85,7 @@ python3 -m pip install -e ".[test]" --upgrade --upgrade-strategy eager --quiet
 # 兜底：显式校验新增依赖在位（防止极老缓存 / 修改 pyproject 后未同步）
 # pyproj：飞行区域叠加用，UTM→WGS84 坐标换算
 MISSING=()
-for mod in fastapi uvicorn websockets httpx pyproj; do
+for mod in fastapi uvicorn websockets httpx aiohttp pyproj; do
     python3 -c "import $mod" 2>/dev/null || MISSING+=("$mod")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
