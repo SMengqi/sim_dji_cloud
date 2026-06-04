@@ -54,6 +54,7 @@ class Player:
         self._video_task: Optional[asyncio.Task] = None
         self._control_sidecar_path = control_sidecar_path
         self._control_server: Optional[ControlServer] = None
+        self._seek_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._manifest = json.loads((self.flight_dir / "manifest.json").read_text())
@@ -134,8 +135,19 @@ class Player:
 
     async def wait_until_done(self) -> None:
         try:
-            if self._tasks:
-                await asyncio.gather(*self._tasks, return_exceptions=True)
+            while True:
+                tasks = list(self._tasks)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                # After gather, an in-progress seek may have cancelled tasks but
+                # not yet replaced them. Acquire seek_lock to wait for any pending
+                # seek to finish, then re-check final state.
+                async with self._seek_lock:
+                    remaining = [t for t in self._tasks if not t.done()]
+                    if not remaining:
+                        break
+                    # Else: seek replaced tasks while we were waiting; loop to
+                    # wait on the new tasks.
         finally:
             if self._video_task is not None:
                 self._video_task.cancel()
@@ -181,40 +193,41 @@ class Player:
         return {"state": "running", "virt_ms": self._scheduler.virt_now_ms()}
 
     async def seek(self, virt_ms: int) -> dict:
-        total = self._total_ms()
-        if total is not None and virt_ms >= total:
-            virt_ms = max(0, total - 1)
-            logger.warning("seek clamped to {}ms (manifest total {})",
-                           virt_ms, total)
-        for t in self._tasks:
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        async with self._seek_lock:
+            total = self._total_ms()
+            if total is not None and virt_ms >= total:
+                virt_ms = max(0, total - 1)
+                logger.warning("seek clamped to {}ms (manifest total {})",
+                               virt_ms, total)
+            for t in self._tasks:
+                t.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
 
-        self._scheduler.set_virt(virt_ms)
+            self._scheduler.set_virt(virt_ms)
 
-        await self._stop_video_for_pause()
+            await self._stop_video_for_pause()
 
-        started_at = self._manifest.get("started_at_recv_ms", 0)
-        for topic_entry in self._manifest.get("topics", []):
-            files = [self.flight_dir / f["name"]
-                     for f in topic_entry.get("files", [])]
-            files = [f for f in files if f.exists()]
-            if not files:
-                continue
-            task = asyncio.create_task(
-                self._replay_topic_from_virt(
-                    topic_entry, files, started_at, virt_ms)
-            )
-            self._tasks.append(task)
+            started_at = self._manifest.get("started_at_recv_ms", 0)
+            for topic_entry in self._manifest.get("topics", []):
+                files = [self.flight_dir / f["name"]
+                         for f in topic_entry.get("files", [])]
+                files = [f for f in files if f.exists()]
+                if not files:
+                    continue
+                task = asyncio.create_task(
+                    self._replay_topic_from_virt(
+                        topic_entry, files, started_at, virt_ms)
+                )
+                self._tasks.append(task)
 
-        if not self._scheduler.paused:
-            await self._restart_video_at_current_virt()
+            if not self._scheduler.paused:
+                await self._restart_video_at_current_virt()
 
-        return {
-            "state": "paused" if self._scheduler.paused else "running",
-            "virt_ms": virt_ms,
-        }
+            return {
+                "state": "paused" if self._scheduler.paused else "running",
+                "virt_ms": virt_ms,
+            }
 
     def progress(self) -> dict:
         total = self._total_ms()

@@ -252,3 +252,54 @@ async def test_player_seek_records_fire_at_expected_wall_time(tmp_path):
             f"buggy ~{t / 2.0}ms)"
         )
     await p.wait_until_done()
+
+
+@pytest.mark.asyncio
+async def test_player_seek_does_not_publish_idle_marker(tmp_path):
+    """Regression test for race where Player.seek cancelling tasks made
+    Player.wait_until_done's gather return prematurely, triggering its
+    finally block which publishes the dashboard-clear synthetic idle OSD
+    (flighttask_step_code=5). Symptom (real-machine 2026-06-04): seek
+    clicks wiped dashboard state but video kept showing because new ffmpeg
+    subprocess was independent of the dead Python player.
+
+    Verify: after start + seek mid-flight, the publisher must NOT have
+    received any synthetic idle marker. Only normal record payloads.
+    """
+    flight = _make_flight(tmp_path, [1000, 1100, 1500, 2000])
+    pub = _FakePublisher()
+    p = Player(flight_dir=flight, publisher=pub, speed=10.0)
+    await p.start()
+    await asyncio.sleep(0.02)
+    # Seek mid-flight
+    await p.seek(500)
+    # Let new tasks publish a few records
+    await asyncio.sleep(0.1)
+
+    # Check no synthetic idle marker was published
+    idle_published = [
+        m for m in pub.published
+        if '"flighttask_step_code":5' in m[2]
+        or '"flighttask_step_code": 5' in m[2]
+    ]
+    assert not idle_published, (
+        f"seek triggered premature wait_until_done finally; idle marker "
+        f"published: {idle_published}"
+    )
+
+    # Cleanup — let player finish naturally
+    for t in p._tasks:
+        try:
+            await asyncio.wait_for(t, timeout=2.0)
+        except asyncio.TimeoutError:
+            t.cancel()
+    await p.wait_until_done()
+    # After wait_until_done, idle marker IS expected (natural finish)
+    idle_after_finish = [
+        m for m in pub.published
+        if '"flighttask_step_code":5' in m[2]
+        or '"flighttask_step_code": 5' in m[2]
+    ]
+    assert idle_after_finish, (
+        "wait_until_done finishing naturally should publish idle marker"
+    )
