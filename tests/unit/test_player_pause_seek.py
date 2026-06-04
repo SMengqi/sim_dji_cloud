@@ -293,7 +293,10 @@ async def test_player_seek_video_restart_uses_anchor_offset(tmp_path, monkeypatc
     monkeypatch.setattr(Player, "_run_video_push", _capture)
 
     pub = _FakePublisher()
-    p = Player(flight_dir=flight, publisher=pub, speed=10.0,
+    # speed=1.0: virt drift during the test's await points stays < ~5ms,
+    # well within tolerance below. With speed=10 the drift becomes ~50ms+
+    # under load and flakes the wait_virt_ms / ss_seconds asserts.
+    p = Player(flight_dir=flight, publisher=pub, speed=1.0,
                video_push_url="rtmp://fake/test",
                video_anchor_offset_ms=-4000)
     await p.start()
@@ -311,19 +314,22 @@ async def test_player_seek_video_restart_uses_anchor_offset(tmp_path, monkeypatc
     assert len(captured_plans) == 2, captured_plans
 
     restart_plan = captured_plans[1]
-    # wait_virt_ms should be 500 + (-4000) = -3500, NOT the raw seek target 500
+    # wait_virt_ms should be seek_virt + anchor_offset ≈ 500 + (-4000) = -3500.
+    # seek_virt is sampled inside _restart_video_at_current_virt at restart time
+    # (a few ms after set_virt(500)), so allow ±50ms slack.
     assert restart_plan["wait_virt_ms"] != 500, (
         f"_restart_video_at_current_virt dropped anchor_offset_ms; "
         f"wait_virt_ms = {restart_plan['wait_virt_ms']} equals raw seek_target=500"
     )
-    assert restart_plan["wait_virt_ms"] == -3500, (
-        f"wait_virt_ms should be seek_target + anchor_offset = 500 + (-4000) = -3500; "
+    assert -3550 <= restart_plan["wait_virt_ms"] <= -3450, (
+        f"wait_virt_ms should be seek_target + anchor_offset ≈ -3500 (±50); "
         f"got {restart_plan['wait_virt_ms']}"
     )
-    # ss_seconds: seek(500) with video_offset_in_flight=200ms → (500-200)/1000 = 0.3s
-    assert abs(restart_plan["ss_seconds"] - 0.3) < 0.01, (
-        f"ss_seconds should be (seek_virt - video_offset_in_flight) / 1000 = "
-        f"(500 - 200) / 1000 = 0.3; got {restart_plan['ss_seconds']}"
+    # ss_seconds: (seek_virt - video_offset_in_flight) / 1000
+    # ≈ (500 - 200) / 1000 = 0.3s, with same ~50ms slack on seek_virt.
+    assert 0.25 <= restart_plan["ss_seconds"] <= 0.35, (
+        f"ss_seconds should be (seek_virt - video_offset_in_flight) / 1000 "
+        f"≈ 0.3 (±0.05); got {restart_plan['ss_seconds']}"
     )
 
     # cleanup
@@ -389,3 +395,49 @@ async def test_player_seek_does_not_publish_idle_marker(tmp_path):
     assert idle_after_finish, (
         "wait_until_done finishing naturally should publish idle marker"
     )
+
+
+@pytest.mark.asyncio
+async def test_player_progress_during_seek_window_uses_scheduler(tmp_path):
+    """Regression: progress() must not return virt_ms=0 just because
+    self._tasks is briefly empty during seek's task-rebuild window."""
+    flight = _make_flight(tmp_path, [1000, 1100, 1500, 2000, 3000, 4000])
+    pub = _FakePublisher()
+    p = Player(flight_dir=flight, publisher=pub, speed=10.0)
+    await p.start()
+    await asyncio.sleep(0.02)
+    await p.seek(1500)
+    # immediately after seek returns, progress should reflect seek target
+    prog = p.progress()
+    assert prog["virt_ms"] >= 1450, (
+        f"progress after seek returned virt_ms={prog['virt_ms']}, "
+        f"expected close to seek target 1500 (regression for hardcoded 0)"
+    )
+    for t in p._tasks:
+        try:
+            await asyncio.wait_for(t, timeout=2.0)
+        except asyncio.TimeoutError:
+            t.cancel()
+    await p.wait_until_done()
+
+
+@pytest.mark.asyncio
+async def test_player_progress_after_natural_finish_keeps_virt(tmp_path):
+    """Regression: progress() after all replay tasks finish naturally
+    should keep the final scheduler virt (not snap to 0)."""
+    flight = _make_flight(tmp_path, [1000, 1050, 1100])
+    pub = _FakePublisher()
+    p = Player(flight_dir=flight, publisher=pub, speed=100.0)
+    await p.start()
+    for t in p._tasks:
+        try:
+            await asyncio.wait_for(t, timeout=2.0)
+        except asyncio.TimeoutError:
+            t.cancel()
+    # All tasks done. progress should reflect last scheduler position.
+    prog = p.progress()
+    assert prog["virt_ms"] > 0, (
+        f"progress after natural finish returned virt_ms={prog['virt_ms']}, "
+        f"should reflect last scheduler position not hardcoded 0"
+    )
+    await p.wait_until_done()

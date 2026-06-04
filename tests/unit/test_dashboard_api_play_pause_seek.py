@@ -66,3 +66,31 @@ def test_seek_400_negative_virt_ms(tmp_path, monkeypatch):
         headers={"Authorization": "Bearer secret"},
     )
     assert r.status_code == 400
+
+
+def test_pause_409_already_paused(tmp_path, monkeypatch):
+    """RuntimeError('already paused') from PlayController.pause -> 409."""
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret")
+    pc = MagicMock(spec=PlayController)
+    pc.pause.side_effect = RuntimeError("already paused")
+    client, _ = _client(tmp_path, pc=pc)
+    r = client.post(
+        "/api/play/pause", json={},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert r.status_code == 409
+    assert "already paused" in r.json()["detail"]
+
+
+def test_resume_409_not_paused(tmp_path, monkeypatch):
+    """RuntimeError('not paused') from PlayController.resume -> 409."""
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret")
+    pc = MagicMock(spec=PlayController)
+    pc.resume.side_effect = RuntimeError("not paused")
+    client, _ = _client(tmp_path, pc=pc)
+    r = client.post(
+        "/api/play/resume", json={},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert r.status_code == 409
+    assert "not paused" in r.json()["detail"]

@@ -230,14 +230,9 @@ class Player:
             }
 
     def progress(self) -> dict:
-        total = self._total_ms()
-        if self._tasks or self._scheduler.paused:
-            virt = self._scheduler.virt_now_ms()
-        else:
-            virt = 0
         return {
-            "virt_ms": virt,
-            "total_ms": total,
+            "virt_ms": self._scheduler.virt_now_ms(),
+            "total_ms": self._total_ms(),
             "paused": self._scheduler.paused,
             "speed": self._scheduler.speed,
         }
@@ -293,6 +288,22 @@ class Player:
         # as fast as possible — the same behaviour as initial play when anchor
         # offset pushed the wait before play start.
         plan["wait_virt_ms"] = seek_virt + self._video_anchor_offset_ms
+        # Defensive: cancel any video task that may have been assigned by a
+        # concurrent path (pause / seek interleave) so we don't orphan ffmpeg.
+        if self._video_task is not None:
+            self._video_task.cancel()
+            try:
+                await self._video_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._video_task = None
+        if self._video_pusher is not None:
+            try:
+                self._video_pusher.stop()
+            except Exception:
+                logger.exception("video pusher stop failed during restart")
+            self._video_pusher = None
+
         self._video_task = asyncio.create_task(
             self._run_video_push(plan, video_file))
 

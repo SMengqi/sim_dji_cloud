@@ -333,12 +333,19 @@ class PlayController:
 
     async def start_progress_polling(self) -> None:
         """1Hz 后台 poll；dashboard_cmd 在 uvicorn startup 钩 + shutdown cancel。
-        永不抛出（all exceptions swallowed），让任务终生运行。"""
+        永不抛出（all exceptions swallowed），让任务终生运行。
+
+        _forward_control 用 sync httpx.Client（最高 5s 阻塞）。直接调会卡
+        uvicorn 事件循环——control server 死 / sidecar 缺时整个 dashboard
+        冻 5s。用 asyncio.to_thread 丢去 threadpool 跑。
+        """
         while True:
             try:
                 if self._status_basic()["state"] == "running":
-                    self._last_progress = self._forward_control(
-                        "GET", "/control/progress", body={})
+                    self._last_progress = await asyncio.to_thread(
+                        self._forward_control, "GET", "/control/progress",
+                        body={},
+                    )
                     self._progress_stale = False
             except Exception:
                 self._progress_stale = True
