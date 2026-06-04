@@ -275,6 +275,25 @@ sim-dji dashboard --port 8099 \
 
 浏览器打开 `http://<host>:8099/`，顶部飞行下拉列出 `recordings/` 下所有飞行；选某个 → 自动 stop 旧 play + 清 dashboard 状态 + start 新 play；选 Live → 看真机实时 MQTT。URL `?flight=<id>` 支持直达。POST 端点用 Bearer token 守护（首次操作 prompt，sessionStorage 缓存）。
 
+### 回放暂停 / 恢复 / 前进 seek（dashboard 底部 timeline 抽屉控件 + REST）
+
+回放暂停 / 恢复 / 前进 seek（dashboard 底部 timeline 抽屉控件 + REST）：
+
+```bash
+export DASHBOARD_TOKEN=$(openssl rand -hex 16)
+sim-dji dashboard --port 8099 --recordings-root ./recordings --log-dir ./logs
+sim-dji play ./recordings/<flight> --mqtt-url tcp://localhost:1883 \
+    --control-sidecar-path ./logs/play.control.json
+```
+
+或通过 dashboard 顶部下拉 / `POST /api/play/start` 起回放（PlayController 会自动加 `--control-sidecar-path`）。打开浏览器 `http://<host>:8099/` 拉开底部 timeline 抽屉，handle 栏出现 `⏸ 00:42 / 12:30`：
+
+- 点 ⏸ / ▶ 暂停 / 恢复（数据 + 视频同步冻结；恢复时 RTMP 短暂黑屏 2-3s）
+- canvas 任意位置点击 seek（仅前进；越界自动截断）
+- `POST /api/play/pause`、`POST /api/play/resume`、`POST /api/play/seek {virt_ms}` 走 Bearer token；`GET /api/play/status` 公开，返回扩 `progress: {virt_ms, total_ms, paused, stale}` 字段
+
+后退 seek / 拖动播放头 / 跑时变速等留下一版。
+
 ---
 
 ## 📖 完整操作手册

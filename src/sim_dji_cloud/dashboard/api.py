@@ -21,6 +21,7 @@ from sim_dji_cloud.dashboard.play_controller import (
     PlayController,
     PlayAlreadyRunning,
     NotRunning,
+    ControlUnavailable,
 )
 
 
@@ -245,6 +246,20 @@ def _timeline_router(archive: EventsArchive, recordings_root: Path) -> APIRouter
     return r
 
 
+def _forward_or_translate(fn):
+    """统一翻译 PlayController 异常为 HTTP 状态码。"""
+    try:
+        return fn()
+    except NotRunning:
+        raise HTTPException(status_code=404, detail="play not running")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ControlUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except RuntimeError as e:    # already paused / not paused → 409
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 def _play_router(pc: PlayController) -> APIRouter:
     r = APIRouter(prefix="/api/play")
 
@@ -274,6 +289,22 @@ def _play_router(pc: PlayController) -> APIRouter:
     @r.get("/status")
     def get_play_status():
         return pc.status()
+
+    # NEW for A
+    class _SeekBody(BaseModel):
+        virt_ms: int
+
+    @r.post("/pause")
+    def pause(_=Depends(require_token)):
+        return _forward_or_translate(pc.pause)
+
+    @r.post("/resume")
+    def resume(_=Depends(require_token)):
+        return _forward_or_translate(pc.resume)
+
+    @r.post("/seek")
+    def seek(body: _SeekBody, _=Depends(require_token)):
+        return _forward_or_translate(lambda: pc.seek(body.virt_ms))
 
     return r
 

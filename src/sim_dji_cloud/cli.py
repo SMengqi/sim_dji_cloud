@@ -118,8 +118,14 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
               help="视频推流相对 first-frame 锚的偏移（毫秒，可正可负）。负值让视频比 first-frame 时刻"
                    "提前 |N| ms 开始推，用于补偿 RTMP push → SRS GOP cache → 客户端 player buffer "
                    "这段管道延迟。典型值：实测 SRS+客户端组合 dial-in 出来的常量，数秒量级。默认 0")
+@click.option(
+    "--control-sidecar-path", default=None, type=click.Path(),
+    help="启用 control HTTP server 并把端口 / pid 写到这个 JSON 文件路径；"
+         "不传则不起 control server（向后兼容 selfcheck / 直接 CLI 跑）",
+)
 def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int,
-             video_push_url: str | None, video_anchor_offset_ms: int) -> None:
+             video_push_url: str | None, video_anchor_offset_ms: int,
+             control_sidecar_path: str | None) -> None:
     from sim_dji_cloud.tools.play_cmd import play_flight
     raise SystemExit(asyncio.run(play_flight(
         flight_dir=Path(flight_dir),
@@ -128,6 +134,7 @@ def play_cmd(flight_dir: str, mqtt_url: str, speed: float, start_offset_ms: int,
         start_offset_ms=start_offset_ms,
         video_push_url=video_push_url,
         video_anchor_offset_ms=video_anchor_offset_ms,
+        control_sidecar_path=Path(control_sidecar_path) if control_sidecar_path else None,
     )))
 
 

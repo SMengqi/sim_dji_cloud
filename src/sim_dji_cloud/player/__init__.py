@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from typing import Optional, Protocol, Callable
 from loguru import logger
@@ -7,6 +9,7 @@ from loguru import logger
 from sim_dji_cloud.player.jsonl_iterator import JsonlIterator
 from sim_dji_cloud.player.scheduler import VirtTimeScheduler
 from sim_dji_cloud.player.video_pusher import VideoPusher, plan_video_push
+from sim_dji_cloud.player.control_server import ControlServer
 
 
 class _PublisherProto(Protocol):
@@ -32,6 +35,7 @@ class Player:
         video_pusher_factory: Callable[..., VideoPusher] = VideoPusher,
         video_anchor_offset_ms: int = 0,
         publish_clear_marker_on_stop: bool = True,
+        control_sidecar_path: Path | None = None,
     ):
         self.flight_dir = Path(flight_dir)
         self._publisher = publisher
@@ -48,6 +52,8 @@ class Player:
         self._publish_clear_marker_on_stop = publish_clear_marker_on_stop
         self._video_pusher: Optional[VideoPusher] = None
         self._video_task: Optional[asyncio.Task] = None
+        self._control_sidecar_path = control_sidecar_path
+        self._control_server: Optional[ControlServer] = None
 
     async def start(self) -> None:
         self._manifest = json.loads((self.flight_dir / "manifest.json").read_text())
@@ -82,6 +88,15 @@ class Player:
         )
         if plan is not None:
             self._video_task = asyncio.create_task(self._run_video_push(plan, video_file))
+
+        if self._control_sidecar_path is not None:
+            self._control_server = ControlServer(
+                player=self,
+                sidecar_path=self._control_sidecar_path,
+                pid=os.getpid(),
+                started_at_ms=int(time.time() * 1000),
+            )
+            await self._control_server.start()
 
     async def _run_video_push(self, plan: dict, video_file: "Path | None") -> None:
         try:
@@ -140,9 +155,148 @@ class Player:
             # 后 dashboard 轨迹会卡在最后一帧。这里主动补一条。SelfCheck
             # loopback 模式下通过 publish_clear_marker_on_stop=False 关掉，
             # 避免污染录制-回放对称性。
+            if self._control_server is not None:
+                await self._control_server.stop()
+                self._control_server = None
             if self._publish_clear_marker_on_stop:
                 await self._publish_dashboard_clear_marker()
             await self._publisher.disconnect()
+
+    # ==================================================================
+    # Pause / Resume / Seek / Progress  (phase 3 A)
+    # ==================================================================
+
+    async def pause(self) -> dict:
+        if self._scheduler.paused:
+            raise RuntimeError("already paused")
+        self._scheduler.pause()
+        await self._stop_video_for_pause()
+        return {"state": "paused", "virt_ms": self._scheduler.virt_now_ms()}
+
+    async def resume(self) -> dict:
+        if not self._scheduler.paused:
+            raise RuntimeError("not paused")
+        self._scheduler.resume()
+        await self._restart_video_at_current_virt()
+        return {"state": "running", "virt_ms": self._scheduler.virt_now_ms()}
+
+    async def seek(self, virt_ms: int) -> dict:
+        total = self._total_ms()
+        if total is not None and virt_ms >= total:
+            virt_ms = max(0, total - 1)
+            logger.warning("seek clamped to {}ms (manifest total {})",
+                           virt_ms, total)
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+        self._scheduler.set_virt(virt_ms)
+
+        await self._stop_video_for_pause()
+
+        started_at = self._manifest.get("started_at_recv_ms", 0)
+        for topic_entry in self._manifest.get("topics", []):
+            files = [self.flight_dir / f["name"]
+                     for f in topic_entry.get("files", [])]
+            files = [f for f in files if f.exists()]
+            if not files:
+                continue
+            task = asyncio.create_task(
+                self._replay_topic_from_virt(
+                    topic_entry, files, started_at, virt_ms)
+            )
+            self._tasks.append(task)
+
+        if not self._scheduler.paused:
+            await self._restart_video_at_current_virt()
+
+        return {
+            "state": "paused" if self._scheduler.paused else "running",
+            "virt_ms": virt_ms,
+        }
+
+    def progress(self) -> dict:
+        total = self._total_ms()
+        if self._tasks or self._scheduler.paused:
+            virt = self._scheduler.virt_now_ms()
+        else:
+            virt = 0
+        return {
+            "virt_ms": virt,
+            "total_ms": total,
+            "paused": self._scheduler.paused,
+            "speed": self._scheduler.speed,
+        }
+
+    def _total_ms(self) -> Optional[int]:
+        started = self._manifest.get("started_at_recv_ms")
+        ended = self._manifest.get("ended_at_recv_ms")
+        if isinstance(started, int) and isinstance(ended, int):
+            return ended - started
+        return None
+
+    async def _stop_video_for_pause(self) -> None:
+        if self._video_task is not None:
+            self._video_task.cancel()
+            try:
+                await self._video_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._video_task = None
+        if self._video_pusher is not None:
+            try:
+                self._video_pusher.stop()
+            except Exception:
+                logger.exception("video pusher stop failed during pause/seek")
+            self._video_pusher = None
+
+    async def _restart_video_at_current_virt(self) -> None:
+        video_meta = self._manifest.get("video") or {}
+        video_rel = video_meta.get("file")
+        video_file = (self.flight_dir / video_rel) if video_rel else None
+        video_exists = bool(video_file and video_file.exists())
+        plan = plan_video_push(
+            self._manifest, self._video_push_url, self._speed,
+            video_exists, anchor_offset_ms=self._video_anchor_offset_ms,
+        )
+        if plan is None:
+            return
+        plan = dict(plan)
+        plan["ss_seconds"] = max(0, self._scheduler.virt_now_ms() / 1000.0)
+        plan["wait_virt_ms"] = self._scheduler.virt_now_ms()
+        self._video_task = asyncio.create_task(
+            self._run_video_push(plan, video_file))
+
+    async def _replay_topic_from_virt(
+        self,
+        topic_entry: dict,
+        files: list[Path],
+        started_at_ms: int,
+        seek_virt_ms: int,
+    ) -> None:
+        """跟 _replay_topic 同逻辑，但 linear scan 跳过 seek 之前的 record。"""
+        topic = topic_entry["topic"]
+        target_recv_ts = started_at_ms + seek_virt_ms
+        for record in JsonlIterator(files):
+            recv_ts = record.get("recv_ts_ms")
+            if not isinstance(recv_ts, int):
+                continue
+            if recv_ts < target_recv_ts:
+                continue
+            # Don't add _start_offset_ms: scheduler.set_virt() in seek() already
+            # moved virt_zero to seek_virt_ms; record at offset T should wait T-S ms
+            # from the current virt = S, which `wait_until_virt(T)` achieves.
+            virt_target = recv_ts - started_at_ms
+            await self._scheduler.wait_until_virt(virt_target)
+            payload = record.get("payload", {})
+            payload_bytes = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            try:
+                await self._publisher.publish(topic, payload_bytes)
+            except Exception:
+                logger.exception("publish failed for topic {}", topic)
 
     async def _publish_dashboard_clear_marker(self) -> None:
         """补发一条合成 dock OSD 让 dashboard 清轨迹（详见 wait_until_done finally

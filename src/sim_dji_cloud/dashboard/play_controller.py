@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from loguru import logger
 
 
@@ -28,6 +30,10 @@ class NotRunning(Exception):
     """stop 时发现没在跑（路由层翻译成 404）。"""
 
 
+class ControlUnavailable(Exception):
+    """control server 未起 / 不可达（路由层翻译成 503）。"""
+
+
 class PlayController:
     """管 sim-dji play 子进程；线程不安全，单 instance per dashboard 进程。"""
 
@@ -39,6 +45,9 @@ class PlayController:
         self._pid_file = log_dir / f"{name}.pid"
         self._meta_file = log_dir / f"{name}.meta.json"
         self._latest_log = log_dir / f"{name}-latest.log"
+        self._control_sidecar = log_dir / f"{name}.control.json"
+        self._last_progress: Optional[dict] = None
+        self._progress_stale: bool = False
 
     def start(
         self,
@@ -55,6 +64,10 @@ class PlayController:
         if cur["state"] == "running":
             raise PlayAlreadyRunning(cur["pid"])
 
+        # Clear progress cache from previous flight (if any).
+        self._last_progress = None
+        self._progress_stale = False
+
         ts = time.strftime("%Y%m%d-%H%M%S")
         log_path = self.log_dir / f"{self.name}-{ts}.log"
         cmd = [
@@ -66,6 +79,7 @@ class PlayController:
             cmd += ["--video-push-url", video_push_url]
         if video_anchor_offset_ms:
             cmd += ["--video-anchor-offset-ms", str(video_anchor_offset_ms)]
+        cmd += ["--control-sidecar-path", str(self._control_sidecar)]
 
         log_fp = open(log_path, "ab")
         proc = subprocess.Popen(
@@ -88,6 +102,24 @@ class PlayController:
             self._latest_log.unlink()
         self._latest_log.symlink_to(log_path.name)
 
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if self._control_sidecar.exists():
+                break
+            if proc.poll() is not None:
+                logger.warning(
+                    "play process exited early (rc={}); sidecar will not appear",
+                    proc.poll(),
+                )
+                break
+            time.sleep(0.1)
+        else:
+            logger.warning(
+                "control sidecar timeout for {} ({}); "
+                "pause/resume/seek will return 503",
+                self.name, self._control_sidecar,
+            )
+
         logger.info("PlayController started: pid={} flight={}", proc.pid, resolved)
         return self.status()
 
@@ -100,6 +132,10 @@ class PlayController:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             self._cleanup_state_files()
+            try:
+                self._control_sidecar.unlink()
+            except FileNotFoundError:
+                pass
             return self.status()
 
         deadline = time.monotonic() + timeout_s
@@ -117,9 +153,13 @@ class PlayController:
                 pass
 
         self._cleanup_state_files()
+        try:
+            self._control_sidecar.unlink()
+        except FileNotFoundError:
+            pass
         return self.status()
 
-    def status(self) -> dict:
+    def _status_basic(self) -> dict:
         if not self._pid_file.exists():
             return self._empty_status()
         try:
@@ -144,6 +184,15 @@ class PlayController:
             "started_at_ms": meta.get("started_at_ms"),
             "log_tail": self._tail_log(),
         }
+
+    def status(self) -> dict:
+        """对外接口；running 时塞 progress 字段。"""
+        s = self._status_basic()
+        if s["state"] == "running":
+            s["progress"] = self._progress_with_stale_flag()
+        else:
+            s["progress"] = None
+        return s
 
     # ------------------------------------------------------------------
     # Internal
@@ -221,4 +270,79 @@ class PlayController:
 
     def _empty_status(self) -> dict:
         return {"state": "stopped", "pid": None, "flight_dir": None,
-                "speed": None, "started_at_ms": None, "log_tail": None}
+                "speed": None, "started_at_ms": None, "log_tail": None,
+                "progress": None}
+
+    # ==================================================================
+    # Pause / Resume / Seek + progress polling  (phase 3 A)
+    # ==================================================================
+
+    def pause(self) -> dict:
+        self._ensure_running()
+        return self._forward_control("POST", "/control/pause", body={})
+
+    def resume(self) -> dict:
+        self._ensure_running()
+        return self._forward_control("POST", "/control/resume", body={})
+
+    def seek(self, virt_ms) -> dict:
+        if not isinstance(virt_ms, int) or isinstance(virt_ms, bool) or virt_ms < 0:
+            raise ValueError("virt_ms must be int >= 0")
+        self._ensure_running()
+        return self._forward_control(
+            "POST", "/control/seek", body={"virt_ms": virt_ms})
+
+    def _ensure_running(self) -> None:
+        if self._status_basic()["state"] != "running":
+            raise NotRunning()
+
+    def _progress_with_stale_flag(self) -> Optional[dict]:
+        if self._last_progress is None:
+            return None
+        out = dict(self._last_progress)
+        out["stale"] = self._progress_stale
+        return out
+
+    def _read_control_port(self) -> Optional[int]:
+        if not self._control_sidecar.exists():
+            return None
+        try:
+            return json.loads(self._control_sidecar.read_text())["control_port"]
+        except (ValueError, OSError, KeyError):
+            return None
+
+    def _forward_control(self, method: str, path: str, *, body: dict) -> dict:
+        port = self._read_control_port()
+        if port is None:
+            raise ControlUnavailable("control server sidecar missing")
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            with httpx.Client(timeout=5.0) as c:
+                if method.upper() == "GET":
+                    r = c.request(method, url)
+                else:
+                    r = c.request(method, url, json=body)
+            if r.status_code == 400:
+                raise ValueError(r.json().get("detail", "bad request"))
+            if r.status_code == 409:
+                raise RuntimeError(r.json().get("detail", "conflict"))
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPError, OSError) as e:
+            raise ControlUnavailable(f"control HTTP failed: {e}") from e
+
+    async def start_progress_polling(self) -> None:
+        """1Hz 后台 poll；dashboard_cmd 在 uvicorn startup 钩 + shutdown cancel。
+        永不抛出（all exceptions swallowed），让任务终生运行。"""
+        while True:
+            try:
+                if self._status_basic()["state"] == "running":
+                    self._last_progress = self._forward_control(
+                        "GET", "/control/progress", body={})
+                    self._progress_stale = False
+            except Exception:
+                self._progress_stale = True
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                return

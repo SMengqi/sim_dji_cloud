@@ -115,6 +115,21 @@
   }
   .flight-selector button:disabled { opacity: 0.5; cursor: wait; }
   .flight-selector .error { color: #ff6b6b; }
+  .playback-controls {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-left: 12px; padding-left: 8px;
+    border-left: 1px solid #444;
+  }
+  .playback-controls button {
+    background: #2a2a2a; color: #ddd;
+    border: 1px solid #555; cursor: pointer;
+    padding: 1px 8px; min-width: 28px;
+  }
+  .playback-controls button:disabled { opacity: 0.4; cursor: wait; }
+  .playback-controls .progress-text {
+    font-variant-numeric: tabular-nums; font-size: 12px;
+  }
+  .playback-controls .stale-badge { color: #ffd24d; cursor: help; }
 </style>
 </head>
 <body x-data="dashboard()" x-init="init()">
@@ -268,6 +283,16 @@
     <button @click.stop="downloadTimelineCsv()">⬇ CSV</button>
     <span class="truncated-badge" x-show="timeline.truncated"
           title="结果超过 limit (5000)，显示最新部分">截断</span>
+    <template x-if="playback.progress">
+      <span class="playback-controls">
+        <button @click="togglePause()" :disabled="playback.busy"
+                x-text="playback.progress.paused ? '▶' : '⏸'"></button>
+        <span class="progress-text"
+              x-text="formatProgress(playback.progress)"></span>
+        <span x-show="playback.progress.stale" class="stale-badge"
+              title="control server 暂时不可达，显示的是最后一次成功值">⚠</span>
+      </span>
+    </template>
     <span x-show="timeline.error" x-text="timeline.error"
           style="color:#ff6b6b"></span>
   </div>
@@ -370,6 +395,10 @@ function dashboard() {
     },
     defaultVideoPushUrl: "",
     switching: false,
+    playback: {
+      progress: null,
+      busy: false,
+    },
 
     async onFlightChange() {
       if (this.switching) return;
@@ -490,6 +519,29 @@ function dashboard() {
         if (flightFromUrl && this.flights.list.find(f => f.id === flightFromUrl)) {
           this.flights.selected = flightFromUrl;
           this.onFlightChange();
+        }
+      });
+
+      // Phase 3 A — pause-seek
+      this._statusInterval = setInterval(async () => {
+        try {
+          const data = await this.callApi("GET", "/api/play/status", null);
+          this.playback.progress = data.progress;
+        } catch {
+          // status 失败时不动 progress（保留上次值）
+        }
+      }, 2000);
+
+      this.$nextTick(() => {
+        if (this.$refs.timelineCanvas) {
+          this.$refs.timelineCanvas.addEventListener("click", (ev) => {
+            if (!this.playback.progress?.total_ms) return;
+            const rect = ev.currentTarget.getBoundingClientRect();
+            const xRatio = Math.max(0, Math.min(1,
+              (ev.clientX - rect.left) / rect.width));
+            const virtMs = Math.floor(xRatio * this.playback.progress.total_ms);
+            this.seekTo(virtMs);
+          });
         }
       });
     },
@@ -822,6 +874,42 @@ function dashboard() {
         .finally(() => { this.timeline.loading = false; });
     },
 
+    async togglePause() {
+      if (this.playback.busy || !this.playback.progress) return;
+      this.playback.busy = true;
+      const path = this.playback.progress.paused
+        ? "/api/play/resume" : "/api/play/pause";
+      try {
+        await this.callApi("POST", path, {});
+      } catch (e) {
+        this.flights.error = `${path} 失败: ${e.detail || e.message || e}`;
+      } finally {
+        this.playback.busy = false;
+      }
+    },
+
+    async seekTo(virtMs) {
+      if (this.playback.busy) return;
+      this.playback.busy = true;
+      try {
+        await this.callApi("POST", "/api/play/seek",
+          {virt_ms: Math.max(0, Math.floor(virtMs))});
+      } catch (e) {
+        this.flights.error = `seek 失败: ${e.detail || e.message || e}`;
+      } finally {
+        this.playback.busy = false;
+      }
+    },
+
+    formatProgress(p) {
+      const fmt = ms => {
+        if (ms == null) return "?";
+        const s = Math.floor(ms / 1000);
+        return `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+      };
+      return `${fmt(p.virt_ms)} / ${fmt(p.total_ms)}`;
+    },
+
     downloadTimelineCsv() {
       const params = new URLSearchParams({
         source: this.timeline.source,
@@ -863,6 +951,19 @@ function dashboard() {
         ctx.fillStyle = e.kind === "event" ? "#d4351c" : "#1d70b8";
         ctx.fillRect(x - 2, y, 4, laneH * 0.8);
       });
+
+      // Phase 3 A — 播放头红线（暂停时变黄）。
+      // 用 rect.* (CSS 像素) 而非 canvas.* (物理像素)——ctx 已被 ctx.scale(dpr,dpr) 缩放。
+      if (this.playback.progress && this.playback.progress.total_ms) {
+        const p = this.playback.progress;
+        const xRatio = Math.min(1, p.virt_ms / p.total_ms);
+        const x = xRatio * rect.width;
+        ctx.strokeStyle = p.paused ? "#ffd24d" : "#ff6b6b";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, 0); ctx.lineTo(x, rect.height);
+        ctx.stroke();
+      }
     },
   };
 }

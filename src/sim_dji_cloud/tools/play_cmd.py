@@ -15,6 +15,7 @@ async def play_flight(
     start_offset_ms: int,
     video_push_url: str | None = None,
     video_anchor_offset_ms: int = 0,
+    control_sidecar_path: Path | None = None,
 ) -> int:
     parsed = urlparse(mqtt_url)
     if parsed.scheme not in ("tcp", "mqtt"):
@@ -31,6 +32,7 @@ async def play_flight(
         start_offset_ms=start_offset_ms,
         video_push_url=video_push_url,
         video_anchor_offset_ms=video_anchor_offset_ms,
+        control_sidecar_path=control_sidecar_path,
     )
 
     # 接 SIGINT / SIGTERM：Python 默认对 SIGTERM 是"立即终止"，

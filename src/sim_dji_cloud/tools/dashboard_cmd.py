@@ -69,6 +69,23 @@ def run_dashboard(
         default_video_push_url=default_video_push_url,
     )
 
+    @app.on_event("startup")
+    async def _start_progress_polling():
+        import asyncio
+        app.state._progress_task = asyncio.create_task(
+            play_controller.start_progress_polling())
+
+    @app.on_event("shutdown")
+    async def _stop_progress_polling():
+        import asyncio
+        t = getattr(app.state, "_progress_task", None)
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
     sub_holder: dict = {"sub": None}
 
     @app.on_event("startup")
