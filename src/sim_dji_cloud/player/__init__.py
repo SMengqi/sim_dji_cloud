@@ -276,8 +276,23 @@ class Player:
         if plan is None:
             return
         plan = dict(plan)
-        plan["ss_seconds"] = max(0, self._scheduler.virt_now_ms() / 1000.0)
-        plan["wait_virt_ms"] = self._scheduler.virt_now_ms()
+        # video_offset_in_flight_ms: how many ms into flight virt-time does the
+        # video file's frame-0 correspond to.  Matches the same field plan_video_push
+        # reads (video["started_at_recv_ms"] - manifest["started_at_recv_ms"]).
+        started_at = self._manifest.get("started_at_recv_ms") or 0
+        video_started_recv_ms = video_meta.get("started_at_recv_ms") or started_at
+        video_offset_in_flight_ms = video_started_recv_ms - started_at
+        seek_virt = self._scheduler.virt_now_ms()
+        # ss_seconds: which second within the video file to seek to so that
+        # frame-0 of the pushed stream corresponds to the current seek target.
+        plan["ss_seconds"] = max(0.0, (seek_virt - video_offset_in_flight_ms) / 1000.0)
+        # wait_virt_ms: apply the same anchor_offset compensation as initial play.
+        # Negative anchor_offset_ms means "launch ffmpeg earlier in virt-time to
+        # compensate the RTMP→SRS→mpegts.js pipeline delay".  If the result is
+        # below seek_virt, wait_until_virt returns immediately and ffmpeg launches
+        # as fast as possible — the same behaviour as initial play when anchor
+        # offset pushed the wait before play start.
+        plan["wait_virt_ms"] = seek_virt + self._video_anchor_offset_ms
         self._video_task = asyncio.create_task(
             self._run_video_push(plan, video_file))
 

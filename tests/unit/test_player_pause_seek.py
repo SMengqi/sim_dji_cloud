@@ -255,6 +255,92 @@ async def test_player_seek_records_fire_at_expected_wall_time(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_player_seek_video_restart_uses_anchor_offset(tmp_path, monkeypatch):
+    """Regression: seek should restart ffmpeg with anchor_offset_ms compensation
+    applied (so video pipeline delay doesn't accumulate per seek vs initial play).
+    Real-machine 2026-06-04: after seek(180000) then seek(0), trail vs video
+    drift accumulated several seconds."""
+    flight = _make_flight(tmp_path, [1000, 1100, 1500, 2000])
+
+    # Manifest needs video segment for plan_video_push to return non-None.
+    # Add minimal video metadata.
+    manifest_path = flight / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    # video["started_at_recv_ms"] = 1200 → video_offset_in_flight = 1200-1000 = 200ms
+    manifest["video"] = {
+        "file": "video/main.mp4",
+        "started_at_recv_ms": 1200,   # video starts 200ms into the flight
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    (flight / "video").mkdir()
+    (flight / "video" / "main.mp4").write_bytes(b"fake-mp4")
+
+    # Stub plan_video_push to always return a minimal plan (avoids file checks)
+    import sim_dji_cloud.player as player_mod
+    monkeypatch.setattr(player_mod, "plan_video_push",
+                        lambda *a, **kw: {"wait_virt_ms": 0, "ss_seconds": 0.0})
+
+    # Capture what plan was passed to _run_video_push
+    captured_plans = []
+
+    async def _capture(self, plan, video_file):
+        captured_plans.append(dict(plan))
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+
+    monkeypatch.setattr(Player, "_run_video_push", _capture)
+
+    pub = _FakePublisher()
+    p = Player(flight_dir=flight, publisher=pub, speed=10.0,
+               video_push_url="rtmp://fake/test",
+               video_anchor_offset_ms=-4000)
+    await p.start()
+    # Yield to the event loop so the initial video task coroutine runs to its
+    # first await (asyncio.sleep(10) inside _capture) and appends its plan.
+    await asyncio.sleep(0)
+    # Should have captured initial plan (from p.start)
+    assert len(captured_plans) == 1, captured_plans
+
+    # Seek mid-flight (500ms into the 1000ms flight)
+    await p.seek(500)
+    # Yield so the new video task coroutine runs to its first await and appends its plan.
+    await asyncio.sleep(0)
+    # Should have captured a SECOND plan from _restart_video_at_current_virt
+    assert len(captured_plans) == 2, captured_plans
+
+    restart_plan = captured_plans[1]
+    # wait_virt_ms should be 500 + (-4000) = -3500, NOT the raw seek target 500
+    assert restart_plan["wait_virt_ms"] != 500, (
+        f"_restart_video_at_current_virt dropped anchor_offset_ms; "
+        f"wait_virt_ms = {restart_plan['wait_virt_ms']} equals raw seek_target=500"
+    )
+    assert restart_plan["wait_virt_ms"] == -3500, (
+        f"wait_virt_ms should be seek_target + anchor_offset = 500 + (-4000) = -3500; "
+        f"got {restart_plan['wait_virt_ms']}"
+    )
+    # ss_seconds: seek(500) with video_offset_in_flight=200ms → (500-200)/1000 = 0.3s
+    assert abs(restart_plan["ss_seconds"] - 0.3) < 0.01, (
+        f"ss_seconds should be (seek_virt - video_offset_in_flight) / 1000 = "
+        f"(500 - 200) / 1000 = 0.3; got {restart_plan['ss_seconds']}"
+    )
+
+    # cleanup
+    for t in p._tasks:
+        t.cancel()
+    if p._video_task:
+        p._video_task.cancel()
+    try:
+        await asyncio.gather(*p._tasks, *(
+            [p._video_task] if p._video_task else []
+        ), return_exceptions=True)
+    except Exception:
+        pass
+    await p.wait_until_done()
+
+
+@pytest.mark.asyncio
 async def test_player_seek_does_not_publish_idle_marker(tmp_path):
     """Regression test for race where Player.seek cancelling tasks made
     Player.wait_until_done's gather return prematurely, triggering its
