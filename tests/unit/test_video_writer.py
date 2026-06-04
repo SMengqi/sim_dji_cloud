@@ -114,7 +114,10 @@ def test_long_running_ffmpeg_is_in_manifest(tmp_path: Path):
 
     with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen") as popen_mock, \
          patch("sim_dji_cloud.recorder.video_writer.time.time", return_value=fake_now):
-        proc = _running_proc()
+        # progress reader 必须看到至少一行非零 out_time_us 才会置
+        # segment.had_any_frames=True，manifest 才保留 video 段。模拟
+        # ffmpeg 真录到帧（vs RTMP 握手成 + 立即 demuxing I/O error 的空壳）。
+        proc = _running_proc(stdout=_progress_stdout(b"out_time_us=100000\n"))
 
         def side_effect(*args, **kwargs):
             launched_event.set()
@@ -153,7 +156,9 @@ def test_long_running_ffmpeg_is_in_manifest(tmp_path: Path):
 def test_fast_fail_then_success_keeps_only_the_success(tmp_path: Path):
     video_dir = tmp_path / "video"
     fail_proc = _exited_proc(exit_code=1)
-    run_proc = _running_proc()
+    # 第二次成功跑的 ffmpeg 必须有 progress 数据，segment.had_any_frames
+    # 才会置 True；新语义下没有这个 flag manifest 跳过 video 段。
+    run_proc = _running_proc(stdout=_progress_stdout(b"out_time_us=100000\n"))
     second_launched = threading.Event()
 
     call_count = {"n": 0}
@@ -1430,3 +1435,121 @@ def test_rename_failure_leaves_placeholder_but_patches_manifest_ts(tmp_path: Pat
     )
     # File field still references the placeholder (truthful about what's on disk).
     assert block["file"] == f"video/main_{expected_launch_ms}.mp4"
+
+
+# ---------------------------------------------------------------------------
+# 17.10. 真机 2026-06-04 复现：ffmpeg 跑够 15s 但 progress reader 没拿到任何
+#        非零 out_time_us（"0 usable out_time_* observations but none > 0"）。
+#        典型场景：RTMP 握手成 + 拿到 stream metadata，但 demuxing I/O error
+#        立即断开 → mp4 文件 ~800B 只有 moov header。新行为：
+#        1) supervisor 仍判 completed 不 retry（避免坏源死循环）+ warning
+#        2) 文件保留在盘上给诊断
+#        3) manifest.video 跳过这一段（had_any_frames=False），dashboard
+#           不会拿空壳去回放
+# ---------------------------------------------------------------------------
+
+def test_empty_shell_mp4_skipped_in_manifest(tmp_path: Path):
+    """ffmpeg 跑够阈值但没出帧 → mp4 留盘但 manifest 不写 video 段。"""
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+    expected_launch_ms = 1780561889077
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        # 模拟 ffmpeg 写了 800 B moov header 就断
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 800)
+        # _empty_stdout = progress reader 读 0 行非零 out_time_us
+        # → had_any_frames 保持 False
+        proc = _running_proc(stdout=_empty_stdout())
+        launched_event.set()
+        return proc
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time",
+               return_value=expected_launch_ms / 1000.0):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=0.05,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    # 1. mp4 文件保留给诊断（用户明确要求）
+    placeholder = video_dir / f"main_{expected_launch_ms}.mp4"
+    assert placeholder.exists(), "空壳 mp4 应保留在盘上给诊断"
+
+    # 2. timing.json 仍写所有 segment 字段（had_any_frames=False 可见）
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    assert len(timing["segments"]) == 1
+    seg = timing["segments"][0]
+    assert seg["had_any_frames"] is False, (
+        "无非零 out_time_us 且 ffprobe 也没救回来 → had_any_frames 必须 False"
+    )
+
+    # 3. manifest.video 跳过这一段
+    block = vw.manifest_video_block(duration_ms=16000)
+    assert block["file"] is None, "had_any_frames=False → manifest 跳过 video 段"
+    assert block["started_at_recv_ms"] is None
+    assert block["popen_at_recv_ms"] is None
+    assert block["segments"] == []
+    # source_url 仍保留以便诊断
+    assert block["source_url"] == "rtmp://example/live/abc"
+
+
+def test_sanity_rejected_back_calc_still_keeps_manifest_video(tmp_path: Path):
+    """对照组：back-calc sanity reject (start==popen) 但 progress reader
+    见过非零 out_time_us → had_any_frames=True → manifest 仍写 video 段，
+    锚点 fallback 到 popen-time。区分"真录到但 ts 不准"vs"完全空壳"。"""
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+    expected_launch_ms = 5_000_000
+
+    times = iter([5000.000, 5005.000, 5098.000])
+    progress_lines = (
+        # 这两条会让 back-calc 算出负数 → sanity reject
+        b"out_time_us=5293000\n",
+        b"out_time_us=93270000000\n",
+    )
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out_path = Path(cmd[-1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00" * 256)
+        proc = _running_proc(stdout=_progress_stdout(*progress_lines))
+        launched_event.set()
+        return proc
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               side_effect=side_effect), \
+         patch("sim_dji_cloud.recorder.video_writer.time.time",
+               side_effect=lambda: next(times, 5098.000)):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=10.0,
+        )
+        vw.start()
+        assert launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    seg = timing["segments"][0]
+    # sanity reject → start == popen，但出过帧 → had_any_frames=True
+    assert seg["ffmpeg_start_wall_ms"] == seg["ffmpeg_popen_wall_ms"]
+    assert seg["had_any_frames"] is True
+
+    # manifest 仍写 video 段，popen-time 作锚点
+    block = vw.manifest_video_block(duration_ms=98000)
+    assert block["file"] is not None, (
+        "sanity-rejected 但出过帧 → manifest 应保留 video 段"
+    )
+    assert block["started_at_recv_ms"] == expected_launch_ms
+    assert block["popen_at_recv_ms"] == expected_launch_ms

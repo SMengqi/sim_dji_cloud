@@ -255,28 +255,46 @@ class VideoWriter:
         self._write_timing()
 
     def manifest_video_block(self, duration_ms: int) -> dict:
-        """Return ``manifest.video`` block. ``file=None`` & ``segments=[]`` if no
-        ffmpeg attempt was ever classified as successful.
+        """Return ``manifest.video`` block. ``file=None`` & ``segments=[]`` if
+        no ffmpeg attempt was ever classified as successful, OR if ffmpeg ran
+        long enough (≥ ``success_min_seconds``) but never produced a first
+        frame (``ffmpeg_start_wall_ms == ffmpeg_popen_wall_ms`` — supervisor
+        keeps the partial mp4 on disk for diagnostics but we refuse to lie to
+        downstream consumers about there being playable video).
 
         Reads filename from the segment list (not ``self._filename``) so the
         block is consistent with what's on disk even if rename happened in a
         different thread.
         """
+        empty_block = {
+            "file": None,
+            "source_url": self.source_url,
+            "started_at_recv_ms": None,
+            "popen_at_recv_ms": None,
+            "duration_ms": duration_ms,
+            "segments": [],
+        }
         with self._state_lock:
             if not self._segments:
-                return {
-                    "file": None,
-                    "source_url": self.source_url,
-                    "started_at_recv_ms": None,
-                    "popen_at_recv_ms": None,
-                    "duration_ms": duration_ms,
-                    "segments": [],
-                }
+                return empty_block
             seg = self._segments[0]
             started = seg["ffmpeg_start_wall_ms"]
             # 老段（升级前的 timing.json）可能没有 ffmpeg_popen_wall_ms 字段，
             # 这种情况下退回 started_at_recv_ms（语义上视频"开始拉流"≈"已开始录"）。
             popen = seg.get("ffmpeg_popen_wall_ms", started)
+            # had_any_frames=False = progress reader 和 ffprobe 都没找到任何
+            # 帧数据。空壳 mp4，不让 dashboard 拿去回放。
+            # 注：sanity-rejected back-calc (start==popen 但确实出过帧) 仍
+            # had_any_frames=True，video 段保留，popen-time 作为锚点 fallback。
+            # 老段缺字段时按"出过帧"放行，保证向后兼容。
+            if not seg.get("had_any_frames", True):
+                logger.warning(
+                    "manifest.video skipped: first segment has no detected "
+                    "frames (had_any_frames=False, popen_wall_ms={}). "
+                    "Partial mp4 file {} is kept on disk for diagnostics.",
+                    popen, seg.get("file"),
+                )
+                return empty_block
             video_rel = f"video/{seg['file']}"
         return {
             "file": video_rel,
@@ -324,10 +342,33 @@ class VideoWriter:
             # Classify by how long it ran.
             ran_sec = time.monotonic() - launch_t
             if ran_sec >= self._success_min_seconds:
-                logger.info(
-                    "ffmpeg exited after {:.1f}s (≥ {}s) — treating as completed recording",
-                    ran_sec, self._success_min_seconds,
-                )
+                # ≥ 15s 不再 retry，但区分"真录到"vs"撑住了但没出帧"。
+                # had_any_frames 由 progress reader（看到非零 out_time_us）或
+                # ffprobe（duration > 0）置位。两路都没置 → 空壳 mp4。真机场景：
+                # RTMP 握手成功 + stream metadata 拿到，但 demuxing I/O error
+                # 立即断开 → mp4 文件 ~800B 只有 moov header，无视频帧。
+                # ffprobe 在 stop() 才跑，所以这里只看 in-band 标志；ffprobe
+                # 后续如果也算不出 duration，manifest_video_block 会再次兜底
+                # 跳过 video 段。
+                with self._state_lock:
+                    no_first_frame = (
+                        bool(self._segments)
+                        and not self._segments[-1].get("had_any_frames", False)
+                    )
+                if no_first_frame:
+                    logger.warning(
+                        "ffmpeg exited after {:.1f}s (≥ {}s) but progress reader "
+                        "got no first frame — RTMP source likely connected then "
+                        "stalled (e.g. demuxing I/O error). Keeping partial mp4 "
+                        "for diagnostics; manifest.video will skip if ffprobe "
+                        "also fails to confirm any frames.",
+                        ran_sec, self._success_min_seconds,
+                    )
+                else:
+                    logger.info(
+                        "ffmpeg exited after {:.1f}s (≥ {}s) — treating as completed recording",
+                        ran_sec, self._success_min_seconds,
+                    )
                 return
 
             logger.warning(
@@ -380,8 +421,14 @@ class VideoWriter:
                 # 比较两种 anchor 哪种实测同步效果更好。
                 "ffmpeg_popen_wall_ms": launch_ms,
                 # ffmpeg_start_wall_ms：默认与 popen 相同，progress reader 拿到
-                # 第一帧后会被 patch 成"第一帧到达"的墙钟。
+                # 第一帧后会被 patch 成"第一帧到达"的墙钟。即使 back-calc 被
+                # sanity reject（值留 = popen），had_any_frames 仍为 True，下游
+                # 据此判断"录到了，只是不知道精确锚点"vs"完全空壳"。
                 "ffmpeg_start_wall_ms": launch_ms,
+                # 真有视频数据到达的 marker。progress reader 看到任一非零
+                # out_time_us 时置 True；ffprobe 算出 duration > 0 也置 True。
+                # 空壳 mp4（RTMP 握手成 + demuxing I/O error 立即断）保持 False。
+                "had_any_frames": False,
                 "pts_offset_ms": 0,
             })
         logger.info("ffmpeg launched: video/{} (pid={})", placeholder_filename, self._proc.pid)
@@ -516,6 +563,15 @@ class VideoWriter:
                 if first_us is None:
                     first_us = us
                     first_observed_at_ms = now_ms
+                    # 第一次见到非零 out_time_us = ffmpeg 真出了帧。
+                    # 即使后面 back-calc 被 sanity reject，had_any_frames
+                    # 仍为 True，manifest 会保留 video 段（用 popen-time
+                    # 作锚点 fallback）。
+                    with self._state_lock:
+                        if (self._segments
+                                and self._segments[-1]["file"]
+                                == placeholder_filename):
+                            self._segments[-1]["had_any_frames"] = True
                 last_us = us
                 last_observed_at_ms = now_ms
         except Exception:
@@ -696,6 +752,14 @@ class VideoWriter:
             first_frame_wall_ms, exit_wall_ms, duration_ms,
             first_frame_wall_ms - popen_wall_ms,
         )
+        # ffprobe 算出 duration > 0 = mp4 里实际有视频帧。即使 in-band
+        # progress reader 没拿到一条非零 out_time_us（典型场景 ffmpeg 太老 /
+        # progress 走 stderr），ffprobe 这一路确认了 had_any_frames。
+        if duration_ms > 0:
+            with self._state_lock:
+                if (self._segments
+                        and self._segments[-1]["file"] == current_filename):
+                    self._segments[-1]["had_any_frames"] = True
         self._rename_to_first_frame_time(current_filename, first_frame_wall_ms)
 
     def _probe_duration_ms(self, file_path: Path) -> Optional[int]:
