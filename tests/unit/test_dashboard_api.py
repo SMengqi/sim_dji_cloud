@@ -565,3 +565,29 @@ def test_index_html_default_video_push_url_empty_when_not_set(tmp_path):
     r = c.get("/")
     assert r.status_code == 200
     assert 'name="default-video-push-url" content=""' in r.text
+
+
+def test_index_html_default_video_push_url_is_html_escaped(tmp_path):
+    """恶意 default_video_push_url 不应能闭合属性注入 HTML 事件。
+
+    XSS 回归：早期 f-string 直接拼到 <meta content="...">，传入
+    'x" onmouseover="alert(1)' 即可闭合属性注入。修复后 " 必须被转义。
+    """
+    from fastapi.testclient import TestClient
+    from sim_dji_cloud.dashboard.api import create_app
+    from sim_dji_cloud.dashboard.live_state import LiveState
+
+    hostile = 'x" onmouseover="alert(1)'
+    state = LiveState()
+    app = create_app(
+        state=state,
+        recordings_root=tmp_path,
+        default_video_push_url=hostile,
+    )
+    c = TestClient(app)
+    r = c.get("/")
+    assert r.status_code == 200
+    # 关键：原始 payload 不能 verbatim 出现（出现就说明没转义 → 属性闭合 → 事件注入）
+    assert hostile not in r.text
+    # 必须有 HTML 实体转义的引号
+    assert '&quot;' in r.text or '&#34;' in r.text

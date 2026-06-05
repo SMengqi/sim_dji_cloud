@@ -155,3 +155,18 @@ def test_manifest_finalize_rejects_bad_status(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="status must be"):
         mb.finalize(ended_at_recv_ms=100, finalize_reason="x", status="bogus")
+
+
+def test_manifest_finalize_is_atomic_no_tmp_leak(tmp_path: Path):
+    """finalize 写入后不应在飞行目录留下 manifest.json.tmp 残留。
+
+    Regression for non-atomic write: 早期直接 write_text，崩溃中途留下截断 JSON
+    打挂 inspect/list/play/selfcheck。修复改走 atomic_write_text。
+    """
+    mb = ManifestBuilder(
+        flight_dir=tmp_path, task_id="T1",
+        dock_sn="D1", drone_sn="A1", started_at_recv_ms=0,
+    )
+    mb.finalize(ended_at_recv_ms=100, finalize_reason="task_idle", status="ok")
+    assert (tmp_path / "manifest.json").exists()
+    assert not (tmp_path / "manifest.json.tmp").exists()

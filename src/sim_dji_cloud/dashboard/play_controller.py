@@ -81,15 +81,17 @@ class PlayController:
             cmd += ["--video-anchor-offset-ms", str(video_anchor_offset_ms)]
         cmd += ["--control-sidecar-path", str(self._control_sidecar)]
 
-        log_fp = open(log_path, "ab")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fp,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log_fp.close()
+        # with-block 保证 Popen 抛错时 log_fp 被关；Popen 已 dup 了 fd，
+        # Python 句柄关闭不影响子进程继续写。
+        # Regression: test_start_closes_log_fp_when_popen_fails.
+        with open(log_path, "ab") as log_fp:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
 
         self._pid_file.write_text(f"{proc.pid}\n")
         started_at_ms = int(time.time() * 1000)

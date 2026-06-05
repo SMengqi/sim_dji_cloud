@@ -70,6 +70,26 @@ def test_start_rejects_nonexistent_flight_dir(tmp_path):
         pc.start("no_such_dir")
 
 
+def test_start_closes_log_fp_when_popen_fails(tmp_path):
+    """Popen 抛错时 log_fp 必须被关掉 —— FD 泄漏回归。
+
+    旧实现 `log_fp = open(...); proc = Popen(...); log_fp.close()` 中间无
+    try/finally；Popen 抛 FileNotFoundError（sim-dji 不在 PATH）时 close
+    永不执行，每次失败启动泄漏一个 FD。修复改用 with open(...) 包 Popen。
+    """
+    pc, _ = _make_pc(tmp_path)
+    mock_fp = MagicMock()
+    mock_fp.__enter__ = MagicMock(return_value=mock_fp)
+    mock_fp.__exit__ = MagicMock(return_value=False)
+    with patch("sim_dji_cloud.dashboard.play_controller.open",
+               create=True, return_value=mock_fp), \
+         patch("sim_dji_cloud.dashboard.play_controller.subprocess.Popen",
+               side_effect=FileNotFoundError("sim-dji not in PATH")):
+        with pytest.raises(FileNotFoundError):
+            pc.start("flight_A")
+    assert mock_fp.close.called or mock_fp.__exit__.called
+
+
 def test_stop_sends_sigterm_and_clears_files(tmp_path):
     pc, _ = _make_pc(tmp_path)
     (tmp_path / "logs").mkdir(exist_ok=True)

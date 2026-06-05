@@ -325,7 +325,24 @@ class VideoWriter:
         """
         while not self._stop_event.is_set():
             launch_t = time.monotonic()
-            self._launch_ffmpeg()
+            try:
+                self._launch_ffmpeg()
+            except FileNotFoundError as e:
+                # ffmpeg 不在 PATH。retry 救不了，明确告警后退出循环 —
+                # 比让 daemon 线程静默死亡好太多。
+                # Regression: test_supervisor_logs_warning_when_ffmpeg_missing.
+                logger.error(
+                    "video supervisor: ffmpeg executable not found ({}); "
+                    "no video will be recorded. Install ffmpeg and restart.",
+                    e,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "video supervisor: unexpected error launching ffmpeg; "
+                    "stopping video recording for this flight"
+                )
+                return
 
             # Wait until ffmpeg exits OR stop() fires. 0.5 s tick keeps stop()
             # latency low without busy-spinning.

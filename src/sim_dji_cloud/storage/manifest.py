@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from sim_dji_cloud.storage.atomic_write import atomic_write_text
+
 SCHEMA_VERSION = 1
 REQUIRED_FIELDS = [
     "schema_version", "status", "finalize_reason",
@@ -89,8 +91,11 @@ class ManifestBuilder:
         self._data["finalize_reason"] = finalize_reason
         self._data["status"] = status
         self.flight_dir.mkdir(parents=True, exist_ok=True)
-        (self.flight_dir / "manifest.json").write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2)
+        # 原子写：tmp + fsync + os.replace；崩溃中途留下完整旧版或完整新版，
+        # 永不截断。下游 inspect/list/play/selfcheck/repair 全部读 manifest.json。
+        atomic_write_text(
+            self.flight_dir / "manifest.json",
+            json.dumps(self._data, ensure_ascii=False, indent=2),
         )
         self._finalized = True
 

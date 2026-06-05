@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import html
 import io
 import json
 from datetime import datetime, timezone
@@ -96,13 +97,18 @@ def create_app(
             return HTMLResponse(
                 "<!doctype html><html><body><p>dashboard ui (index.html missing)</p></body></html>"
             )
-        html = html_path.read_text(encoding="utf-8")
+        page = html_path.read_text(encoding="utf-8")
         if default_video_push_url:
-            html = html.replace(
+            # 必须 HTML-escape：default_video_push_url 来自 CLI，含 " 会闭合
+            # 属性边界注入 onmouseover 等事件（XSS）。html.escape(quote=True)
+            # 同时处理 < > & " '。pinned by
+            # test_index_html_default_video_push_url_is_html_escaped。
+            safe = html.escape(default_video_push_url, quote=True)
+            page = page.replace(
                 '<meta name="default-video-push-url" content="">',
-                f'<meta name="default-video-push-url" content="{default_video_push_url}">',
+                f'<meta name="default-video-push-url" content="{safe}">',
             )
-        return HTMLResponse(html)
+        return HTMLResponse(page)
 
     @app.websocket("/ws/stream")
     async def ws_stream(ws: WebSocket) -> None:

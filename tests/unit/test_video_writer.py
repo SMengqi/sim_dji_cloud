@@ -73,6 +73,45 @@ def _make_partial_file(cmd: list, content: bytes = b"") -> Path:
 # 1. Eager launch: ffmpeg starts immediately, no probe gate
 # ---------------------------------------------------------------------------
 
+def test_supervisor_logs_warning_when_ffmpeg_missing(tmp_path: Path):
+    """ffmpeg 不在 PATH → Popen 抛 FileNotFoundError；supervisor 不能静默死。
+
+    Regression: 旧代码 _launch_ffmpeg 抛错直接传到 daemon 线程顶层，
+    线程死、retry 永不触发、用户看不到任何提示，timing.json 空白。
+    修复加 try/except 包 _launch_ffmpeg，明确日志 + 退出循环。
+    """
+    from loguru import logger
+
+    video_dir = tmp_path / "video"
+    captured: list[str] = []
+    sink_id = logger.add(lambda msg: captured.append(str(msg)), level="ERROR")
+
+    try:
+        with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+                   side_effect=FileNotFoundError("ffmpeg")):
+            vw = VideoWriter(
+                source_url="rtmp://example/live/abc",
+                output_dir=video_dir,
+                retry_interval_s=0.001,
+                success_min_seconds=0.05,
+            )
+            vw.start()
+            time.sleep(0.3)
+            vw.stop()
+    finally:
+        logger.remove(sink_id)
+
+    combined = " ".join(captured).lower()
+    assert "ffmpeg" in combined
+    assert any(k in combined for k in (
+        "missing", "not found", "no such", "executable", "not in path",
+    )), f"expected explicit ffmpeg-missing diagnostic, got: {combined!r}"
+    # manifest 必须显式跳过 video（file=None / segments=[]，CLAUDE.md 文档约定）
+    block = vw.manifest_video_block(duration_ms=10000)
+    assert block["file"] is None
+    assert block["segments"] == []
+
+
 def test_eager_launch_no_probe_gate(tmp_path: Path):
     video_dir = tmp_path / "video"
     launched_event = threading.Event()

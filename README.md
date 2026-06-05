@@ -44,7 +44,7 @@ sim-dji stop-record T-2026-001
 
 或者直接 Ctrl-C，会触发优雅 finalize。
 
-产出目录：`./recordings/<task_id>__<dock_sn>__<YYYYMMDD-HHMMSS>/`
+产出目录：`./recordings/<dock_sn>_<YYYYMMDD-HHMMSS>/`（`task_id` 进 `manifest.json`；连续录制多任务同一进程内每段一个目录。旧版 `<task_id>__<dock_sn>__<ts>/` 仍能被 inspect/play 读出。）
 
 ```
 <flight_dir>/
@@ -298,7 +298,7 @@ sim-dji play ./recordings/<flight> --mqtt-url tcp://localhost:1883 \
 
 ## 📖 完整操作手册
 
-所有 8 个 CLI 子命令的详细用法、配置说明、完整工作流、故障排查矩阵、数据契约速查见：
+所有 9 个 CLI 子命令的详细用法、配置说明、完整工作流、故障排查矩阵、数据契约速查见：
 
 **[../2026-05-21-sim-dji-cloud-operations-manual.md](../2026-05-21-sim-dji-cloud-operations-manual.md)**
 

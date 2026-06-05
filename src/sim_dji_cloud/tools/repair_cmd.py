@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from sim_dji_cloud.storage.atomic_write import atomic_write_text
+
 
 _DIR_RE_LEGACY = re.compile(r"^(.+?)__(.+?)__(\d{8}-\d{6})$")
 _DIR_RE_NEW = re.compile(r"^(.+)_(\d{8}-\d{6})(?:_\d{3})?$")
@@ -125,6 +127,6 @@ def repair_flight(flight_dir: Path, force: bool = False) -> int:
         "topics": topics,
         "video": None,
     }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
     print(f"repaired manifest written: {manifest_path}")
     return 0
