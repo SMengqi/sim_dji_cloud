@@ -1,4 +1,8 @@
-"""回放端视频推流：把 video/main.mp4 用 ffmpeg -re -c copy 推到 RTMP（SRS）。"""
+"""回放端视频推流：把 `manifest.video.file` 指向的 mp4 用 ffmpeg -re -c copy 推到 RTMP（SRS）。
+
+实际文件名形如 `video/main_<epoch_ms>.mp4`（epoch_ms 是首帧 wall 时间锚）；
+旧录制可能为 `video/main.mp4`。下游一律用 manifest 里的 file 字段，不要 hardcode。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +44,10 @@ def plan_video_push(
         logger.warning("manifest.video 为空，跳过视频推流")
         return None
     if not file_exists:
-        logger.warning("video/main.mp4 不存在，跳过视频推流")
+        logger.warning(
+            "manifest.video.file ({}) 在 flight_dir 下不存在，跳过视频推流",
+            video.get("file", "<unknown>"),
+        )
         return None
     base = video.get("started_at_recv_ms", 0) - manifest.get("started_at_recv_ms", 0)
     offset = max(0, base + anchor_offset_ms)

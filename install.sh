@@ -107,11 +107,16 @@ sim-dji --help 2>&1 | grep -E "^  (record|stop-record|inspect|validate-config|pl
 hr
 
 # ---------- 7. 单元测试 ----------
+# Regression (review MAJOR): 旧写法 `if pytest ... | tail -3; then` 检的是
+# tail 的退出码（永远 0），pytest 红了也"成功"。用 ${PIPESTATUS[0]} 拿 pytest
+# 真实退出码。
 say "跑单元测试（跳过集成测试，需要 mosquitto）..."
-if pytest tests/unit/ -q --tb=line 2>&1 | tail -3; then
+pytest tests/unit/ -q --tb=line 2>&1 | tail -3
+pytest_rc="${PIPESTATUS[0]}"
+if [[ "$pytest_rc" -eq 0 ]]; then
     say "  单元测试通过"
 else
-    warn "  单元测试有失败（看上面输出）"
+    warn "  单元测试有失败（退出码 $pytest_rc；看上面输出）"
 fi
 hr
 

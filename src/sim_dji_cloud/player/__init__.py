@@ -12,6 +12,14 @@ from sim_dji_cloud.player.video_pusher import VideoPusher, plan_video_push
 from sim_dji_cloud.player.control_server import ControlServer
 
 
+class PlayerError(Exception):
+    """Player 启动 / 运行时的预期错误（manifest 缺失 / 损坏 / 路径错等）。
+
+    CLI 路径接住翻成 print + exit 2；不要让原生 FileNotFoundError /
+    JSONDecodeError 冒到 Python 顶层 traceback。
+    """
+
+
 class _PublisherProto(Protocol):
     async def connect(self) -> None: ...
     async def publish(self, topic: str, payload: bytes, qos: int = 0) -> None: ...
@@ -63,7 +71,27 @@ class Player:
         self._seek_lock = self._control_lock
 
     async def start(self) -> None:
-        self._manifest = json.loads((self.flight_dir / "manifest.json").read_text())
+        # manifest 是 player 的硬依赖；缺失 / 损坏 / 不可读时给 CLI 用户一个
+        # 清晰的中文错误而不是原始 Python traceback。
+        # Regression: test_start_raises_player_error_on_missing_manifest /
+        #             test_start_raises_player_error_on_malformed_manifest.
+        manifest_path = self.flight_dir / "manifest.json"
+        try:
+            manifest_text = manifest_path.read_text()
+        except FileNotFoundError as e:
+            raise PlayerError(
+                f"flight_dir 不存在或缺少 manifest.json: {self.flight_dir}"
+            ) from e
+        except OSError as e:
+            raise PlayerError(
+                f"无法读取 manifest.json ({manifest_path}): {e}"
+            ) from e
+        try:
+            self._manifest = json.loads(manifest_text)
+        except json.JSONDecodeError as e:
+            raise PlayerError(
+                f"manifest.json 损坏 ({manifest_path}): {e}"
+            ) from e
         await self._publisher.connect()
 
         started_at = self._manifest.get("started_at_recv_ms", 0)
@@ -203,8 +231,13 @@ class Player:
             if not self._scheduler.paused:
                 raise RuntimeError("not paused")
             self._scheduler.resume()
-            await self._restart_video_at_current_virt()
-            return {"state": "running", "virt_ms": self._scheduler.virt_now_ms()}
+            # Snapshot virt 立即取，传给 _restart —— restart 内部还要 cancel/await
+            # 老 video task + aclose 老 pusher，期间 virt 会按 wall 推进。
+            # 用 snapshot 让视频 ss_seconds 跟 resume 时刻精确对齐而不是落在
+            # await 之后（review MAJOR: 视频起点比 MQTT 落后数秒）。
+            target_virt = self._scheduler.virt_now_ms()
+            await self._restart_video_at_current_virt(at_virt_ms=target_virt)
+            return {"state": "running", "virt_ms": target_virt}
 
     async def seek(self, virt_ms: int) -> dict:
         async with self._control_lock:
@@ -236,7 +269,10 @@ class Player:
                 self._tasks.append(task)
 
             if not self._scheduler.paused:
-                await self._restart_video_at_current_virt()
+                # 用 seek 的目标 virt_ms 作 snapshot，跟 _replay_topic_from_virt
+                # 的起点对齐；不要再调 virt_now_ms（会包含 stop_video / create_task
+                # 这段 await 推进的几十-几百 ms）。
+                await self._restart_video_at_current_virt(at_virt_ms=virt_ms)
 
             return {
                 "state": "paused" if self._scheduler.paused else "running",
@@ -273,7 +309,17 @@ class Player:
                 logger.exception("video pusher stop failed during pause/seek")
             self._video_pusher = None
 
-    async def _restart_video_at_current_virt(self) -> None:
+    async def _restart_video_at_current_virt(
+        self, *, at_virt_ms: Optional[int] = None,
+    ) -> None:
+        """Args
+        ----
+        at_virt_ms:
+            Snapshot 的 virt 时刻（resume/seek 调用方在 await 链最早处取）。
+            None 时回退到 ``self._scheduler.virt_now_ms()`` 当前值——仅给直接调用
+            兼容；resume/seek 路径必须传 snapshot 避免 await 期间 virt 推进
+            （review MAJOR）。
+        """
         video_meta = self._manifest.get("video") or {}
         video_rel = video_meta.get("file")
         video_file = (self.flight_dir / video_rel) if video_rel else None
@@ -291,7 +337,8 @@ class Player:
         started_at = self._manifest.get("started_at_recv_ms") or 0
         video_started_recv_ms = video_meta.get("started_at_recv_ms") or started_at
         video_offset_in_flight_ms = video_started_recv_ms - started_at
-        seek_virt = self._scheduler.virt_now_ms()
+        seek_virt = (at_virt_ms if at_virt_ms is not None
+                     else self._scheduler.virt_now_ms())
         # ss_seconds: which second within the video file to seek to so that
         # frame-0 of the pushed stream corresponds to the current seek target.
         plan["ss_seconds"] = max(0.0, (seek_virt - video_offset_in_flight_ms) / 1000.0)

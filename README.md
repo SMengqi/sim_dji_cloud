@@ -56,13 +56,14 @@ sim-dji stop-record T-2026-001
 │   ├── thing__product__<dock_sn>__drc__up.0001.jsonl
 │   └── ...
 └── video/
-    ├── main.mp4
-    └── main.timing.json
+    ├── main_<epoch_ms>.mp4        # 文件名 epoch_ms = 首帧 wall 时间锚
+    ├── main.timing.json           # 首帧锚来源（popen / pts-delta / ffprobe）
+    └── main.ffmpeg.log            # ffmpeg attempts 累积日志（含失败 trace）
 ```
 
 ### 主镜头视频（SRS RTMP）
 
-机场把主镜头推流到 **SRS**，recorder 飞行期间从 SRS 拉流转写到 `video/main.mp4`（ffmpeg `-c copy`）。在 `recorder.yaml` 配置真实 SRS 拉流地址：
+机场把主镜头推流到 **SRS**，recorder 飞行期间从 SRS 拉流转写到 `video/main_<epoch_ms>.mp4`（ffmpeg `-c copy`，文件名 `epoch_ms` 是首帧 wall 时间锚）。在 `recorder.yaml` 配置真实 SRS 拉流地址：
 
 ```yaml
 video:
@@ -101,36 +102,25 @@ pytest tests/integration/ -v           # 集成测试；mosquitto 未安装时 s
 
 ## 项目结构
 
+完整文件树（含 dashboard / player / selfcheck）见运维手册
+[§11 文件结构](../2026-05-21-sim-dji-cloud-operations-manual.md#11-文件结构参考)。
+顶层一览：
+
 ```
 sim_dji_cloud/
-├── pyproject.toml
-├── recorder.yaml.example
-├── README.md
+├── pyproject.toml, install.sh, run.sh, recorder.yaml(.example)
+├── README.md, CLAUDE.md
 ├── src/sim_dji_cloud/
-│   ├── cli.py                      # click 入口
-│   ├── config.py                   # YAML 加载 + ${env:VAR}
-│   ├── logging_setup.py            # loguru 配置
-│   ├── utils/time_ms.py
-│   ├── storage/
-│   │   ├── jsonl.py                # JsonlWriter / JsonlReader
-│   │   ├── rotation.py             # RotatingJsonlWriter（分卷）
-│   │   └── manifest.py             # ManifestBuilder + validator
-│   ├── recorder/
-│   │   ├── __init__.py             # Recorder 顶层编排
-│   │   ├── topic_router.py         # topic → (device_sn, source)
-│   │   ├── write_queue.py          # 每 topic 一个 asyncio queue
-│   │   ├── mqtt_client.py          # gmqtt 封装 + 断连 gap 跟踪
-│   │   ├── flight_detector.py      # 任务边界规则引擎
-│   │   ├── video_writer.py         # ffmpeg 子进程
-│   │   └── stop_signal.py          # 进程间停止信号
-│   └── tools/
-│       ├── inspect_cmd.py
-│       ├── stop_record_cmd.py
-│       └── validate_config_cmd.py
-└── tests/
-    ├── unit/                       # 单元测试
-    ├── integration/                # mosquitto 集成测试
-    └── fixtures/recorder_minimal.yaml
+│   ├── cli.py                      # 9 个 click 子命令入口
+│   ├── config.py, logging_setup.py, utils/
+│   ├── storage/                    # jsonl / rotation / manifest / atomic_write
+│   ├── recorder/                   # MQTT 录制 + flight_detector + video_writer
+│   ├── player/                     # 回放 + scheduler + video_pusher + control_server
+│   ├── selfcheck/                  # 录-放对称性自检
+│   ├── dashboard/                  # FastAPI + WS + 静态前端 + play_controller
+│   └── tools/                      # 9 个 CLI 子命令实现
+├── tests/{unit,integration,fixtures}/
+└── recordings/                     # 飞行数据（运行时生成）
 ```
 
 ## Phase 2: Player + SelfCheck
@@ -304,7 +294,7 @@ sim-dji play ./recordings/<flight> --mqtt-url tcp://localhost:1883 \
 
 涵盖章节：
 
-- 0. 快速速查表（8 个命令一览）
+- 0. 快速速查表（9 个命令一览）
 - 1-2. 安装 + 配置
 - 3. 录制（启停三种方式 / 实时验证）
 - 4. 检查（inspect / list / repair）

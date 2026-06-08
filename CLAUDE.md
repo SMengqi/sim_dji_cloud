@@ -24,7 +24,7 @@ bash install.sh                          # creates .venv, pip install -e ".[test
 source .venv/bin/activate
 
 # Tests
-pytest tests/                            # full suite (~148 passed, integration tests need mosquitto; auto-skip)
+pytest tests/                            # full suite (≈397 unit passed + 7 integration auto-skip without mosquitto)
 pytest tests/unit/ -v                    # unit only, no external deps
 pytest tests/integration/ -v             # integration; needs `mosquitto` binary in PATH
 pytest tests/unit/test_dashboard_live_state.py::test_partial_dock_osd_preserves_previous_fields -v   # single test

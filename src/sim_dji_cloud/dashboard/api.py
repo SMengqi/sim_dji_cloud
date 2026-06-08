@@ -47,6 +47,7 @@ def create_app(
     recordings_root: Path = Path("recordings"),
     play_controller: PlayController | None = None,
     default_video_push_url: str = "",
+    flights_cache_ttl_s: float = 5.0,
 ) -> FastAPI:
     app = FastAPI(title="sim-dji dashboard")
 
@@ -131,7 +132,8 @@ def create_app(
     if play_controller is not None:
         app.include_router(_play_router(play_controller))
 
-    app.include_router(_flights_router(Path(recordings_root)))
+    app.include_router(_flights_router(Path(recordings_root),
+                                        cache_ttl_s=flights_cache_ttl_s))
 
     app.include_router(_state_reset_router(state, archive))
 
@@ -211,7 +213,7 @@ def _timeline_router(archive: EventsArchive, recordings_root: Path) -> APIRouter
         until_ms: int | None = None,
         limit: int = 5000,
     ):
-        entries, session, _ = _fetch(
+        entries, session, truncated = _fetch(
             source, kinds, since_ms, until_ms, limit,
         )
         if source == "live":
@@ -243,10 +245,16 @@ def _timeline_router(archive: EventsArchive, recordings_root: Path) -> APIRouter
                 ])
                 yield buf.getvalue()
 
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        # X-Truncated: 让自动化下载脚本能感知 limit 截断（review MAJOR）；
+        # CORS 默认下 fetch() 看不到自定义 header，但 curl / 服务器对服务器
+        # 调用都能拿到，且不影响浏览器原生下载体验。
+        if truncated:
+            headers["X-Truncated"] = "true"
         return StreamingResponse(
             generate(),
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=headers,
         )
 
     return r
@@ -290,10 +298,12 @@ def _play_router(pc: PlayController) -> APIRouter:
     @r.post("/stop")
     async def stop_play(_=Depends(require_token)):
         # async + await astop：SIGTERM 等待用 asyncio.sleep 不冻事件循环。
+        # 幂等：not-running 也返 200 + 当前状态（review MAJOR：旧 404 违反 REST
+        # 语义且跟 start 之间存在 TOCTOU 竞态）。客户端连发 stop 不再炸。
         try:
             return await pc.astop()
         except NotRunning:
-            raise HTTPException(status_code=404, detail="no play running")
+            return pc.status()
 
     @r.get("/status")
     def get_play_status():
@@ -359,12 +369,27 @@ def _scan_flights(recordings_root: Path) -> list[dict]:
     return flights
 
 
-def _flights_router(recordings_root: Path) -> APIRouter:
+def _flights_router(recordings_root: Path, *, cache_ttl_s: float = 5.0) -> APIRouter:
+    """``GET /api/flights`` 路由 + 5s TTL 缓存。
+
+    `_scan_flights` 全盘扫描 recordings_root；大目录 / NFS 慢盘下每次 GET 都扫
+    会拖。dashboard 用户刷新频率（人手按钮 / 多飞行下拉初始化）不需要亚秒级
+    新鲜度，5s 已足够。新录的飞行最多延迟 5s 出现，可接受。
+    """
+    import time as _time
     r = APIRouter(prefix="/api")
+    cache: dict = {"value": None, "expires_at": 0.0}
+
+    def _get_cached() -> list[dict]:
+        now = _time.monotonic()
+        if cache["value"] is None or now >= cache["expires_at"]:
+            cache["value"] = _scan_flights(recordings_root)
+            cache["expires_at"] = now + cache_ttl_s
+        return cache["value"]
 
     @r.get("/flights")
     def list_flights():
-        return {"flights": _scan_flights(recordings_root)}
+        return {"flights": _get_cached()}
 
     return r
 

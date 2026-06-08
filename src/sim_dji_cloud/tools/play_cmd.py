@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from loguru import logger
 
-from sim_dji_cloud.player import Player
+from sim_dji_cloud.player import Player, PlayerError
 from sim_dji_cloud.player.mqtt_publisher import MqttPublisher
 
 
@@ -51,7 +51,12 @@ async def play_flight(
 
     logger.info("play start: flight={}, broker=tcp://{}:{}, speed={}",
                 flight_dir, host, port, speed)
-    await player.start()
+    try:
+        await player.start()
+    except PlayerError as e:
+        # manifest 缺失 / 损坏 / 路径错 → 给 CLI 用户清晰错误，不抛 traceback
+        print(f"ERROR: {e}")
+        return 2
 
     wait_task = asyncio.create_task(player.wait_until_done())
     stop_task = asyncio.create_task(stop_event.wait())

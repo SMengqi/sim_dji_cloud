@@ -45,3 +45,25 @@ def test_require_token_401_when_token_mismatch(monkeypatch):
 def test_require_token_passes_when_match(monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
     assert require_token(authorization="Bearer secret123") is None
+
+
+def test_require_token_401_includes_www_authenticate(monkeypatch):
+    """401 必须带 WWW-Authenticate: Bearer header（RFC 7235 §3.1）。
+
+    Regression (review MAJOR): 旧裸 401 让 curl / Postman / OpenAPI 客户端
+    自动重试逻辑认不出"该用 Bearer"。
+    """
+    monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
+    # missing header
+    with pytest.raises(HTTPException) as exc:
+        require_token(authorization=None)
+    assert exc.value.status_code == 401
+    assert exc.value.headers.get("WWW-Authenticate") == "Bearer"
+    # malformed
+    with pytest.raises(HTTPException) as exc:
+        require_token(authorization="Basic xxx")
+    assert exc.value.headers.get("WWW-Authenticate") == "Bearer"
+    # token mismatch
+    with pytest.raises(HTTPException) as exc:
+        require_token(authorization="Bearer wrong")
+    assert exc.value.headers.get("WWW-Authenticate") == "Bearer"

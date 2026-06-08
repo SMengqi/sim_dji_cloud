@@ -22,8 +22,17 @@ def require_token(authorization: str | None = Header(None)) -> None:
     expected = os.environ.get("DASHBOARD_TOKEN")
     if not expected:
         raise HTTPException(503, "write API disabled: set DASHBOARD_TOKEN")
+    # 401 必须带 WWW-Authenticate: Bearer（RFC 7235 §3.1）；让 curl/Postman
+    # 自动认出"该用 Bearer token"，且符合 OpenAPI 客户端期望。
+    # Regression: test_require_token_401_includes_www_authenticate.
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "missing or malformed Authorization header")
+        raise HTTPException(
+            401, "missing or malformed Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     token = authorization[7:]
     if not secrets.compare_digest(token, expected):
-        raise HTTPException(401, "invalid token")
+        raise HTTPException(
+            401, "invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

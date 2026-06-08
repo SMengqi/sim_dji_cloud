@@ -61,6 +61,9 @@ def compare_topic(
             out_of_order_count=0, max_reorder_offset=0, status="FAIL",
         )
 
+    # Pass 1: find first field-level divergence (break-on-first)
+    # Regression: review MAJOR — drift 计算原本跟 divergence 搜索共用一个 break
+    # 循环，divergence 之后的数据不算 drift → 报告里 max_drift 误导。现在分两 pass。
     for i, (a, b) in enumerate(zip(orig, replay)):
         if a.get("topic") != b.get("topic"):
             first_div_idx, first_div_field = i, "topic"
@@ -74,17 +77,24 @@ def compare_topic(
         if _canonical_payload(a.get("payload")) != _canonical_payload(b.get("payload")):
             first_div_idx, first_div_field = i, "payload"
             break
-        if i > 0:
-            dt_o = a["recv_ts_ms"] - orig[i - 1]["recv_ts_ms"]
-            dt_r = b["recv_ts_ms"] - replay[i - 1]["recv_ts_ms"]
-            drift = abs(dt_o - dt_r)
-            if drift > max_drift:
-                max_drift = drift
 
+    # Pass 2: complete recv_ts drift scan over all aligned records (not aborted
+    # by divergence). 这条 pass 才是 max_drift 的权威来源。
+    for i in range(1, len(orig)):
+        dt_o = orig[i]["recv_ts_ms"] - orig[i - 1]["recv_ts_ms"]
+        dt_r = replay[i]["recv_ts_ms"] - replay[i - 1]["recv_ts_ms"]
+        drift = abs(dt_o - dt_r)
+        if drift > max_drift:
+            max_drift = drift
+
+    # Pass 3: reorder — max_reorder 应当是 recv_ts_ms 实际倒退的最大毫秒数，
+    # 不是旧的硬封顶 max(_, 1)（让字段永远 0 或 1，毫无诊断意义）。
     for i in range(1, len(replay)):
-        if replay[i]["recv_ts_ms"] < replay[i - 1]["recv_ts_ms"]:
+        delta = replay[i - 1]["recv_ts_ms"] - replay[i]["recv_ts_ms"]
+        if delta > 0:
             out_of_order += 1
-            max_reorder = max(max_reorder, 1)
+            if delta > max_reorder:
+                max_reorder = delta
 
     status = "PASS"
     if first_div_field is not None:

@@ -116,3 +116,51 @@ def test_get_flights_skips_hidden_and_non_dir(tmp_path):
     r = client.get("/api/flights")
     ids = [f["id"] for f in r.json()["flights"]]
     assert ids == ["flight_A"]
+
+
+def test_get_flights_cache_hits_within_ttl(tmp_path):
+    """缓存有效期内第二次 GET 不应触发 disk scan（结果跟首次一致即使盘上新增）。
+
+    Regression (review MAJOR): _scan_flights 每次 GET 都全盘扫；大目录 / NFS 慢盘下
+    占资源。加 TTL 缓存后短窗口内重复 GET 返同一份快照。
+    """
+    _make_flight(tmp_path, "flight_A",
+                 started_ms=100, ended_ms=200)
+    state = LiveState()
+    app = create_app(state=state, recordings_root=tmp_path,
+                     flights_cache_ttl_s=60.0)    # 长 TTL 让测试看到缓存
+    client = TestClient(app)
+
+    r1 = client.get("/api/flights")
+    ids1 = [f["id"] for f in r1.json()["flights"]]
+    assert ids1 == ["flight_A"]
+
+    # 在缓存有效期内新增飞行 — 不应进结果
+    _make_flight(tmp_path, "flight_B_added_late",
+                 started_ms=300, ended_ms=400)
+    r2 = client.get("/api/flights")
+    ids2 = [f["id"] for f in r2.json()["flights"]]
+    assert ids2 == ["flight_A"], (
+        f"缓存有效期内新增飞行不应可见，实际看到 {ids2}"
+    )
+
+
+def test_get_flights_cache_expires_after_ttl(tmp_path):
+    """TTL 过后下一次 GET 重新扫盘，能看到新增的飞行。"""
+    _make_flight(tmp_path, "flight_A",
+                 started_ms=100, ended_ms=200)
+    state = LiveState()
+    app = create_app(state=state, recordings_root=tmp_path,
+                     flights_cache_ttl_s=0.0)    # TTL=0 每次都过期
+    client = TestClient(app)
+
+    r1 = client.get("/api/flights")
+    assert [f["id"] for f in r1.json()["flights"]] == ["flight_A"]
+
+    _make_flight(tmp_path, "flight_B",
+                 started_ms=300, ended_ms=400)
+    r2 = client.get("/api/flights")
+    ids2 = {f["id"] for f in r2.json()["flights"]}
+    assert ids2 == {"flight_A", "flight_B"}, (
+        f"TTL 过后新飞行应当出现，实际 {ids2}"
+    )

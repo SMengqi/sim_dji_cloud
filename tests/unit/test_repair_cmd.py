@@ -92,3 +92,49 @@ def test_repair_new_format_dir(tmp_path: Path):
     assert m["task_id"] == "unknown"
     assert m["dock_sn"] == "SN_DOCK"
     assert m["finalize_reason"] == "repaired"
+
+
+def test_repair_merges_multi_volume_topics(tmp_path: Path):
+    """同一 topic 的多卷 (.0001 / .0002 / ...) 必须合到一条 topic 下的 files[]。
+
+    Regression (review MAJOR): 旧实现把每卷文件当独立 topic 加进 topics[]，
+    repair 后的 manifest 不再多卷聚合，selfcheck/player 读到的 files 缺卷。
+    """
+    flight = tmp_path / "SN_DOCK_20260601-100000"
+    (flight / "topics").mkdir(parents=True)
+    (flight / "topics" / "thing__product__SN_DOCK__osd.0001.jsonl").write_text(
+        '{"recv_ts_ms":1000,"topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+        '{"recv_ts_ms":1500,"topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+    )
+    (flight / "topics" / "thing__product__SN_DOCK__osd.0002.jsonl").write_text(
+        '{"recv_ts_ms":2000,"topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+    )
+    (flight / "topics" / "thing__product__SN_DOCK__osd.0003.jsonl").write_text(
+        '{"recv_ts_ms":2800,"topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+        '{"recv_ts_ms":3500,"topic":"thing/product/SN_DOCK/osd","payload":{}}\n'
+    )
+
+    code = repair_flight(flight)
+    assert code == 0
+    m = json.loads((flight / "manifest.json").read_text())
+
+    osd_topics = [t for t in m["topics"]
+                  if t["topic"] == "thing/product/SN_DOCK/osd"]
+    assert len(osd_topics) == 1, (
+        f"多卷必须合并到 1 条 topic entry，实际 {len(osd_topics)}"
+    )
+    entry = osd_topics[0]
+    # 5 条记录跨 3 卷 (2 + 1 + 2)
+    assert entry["count"] == 5
+    assert entry["first_recv_ts_ms"] == 1000
+    assert entry["last_recv_ts_ms"] == 3500
+    file_names = sorted(f["name"] for f in entry["files"])
+    assert file_names == [
+        "topics/thing__product__SN_DOCK__osd.0001.jsonl",
+        "topics/thing__product__SN_DOCK__osd.0002.jsonl",
+        "topics/thing__product__SN_DOCK__osd.0003.jsonl",
+    ]
+    by_name = {f["name"]: f for f in entry["files"]}
+    assert by_name["topics/thing__product__SN_DOCK__osd.0001.jsonl"]["count"] == 2
+    assert by_name["topics/thing__product__SN_DOCK__osd.0002.jsonl"]["count"] == 1
+    assert by_name["topics/thing__product__SN_DOCK__osd.0003.jsonl"]["count"] == 2

@@ -66,6 +66,95 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_finalize_writes_extra_gaps_into_manifest(minimal_config, tmp_path: Path):
+    """finalize_and_close 的 extra_gaps 参数把 MQTT 断连 gap 写进 manifest.gaps。
+
+    Regression (review MAJOR): 旧实现 mqtt_client.gaps 累积但从未写到 manifest，
+    inspect / selfcheck 看到的 gaps 永远空。
+    """
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    # 起一段飞行
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({
+            "data": {"flighttask_step_code": 1, "flight_id": "T-G",
+                     "sub_device": {"device_sn": "SN_DRONE"}}
+        }).encode(),
+        500,
+    )
+    # 模拟外部累积的 2 条 mqtt gaps
+    fake_gaps = [
+        {"reason": "mqtt_disconnect", "start_ms": 600, "end_ms": 700},
+        {"reason": "mqtt_disconnect", "start_ms": 1200, "end_ms": 1250},
+    ]
+    flight_dir = await rec.finalize_and_close(
+        finalize_reason="task_idle", extra_gaps=fake_gaps,
+    )
+    manifest = json.loads((flight_dir / "manifest.json").read_text())
+    gaps = manifest["gaps"]
+    assert len(gaps) == 2, f"应写入 2 条 gap，实际 {gaps}"
+    assert gaps[0]["reason"] == "mqtt_disconnect"
+    assert gaps[0]["start_ms"] == 600
+    assert gaps[1]["end_ms"] == 1250
+
+
+@pytest.mark.asyncio
+async def test_on_mqtt_message_accepts_str_payload(minimal_config, tmp_path: Path):
+    """gmqtt 某些版本传 str 而不是 bytes；recorder 不应抛 AttributeError。
+
+    Regression (review MAJOR): 旧 payload.decode("utf-8") 假设 bytes，str 进来
+    直接炸；现在加 isinstance 守卫优雅处理。
+    """
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    # 传 str（不是 bytes）
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        '{"data": {"flighttask_step_code": 1}}',   # type: ignore[arg-type]
+        500,
+    )
+    # 不抛错且进入 recording 状态
+    assert rec._detector.state.value == "recording"
+
+
+@pytest.mark.asyncio
+async def test_rename_preserves_prior_manifest_gaps(minimal_config, tmp_path: Path):
+    """pending 阶段累积的 gap 必须在 rename 后仍在 manifest.gaps 里。
+
+    Regression (review MAJOR): 旧实现 rename 时 self._manifest = ManifestBuilder(...)
+    完全新建 → pending 阶段 add_gap 进去的 gap 全丢。
+    """
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    # 进入 pending：step=1，无 task_id
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"data": {"flighttask_step_code": 1}}).encode(),
+        500,
+    )
+    assert rec.flight_dir is not None and rec.flight_dir.name.startswith("pending_")
+    # 模拟 pending 阶段 MQTT 断连记录的 gap
+    assert rec._manifest is not None
+    rec._manifest.add_gap("mqtt_disconnect", 600, 800)
+    rec._manifest.add_gap("mqtt_disconnect", 850, 900)
+
+    # 触发 rename：task_id 通过 events 到达
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/events",
+        json.dumps({"data": {"flight_id": "T-GAP"}}).encode(),
+        1000,
+    )
+    assert not rec.flight_dir.name.startswith("pending_")
+
+    gaps_after = rec._manifest.data["gaps"]
+    assert len(gaps_after) == 2, f"rename 后 gaps 应保留 2 条，实际 {gaps_after}"
+    assert gaps_after[0]["reason"] == "mqtt_disconnect"
+    assert gaps_after[0]["start_ms"] == 600
+    assert gaps_after[1]["end_ms"] == 900
+
+
+@pytest.mark.asyncio
 async def test_reset_does_not_redrain_after_finalize(minimal_config, tmp_path: Path):
     """finalize_and_close 已 drain 的 queues，reset_for_next_flight 不再重复 drain。
 

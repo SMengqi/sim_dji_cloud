@@ -78,7 +78,11 @@ def repair_flight(flight_dir: Path, force: bool = False) -> int:
         print(f"ERROR: no topics/ directory in {flight_dir}", file=sys.stderr)
         return 2
 
-    topics: list[dict] = []
+    # 多卷归并：同一 topic 的 *.0001.jsonl / *.0002.jsonl / ... 必须合到 topics[]
+    # 同一条目下的 files[] 里，count 累加、first/last 取 min/max。
+    # Regression (review MAJOR): 旧实现每个 jsonl 文件当独立 topic，repair 后的
+    # manifest 不再多卷聚合 → selfcheck/player 读 files 时丢卷。
+    by_topic: dict[str, dict] = {}
     overall_first = None
     overall_last = None
     drone_sn = "unknown"
@@ -89,20 +93,38 @@ def repair_flight(flight_dir: Path, force: bool = False) -> int:
         stats = _scan_topic_file(jsonl_path)
         if stats["count"] == 0:
             continue
-        topics.append({
-            "topic": topic,
-            "device_sn": stats["device_sn"],
-            "direction": stats["direction"],
+        file_entry = {
+            "name": f"topics/{jsonl_path.name}",
             "count": stats["count"],
-            "first_recv_ts_ms": stats["first_ms"],
-            "last_recv_ts_ms": stats["last_ms"],
-            "files": [{
-                "name": f"topics/{jsonl_path.name}",
+            "first_ms": stats["first_ms"],
+            "last_ms": stats["last_ms"],
+        }
+        entry = by_topic.get(topic)
+        if entry is None:
+            by_topic[topic] = {
+                "topic": topic,
+                "device_sn": stats["device_sn"],
+                "direction": stats["direction"],
                 "count": stats["count"],
-                "first_ms": stats["first_ms"],
-                "last_ms": stats["last_ms"],
-            }],
-        })
+                "first_recv_ts_ms": stats["first_ms"],
+                "last_recv_ts_ms": stats["last_ms"],
+                "files": [file_entry],
+            }
+        else:
+            entry["count"] += stats["count"]
+            if stats["first_ms"] is not None:
+                cur = entry["first_recv_ts_ms"]
+                entry["first_recv_ts_ms"] = (
+                    stats["first_ms"] if cur is None
+                    else min(cur, stats["first_ms"])
+                )
+            if stats["last_ms"] is not None:
+                cur = entry["last_recv_ts_ms"]
+                entry["last_recv_ts_ms"] = (
+                    stats["last_ms"] if cur is None
+                    else max(cur, stats["last_ms"])
+                )
+            entry["files"].append(file_entry)
         if stats["first_ms"] is not None:
             overall_first = (stats["first_ms"] if overall_first is None
                              else min(overall_first, stats["first_ms"]))
@@ -111,6 +133,7 @@ def repair_flight(flight_dir: Path, force: bool = False) -> int:
                             else max(overall_last, stats["last_ms"]))
         if stats["device_sn"] and stats["device_sn"] != dock_sn:
             drone_sn = stats["device_sn"]
+    topics: list[dict] = list(by_topic.values())
 
     manifest = {
         "schema_version": 1,

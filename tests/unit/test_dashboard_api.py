@@ -339,11 +339,37 @@ def test_export_csv_header_and_basic_row(tmp_path):
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/csv")
     assert "attachment" in r.headers["content-disposition"]
+    # 未截断 → 不带 X-Truncated header
+    assert "x-truncated" not in {k.lower() for k in r.headers.keys()}
     lines = r.text.strip().split("\n")
     assert lines[0] == "recv_ts_ms,recv_ts_iso,virt_offset_ms,kind,topic,method,payload_json"
     assert "1780297017006" in lines[1]
     assert "event" in lines[1]
     assert "alarm" in lines[1]
+
+
+def test_export_csv_emits_x_truncated_header_when_limit_hits(tmp_path):
+    """超过 limit 时 CSV 必须带 X-Truncated: true 让自动化能感知截断。
+
+    Regression (review MAJOR): 旧实现 CSV 截断无标记，用户下载完全不知 5000 条
+    被截短，可能漏掉关键告警。
+    """
+    client, archive = _client_with_archive(tmp_path)
+    # 灌 5 条 events
+    for i in range(5):
+        archive.append("thing/product/SN/events",
+                       {"method": "alarm", "data": {"i": i}},
+                       recv_ts_ms=1780297017000 + i)
+    # limit=3 → 必触发截断
+    r = client.get("/api/timeline/export.csv?limit=3")
+    assert r.status_code == 200
+    # FastAPI/Starlette 把 headers key lower-case
+    assert r.headers.get("x-truncated") == "true", (
+        f"limit=3 拿到 5 条数据应触发 X-Truncated；headers={dict(r.headers)}"
+    )
+    body_lines = r.text.strip().split("\n")
+    # 1 行 header + 3 行数据
+    assert len(body_lines) == 4
 
 
 def test_export_csv_payload_json_quoted_safely(tmp_path):
@@ -505,14 +531,22 @@ def test_play_stop_200_when_running(tmp_path, monkeypatch):
     assert r.json()["state"] == "stopped"
 
 
-def test_play_stop_404_when_not_running(tmp_path, monkeypatch):
+def test_play_stop_idempotent_when_not_running(tmp_path, monkeypatch):
+    """stop not-running 时返 200 + state=stopped 而不是 404（review MAJOR）。
+
+    幂等性：客户端连发 stop / 跟 start 之间 TOCTOU 不再炸 404。状态 dict 跟
+    GET /api/play/status 一致 — 调用方拿到清晰"已是 stopped"信息。
+    """
     monkeypatch.setenv("DASHBOARD_TOKEN", "secret123")
     client, _, _ = _client_with_play(tmp_path)
     r = client.post(
         "/api/play/stop",
         headers={"Authorization": "Bearer secret123"},
     )
-    assert r.status_code == 404
+    assert r.status_code == 200, f"应当 200 幂等，实际 {r.status_code}: {r.text}"
+    body = r.json()
+    assert body["state"] == "stopped"
+    assert body["pid"] is None
 
 
 def test_play_status_no_token_required(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ mqtt:
   port: 8883
   tls: false
   client_id: c
+  dock_sn: SN_TEST
   username: "${env:U}"
   password: "${env:P}"
   subscribe_patterns: ["thing/product/+/+"]

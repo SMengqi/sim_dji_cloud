@@ -55,6 +55,60 @@ def _make_flight(tmp_path: Path, recv_ts_list: list[int]) -> Path:
 
 
 @pytest.mark.asyncio
+async def test_seek_passes_virt_snapshot_to_video_restart(tmp_path):
+    """seek 调 _restart_video_at_current_virt 时传 snapshot 的 at_virt_ms，
+    不再由 _restart 内部再调 virt_now_ms() —— 避免 await 期间 virt 推进
+    导致视频 ss_seconds 偏离目标 seek 点（review MAJOR）。
+    """
+    # 60s 长飞行，留够 seek 目标空间
+    flight = _make_flight(tmp_path, [0, 10_000, 30_000, 60_000])
+    pub = _FakePublisher()
+    # video_push_url=None → start() 不触发 ffmpeg；本测试只验证 seek → _restart
+    # 的参数传递，不涉及真实视频。
+    player = Player(flight, pub, speed=1.0)
+    await player.start()
+
+    captured = {"at_virt_ms": "NOT_CALLED"}
+
+    async def spy(*, at_virt_ms=None):
+        captured["at_virt_ms"] = at_virt_ms
+        return None
+
+    player._restart_video_at_current_virt = spy
+    await player.seek(45_000)
+
+    assert captured["at_virt_ms"] == 45_000, (
+        f"seek 必须把 virt_ms snapshot 传给 _restart，实际拿到 {captured['at_virt_ms']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_passes_virt_snapshot_to_video_restart(tmp_path):
+    """resume 同样：scheduler.resume() 后立即 snapshot virt，传给 _restart。"""
+    flight = _make_flight(tmp_path, [1000, 1100, 1200])
+    pub = _FakePublisher()
+    player = Player(flight, pub, speed=1.0)
+    await player.start()
+
+    await player.pause()
+
+    captured = {"at_virt_ms": "NOT_CALLED"}
+
+    async def spy(*, at_virt_ms=None):
+        captured["at_virt_ms"] = at_virt_ms
+        return None
+
+    player._restart_video_at_current_virt = spy
+    result = await player.resume()
+
+    assert captured["at_virt_ms"] is not None, "resume 应当传 snapshot 给 _restart"
+    # snapshot 跟 resume() 返回的 virt_ms 同源（同一时刻取）
+    assert abs(captured["at_virt_ms"] - result["virt_ms"]) < 50, (
+        f"snapshot {captured['at_virt_ms']} 跟返回 {result['virt_ms']} 应同一时刻"
+    )
+
+
+@pytest.mark.asyncio
 async def test_video_pusher_reference_set_before_start(tmp_path):
     """pusher.start() 失败时 self._video_pusher 仍持有引用，避免孤儿子进程。
 

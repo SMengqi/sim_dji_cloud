@@ -2,7 +2,7 @@ import asyncio
 import json
 import pytest
 from pathlib import Path
-from sim_dji_cloud.player import Player
+from sim_dji_cloud.player import Player, PlayerError
 
 
 def _make_flight_dir(tmp_path: Path) -> Path:
@@ -185,3 +185,31 @@ async def test_player_idle_marker_safe_when_dock_sn_missing(tmp_path: Path):
     for _, payload in published:
         decoded = json.loads(payload.decode())
         assert decoded.get("data", {}).get("flighttask_step_code") != 5
+
+
+class _NoopPublisher:
+    async def connect(self): pass
+    async def disconnect(self): pass
+    async def publish(self, topic, payload, qos=0): pass
+
+
+@pytest.mark.asyncio
+async def test_start_raises_player_error_on_missing_manifest(tmp_path):
+    """flight_dir 不存在 / 缺 manifest.json → 抛 PlayerError 而不是 FileNotFoundError。
+
+    Regression (review MAJOR): 旧 start() 直接 read_text，traceback 冒到 CLI 顶层。
+    """
+    p = Player(flight_dir=tmp_path / "no_such_flight", publisher=_NoopPublisher())
+    with pytest.raises(PlayerError, match="缺少 manifest.json"):
+        await p.start()
+
+
+@pytest.mark.asyncio
+async def test_start_raises_player_error_on_malformed_manifest(tmp_path):
+    """manifest.json 内容损坏 → 抛 PlayerError 而不是 JSONDecodeError。"""
+    flight = tmp_path / "broken"
+    flight.mkdir()
+    (flight / "manifest.json").write_text("{not valid json")
+    p = Player(flight_dir=flight, publisher=_NoopPublisher())
+    with pytest.raises(PlayerError, match="manifest.json 损坏"):
+        await p.start()

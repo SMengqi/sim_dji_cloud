@@ -88,7 +88,11 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
                 rec._detector.tick(now_ms())                      # 推进空闲去抖
                 if rec._detector.state == FlightState.FINALIZING:  # 一段任务结束
                     reason = rec._detector.end_reason or "task_idle"
-                    fd = await rec.finalize_and_close(finalize_reason=reason)
+                    # 把当前段累积的 MQTT 断连 gap 喂给 manifest，喂完清空给下段重新累积。
+                    seg_gaps = list(mqtt.gaps)
+                    mqtt.gaps.clear()
+                    fd = await rec.finalize_and_close(
+                        finalize_reason=reason, extra_gaps=seg_gaps)
                     click.echo(f"finalized: {fd}  (reason={reason})")
                     await rec.reset_for_next_flight()              # 重置，继续等下一段
                     continue
@@ -100,7 +104,10 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
             await mqtt.stop()
             loop_task.cancel()
             if rec.flight_dir is not None:                         # 退出时收尾在录的那段
-                fd = await rec.finalize_and_close(finalize_reason="manual_stop")
+                seg_gaps = list(mqtt.gaps)
+                mqtt.gaps.clear()
+                fd = await rec.finalize_and_close(
+                    finalize_reason="manual_stop", extra_gaps=seg_gaps)
                 click.echo(f"finalized: {fd}  (reason=manual_stop)")
 
     asyncio.run(run())

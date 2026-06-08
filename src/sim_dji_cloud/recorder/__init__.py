@@ -65,8 +65,20 @@ class Recorder:
         ):
             return
 
+        # gmqtt 通常给 bytes，但某些版本 / qos 路径会给 str；
+        # 守一下避免裸 .decode 触发 AttributeError。
+        # Regression: test_on_mqtt_message_accepts_str_payload.
         try:
-            payload_obj = json.loads(payload.decode("utf-8")) if payload else {}
+            if not payload:
+                payload_obj = {}
+            elif isinstance(payload, bytes):
+                payload_obj = json.loads(payload.decode("utf-8"))
+            elif isinstance(payload, str):
+                payload_obj = json.loads(payload)
+            else:
+                logger.warning("unexpected payload type {} on topic {}",
+                               type(payload).__name__, topic)
+                return
         except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning("non-JSON payload on topic {}", topic)
             return
@@ -192,7 +204,11 @@ class Recorder:
         for writer in self._writers.values():
             writer.base_path = new_topics_dir / writer.base_path.name
 
-        # ManifestBuilder 持有 flight_dir 路径，需要重建指向新位置
+        # ManifestBuilder 持有 flight_dir 路径，需要重建指向新位置。
+        # 旧 builder 已累积的 gaps（pending 阶段 MQTT 断连 / 未来其它来源）
+        # 必须复制进新 builder，否则 rename 后丢失。
+        # Regression: test_rename_preserves_prior_manifest_gaps.
+        prior_gaps = self._manifest.data["gaps"] if self._manifest else []
         self._manifest = ManifestBuilder(
             flight_dir=self.flight_dir,
             task_id=task_id,
@@ -200,6 +216,8 @@ class Recorder:
             drone_sn=self.drone_sn or "unknown",
             started_at_recv_ms=self._task_started_ms or now_ms(),
         )
+        for g in prior_gaps:
+            self._manifest.add_gap(g["reason"], g["start_ms"], g["end_ms"])
         # 视频：目录已 rename（ffmpeg fd 跟随 inode 继续写），仅需把 output_dir
         # 指向新目录，使 stop() 时 timing.json 落在新位置。
         if self._video_writer is not None:
@@ -241,7 +259,24 @@ class Recorder:
         }
         await q.put(record)
 
-    async def finalize_and_close(self, finalize_reason: str) -> Path:
+    async def finalize_and_close(
+        self,
+        finalize_reason: str,
+        *,
+        extra_gaps: Optional[list[dict]] = None,
+    ) -> Path:
+        """完成当前飞行段，把 manifest 写盘。
+
+        Args
+        ----
+        extra_gaps:
+            外部累积的 gap 列表（典型来源：``MqttRecorderClient.gaps`` 在
+            MQTT 断连时填充）。每条 dict 含 ``reason / start_ms / end_ms``。
+            finalize 前一次性合并进 manifest.gaps，让下游 inspect/selfcheck
+            看到真实的录制中断段。
+            Regression (review MAJOR): 旧实现 mqtt 的 gaps 累积但从未写到
+            manifest → manifest.gaps 永远空。
+        """
         if self.flight_dir is None:
             raise RuntimeError("no flight in progress")
 
@@ -254,6 +289,13 @@ class Recorder:
             self._drained_topics.add(topic)
 
         assert self._manifest is not None
+        if extra_gaps:
+            for g in extra_gaps:
+                self._manifest.add_gap(
+                    g.get("reason", "unknown"),
+                    int(g["start_ms"]),
+                    int(g["end_ms"]),
+                )
         # rename 现在不再关闭/重建 writer，每个 topic 的全生命周期数据都在
         # 同一 RotatingJsonlWriter 里累积，files_metadata() 直接给出完整列表。
         for topic, writer in self._writers.items():
