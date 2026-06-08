@@ -66,6 +66,46 @@ async def test_recorder_writes_jsonl_when_recording(minimal_config, tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_reset_does_not_redrain_after_finalize(minimal_config, tmp_path: Path):
+    """finalize_and_close 已 drain 的 queues，reset_for_next_flight 不再重复 drain。
+
+    Regression: 重复 await 一个 crash 的 consumer 会再次抛出存储的异常被 reset
+    的 except 静默吃掉。修复后 reset 跳过已 drained 的 topics。
+    """
+    rec = Recorder(minimal_config, dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    await rec.on_mqtt_message(
+        "thing/product/SN_DOCK/osd",
+        json.dumps({"data": {"flighttask_step_code": 1,
+                             "sub_device": {"device_sn": "SN_DRONE"}}}).encode(),
+        1000,
+    )
+    queues_before = list(rec._queues.values())
+    assert queues_before, "需要至少一个 topic queue 才能验证"
+
+    call_counts: dict[int, int] = {}
+    orig_drain = {id(q): q.drain_and_close for q in queues_before}
+
+    def make_spy(q):
+        async def spy():
+            call_counts[id(q)] = call_counts.get(id(q), 0) + 1
+            await orig_drain[id(q)]()
+        return spy
+
+    for q in queues_before:
+        q.drain_and_close = make_spy(q)
+
+    await rec.finalize_and_close(finalize_reason="task_idle")
+    await rec.reset_for_next_flight()
+
+    for q in queues_before:
+        assert call_counts.get(id(q), 0) == 1, (
+            f"queue {id(q)} drained {call_counts.get(id(q), 0)} 次，"
+            "应当只 finalize drain 一次"
+        )
+
+
+@pytest.mark.asyncio
 async def test_drone_sn_backfilled_from_dock_osd_sub_device(minimal_config, tmp_path: Path):
     """关键修复：drone_sn 应从 dock_osd.data.sub_device.device_sn 精确提取，
     不再用'首条非 dock osd 即认为是飞行器'的启发式。"""

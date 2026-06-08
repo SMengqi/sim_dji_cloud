@@ -1,5 +1,7 @@
+import asyncio
 import json
 import signal
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -68,6 +70,22 @@ def test_start_rejects_nonexistent_flight_dir(tmp_path):
     pc, _ = _make_pc(tmp_path)
     with pytest.raises(ValueError, match="not found"):
         pc.start("no_such_dir")
+
+
+def test_start_rejects_symlink_pointing_outside_recordings(tmp_path):
+    """C-9 验证: recordings_root 内的 symlink 指向外部目录 → 必须被拒绝。
+
+    .resolve() + relative_to() 已正确处理；本测试 pin 住该保护，避免
+    重构时退化。
+    """
+    pc, recordings = _make_pc(tmp_path)
+    outside = tmp_path / "outside_target"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("PWNED")
+    symlink = recordings / "sneak"
+    symlink.symlink_to(outside)
+    with pytest.raises(ValueError, match="must be under"):
+        pc.start("sneak")
 
 
 def test_start_closes_log_fp_when_popen_fails(tmp_path):
@@ -230,3 +248,118 @@ def test_pid_alive_returns_true_for_running_non_zombie(monkeypatch):
     monkeypatch.setattr(builtins, "open", fake_open)
 
     assert PlayController._pid_alive(99999) is True
+
+
+# ---------------------------------------------------------------------------
+# astart / astop async regression suite (review MAJOR: PlayController async 化)
+#
+# Background: 旧 start() / stop() 内 sidecar 等待 / SIGTERM 等待用 time.sleep
+# 阻塞最长 5s / timeout_s 秒。dashboard FastAPI sync handler 跑在 anyio
+# threadpool 里，并发请求把池吃光后新请求排队。astart/astop 内部用
+# asyncio.sleep，handler 改 async def → 整条链路不再阻塞任何线程。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_astart_returns_same_dict_as_start(tmp_path):
+    """astart 跟 start 的返回 dict 形状一致（state/pid/flight_dir/...）。"""
+    pc, _ = _make_pc(tmp_path)
+    with patch("sim_dji_cloud.dashboard.play_controller.subprocess.Popen",
+               return_value=_running_popen()), \
+         patch.object(PlayController, "_pid_alive", return_value=True):
+        result = await pc.astart("flight_A")
+    assert result["state"] == "running"
+    assert result["pid"] == 12345
+    assert result["flight_dir"].endswith("flight_A")
+
+
+@pytest.mark.asyncio
+async def test_astart_does_not_block_event_loop(tmp_path):
+    """sidecar 没出现时 astart 等待阶段不冻 asyncio loop。
+
+    Regression: 旧 start() 内 time.sleep 循环最长 5s，async handler 转为 sync
+    handler 后 anyio 池被霸占。astart 用 await asyncio.sleep 真正 yield。
+    """
+    pc, _ = _make_pc(tmp_path)
+    ticks = {"n": 0}
+
+    async def ticker():
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            ticks["n"] += 1
+
+    with patch("sim_dji_cloud.dashboard.play_controller.subprocess.Popen",
+               return_value=_running_popen()), \
+         patch.object(PlayController, "_pid_alive", return_value=True):
+        t0 = time.monotonic()
+        # ticker 跑 ~400ms；同期 astart 因 sidecar 永远不出现走完 deadline
+        await asyncio.gather(pc.astart("flight_A"), ticker())
+        elapsed = time.monotonic() - t0
+
+    assert ticks["n"] >= 30, (
+        f"astart 等 sidecar 期间 asyncio loop 被冻 — ticker 只 tick "
+        f"{ticks['n']} 次（应 ≥30），elapsed={elapsed:.2f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_astop_returns_same_dict_as_stop(tmp_path):
+    """astop 跟 stop 返回形状一致；进程被 SIGTERM 优雅退出。"""
+    pc, _ = _make_pc(tmp_path)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "logs" / "play.pid").write_text("12345\n")
+    (tmp_path / "logs" / "play.meta.json").write_text("{}")
+
+    alive_state = {"v": True}
+
+    def kill_then_dead(pid, sig):
+        if sig == signal.SIGTERM:
+            alive_state["v"] = False
+
+    def fake_alive(pid):
+        return alive_state["v"]
+
+    with patch("sim_dji_cloud.dashboard.play_controller.os.kill",
+               side_effect=kill_then_dead), \
+         patch.object(PlayController, "_pid_alive", side_effect=fake_alive):
+        result = await pc.astop()
+
+    assert result["state"] == "stopped"
+    assert not (tmp_path / "logs" / "play.pid").exists()
+
+
+@pytest.mark.asyncio
+async def test_astop_does_not_block_event_loop(tmp_path):
+    """SIGTERM 后 pid 一直 alive 时 astop 等待 deadline 不冻 asyncio loop。"""
+    pc, _ = _make_pc(tmp_path)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "logs" / "play.pid").write_text("12345\n")
+    (tmp_path / "logs" / "play.meta.json").write_text("{}")
+
+    ticks = {"n": 0}
+
+    async def ticker():
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            ticks["n"] += 1
+
+    # _pid_alive 永远 True → 走 deadline + SIGKILL 兜底分支；timeout_s=0.4 让
+    # 测试快。期间 ticker 应正常 tick。
+    with patch("sim_dji_cloud.dashboard.play_controller.os.kill") as kill_mock, \
+         patch.object(PlayController, "_pid_alive", return_value=True):
+        await asyncio.gather(pc.astop(timeout_s=0.4), ticker())
+
+    assert ticks["n"] >= 30, (
+        f"astop 等 SIGTERM 期间 asyncio loop 被冻 — ticker 只 tick "
+        f"{ticks['n']} 次（应 ≥30）"
+    )
+    # SIGTERM + SIGKILL 都该发了
+    sigs = [c.args[1] for c in kill_mock.call_args_list]
+    assert signal.SIGTERM in sigs
+    assert signal.SIGKILL in sigs
+
+
+@pytest.mark.asyncio
+async def test_astop_when_not_running_raises_NotRunning(tmp_path):
+    pc, _ = _make_pc(tmp_path)
+    with pytest.raises(NotRunning):
+        await pc.astop()

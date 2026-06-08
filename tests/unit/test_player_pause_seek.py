@@ -55,6 +55,74 @@ def _make_flight(tmp_path: Path, recv_ts_list: list[int]) -> Path:
 
 
 @pytest.mark.asyncio
+async def test_video_pusher_reference_set_before_start(tmp_path):
+    """pusher.start() 失败时 self._video_pusher 仍持有引用，避免孤儿子进程。
+
+    Regression (C-7): 旧代码 self._video_pusher = pusher 写在 pusher.start()
+    之后；start 抛错 → 引用永远不存 → wait_until_done 无法 stop。
+    """
+    from unittest.mock import MagicMock, AsyncMock
+
+    flight = _make_flight(tmp_path, [1000, 1100, 1200])
+    mf_path = flight / "manifest.json"
+    mf = json.loads(mf_path.read_text())
+    mf["video"] = {"file": "video/main.mp4", "started_at_recv_ms": 1000}
+    mf_path.write_text(json.dumps(mf))
+    (flight / "video").mkdir()
+    (flight / "video" / "main.mp4").write_bytes(b"fake")
+
+    captured = {"pusher": None}
+
+    def factory(*args, **kwargs):
+        p = MagicMock()
+        p.start.side_effect = RuntimeError("simulated ffmpeg start failure")
+        # Player 现在在 async 上下文用 aclose() 而非 stop()，避免冻 asyncio loop
+        # 10s（review MAJOR）。aclose 用 AsyncMock 才能被 await 不报 TypeError。
+        p.aclose = AsyncMock()
+        captured["pusher"] = p
+        return p
+
+    pub = _FakePublisher()
+    player = Player(flight, pub, speed=1.0, video_push_url="rtmp://x/live",
+                    video_pusher_factory=factory)
+    await player.start()
+    await asyncio.sleep(0.05)
+    assert captured["pusher"] is not None
+    assert player._video_pusher is captured["pusher"], (
+        "pusher.start 失败时 self._video_pusher 应当已被赋值"
+    )
+    await player.wait_until_done()
+    captured["pusher"].aclose.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_pause_acquires_control_lock(tmp_path):
+    """C-8: pause/resume/seek 共享 _control_lock 序列化（_seek_lock 别名同一把）。
+
+    Regression: 旧代码只 seek 有锁，pause 无锁，并发 pause+seek 会 mutate
+    _video_task 出错。验证三者都用同一把锁。
+    """
+    flight = _make_flight(tmp_path, [1000, 1100, 1200])
+    pub = _FakePublisher()
+    player = Player(flight, pub, speed=1.0)
+    await player.start()
+    assert player._control_lock is player._seek_lock, "应是同一把锁"
+
+    # 手动占住锁，pause 必须等
+    await player._control_lock.acquire()
+    pause_task = asyncio.create_task(player.pause())
+    await asyncio.sleep(0.05)
+    assert not pause_task.done(), "pause 应该被 control_lock 拦住等待"
+    player._control_lock.release()
+    await pause_task
+    assert player._scheduler.paused
+
+    # resume 让 publisher 任务能跑完，否则 wait_until_done 会挂死
+    await player.resume()
+    await player.wait_until_done()
+
+
+@pytest.mark.asyncio
 async def test_player_pause_then_resume_publishes_in_order(tmp_path):
     flight = _make_flight(tmp_path, [1000, 1100, 1200, 1300])
     pub = _FakePublisher()

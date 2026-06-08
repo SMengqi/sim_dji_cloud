@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import signal
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,68 @@ def _make_partial_file(cmd: list, content: bytes = b"") -> Path:
 # ---------------------------------------------------------------------------
 # 1. Eager launch: ffmpeg starts immediately, no probe gate
 # ---------------------------------------------------------------------------
+
+def test_stop_does_not_block_forever_when_ffmpeg_hangs(tmp_path: Path):
+    """SIGKILL 后 ffmpeg 仍卡（内核 D 状态）→ stop() 不应无限阻塞，必须超时退出。
+
+    Regression: 旧代码 self._proc.kill() 后 self._proc.wait() 无 timeout，
+    卡死内核状态时 stop() 永远不返回。修复加 timeout=timeout_s 保上限。
+    """
+    from loguru import logger as _logger
+    video_dir = tmp_path / "video"
+
+    class HangingProc:
+        def __init__(self):
+            self.pid = 99999
+            self._wait_calls = 0
+            self.stdout = _empty_stdout()
+            self.stderr = None
+
+        def poll(self):
+            return None  # 永不退出
+
+        def send_signal(self, _sig):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            self._wait_calls += 1
+            if timeout is None:
+                # 旧 bug 路径——pytest-timeout 兜底
+                time.sleep(120)
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout)
+
+    hanging = HangingProc()
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen",
+               return_value=hanging):
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=0.05,
+        )
+        captured: list[str] = []
+        sink_id = _logger.add(lambda m: captured.append(str(m)), level="ERROR")
+        try:
+            vw.start()
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            vw.stop(timeout_s=0.1)
+            elapsed = time.monotonic() - t0
+        finally:
+            _logger.remove(sink_id)
+
+    assert elapsed < 5.0, f"stop() 阻塞 {elapsed:.1f}s，应当在超时内返回"
+    assert any("ffmpeg" in m.lower() and ("kill" in m.lower() or "退出" in m)
+               for m in captured), \
+        f"超时时应有 ERROR 日志，捕获到: {captured}"
+    assert hanging._wait_calls >= 2, (
+        f"应有 2 次 wait（SIGINT + SIGKILL 各 1），实际 {hanging._wait_calls}"
+    )
+
 
 def test_supervisor_logs_warning_when_ffmpeg_missing(tmp_path: Path):
     """ffmpeg 不在 PATH → Popen 抛 FileNotFoundError；supervisor 不能静默死。

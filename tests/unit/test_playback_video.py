@@ -25,6 +25,10 @@ class FakeVideoPusher:
     def stop(self, timeout_s=10.0):
         self.stopped = True
 
+    async def aclose(self, timeout_s=10.0):
+        """异步友好的 stop（避免冻 asyncio loop）。"""
+        self.stop(timeout_s)
+
     def is_alive(self):
         return self.started_ss is not None and not self.stopped
 

@@ -270,9 +270,11 @@ def _play_router(pc: PlayController) -> APIRouter:
     r = APIRouter(prefix="/api/play")
 
     @r.post("/start", status_code=201)
-    def start_play(body: PlayStartBody, _=Depends(require_token)):
+    async def start_play(body: PlayStartBody, _=Depends(require_token)):
+        # async + await astart：sidecar 等待用 asyncio.sleep 不冻事件循环。
+        # 旧 sync handler 跑在 anyio threadpool，并发 start 把池吃光（review MAJOR）。
         try:
-            return pc.start(
+            return await pc.astart(
                 body.flight_dir,
                 speed=body.speed,
                 mqtt_url=body.mqtt_url,
@@ -286,9 +288,10 @@ def _play_router(pc: PlayController) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(e))
 
     @r.post("/stop")
-    def stop_play(_=Depends(require_token)):
+    async def stop_play(_=Depends(require_token)):
+        # async + await astop：SIGTERM 等待用 asyncio.sleep 不冻事件循环。
         try:
-            return pc.stop()
+            return await pc.astop()
         except NotRunning:
             raise HTTPException(status_code=404, detail="no play running")
 

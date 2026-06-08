@@ -37,6 +37,12 @@ class ControlUnavailable(Exception):
 class PlayController:
     """管 sim-dji play 子进程；线程不安全，单 instance per dashboard 进程。"""
 
+    # sidecar wait deadline (seconds). 缩短自历史 5s → 2s：control sidecar
+    # 由 sim-dji play 内的 aiohttp ControlServer 在子进程 import + asyncio
+    # bootstrap 完即可写出，冷启动实测 < 1s；2s 给冷 venv / NFS 也够。
+    # Sprint 2: 缩短让 sidecar 没出现时 503 更快暴露给 dashboard。
+    SIDECAR_WAIT_SECONDS = 2.0
+
     def __init__(self, recordings_root: Path, log_dir: Path, name: str = "play"):
         self.recordings_root = recordings_root.resolve()
         self.log_dir = log_dir
@@ -58,6 +64,71 @@ class PlayController:
         video_push_url: Optional[str] = None,
         video_anchor_offset_ms: int = 0,
     ) -> dict:
+        """Sync 启动 sim-dji play 子进程；阻塞最长 ``SIDECAR_WAIT_SECONDS``。
+
+        async 上下文（FastAPI handler）请用 ``astart`` 避免冻 loop。
+        """
+        proc, deadline = self._prepare_start_subprocess(
+            flight_dir, speed=speed, mqtt_url=mqtt_url,
+            video_push_url=video_push_url,
+            video_anchor_offset_ms=video_anchor_offset_ms,
+        )
+        # Sync sidecar 等待：每 100ms 轮询，最长 SIDECAR_WAIT_SECONDS。
+        while time.monotonic() < deadline:
+            outcome = self._check_sidecar(proc)
+            if outcome is not None:
+                break
+            time.sleep(0.1)
+        else:
+            self._log_sidecar_timeout()
+        logger.info("PlayController started: pid={} flight_dir={}",
+                    proc.pid, self._meta_file)
+        return self.status()
+
+    async def astart(
+        self,
+        flight_dir: str,
+        *,
+        speed: float = 1.0,
+        mqtt_url: str = "tcp://localhost:1883",
+        video_push_url: Optional[str] = None,
+        video_anchor_offset_ms: int = 0,
+    ) -> dict:
+        """Async 启动 sim-dji play 子进程。
+
+        跟 ``start()`` 行为对等，但 sidecar 等待用 ``await asyncio.sleep``
+        而不是 ``time.sleep``——dashboard FastAPI handler 改 ``async def`` 后
+        整条链路不再阻塞任何线程，HTTP 客户端超时也不会霸占 anyio threadpool。
+        """
+        proc, deadline = self._prepare_start_subprocess(
+            flight_dir, speed=speed, mqtt_url=mqtt_url,
+            video_push_url=video_push_url,
+            video_anchor_offset_ms=video_anchor_offset_ms,
+        )
+        while time.monotonic() < deadline:
+            outcome = self._check_sidecar(proc)
+            if outcome is not None:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            self._log_sidecar_timeout()
+        logger.info("PlayController started (async): pid={}", proc.pid)
+        return self.status()
+
+    def _prepare_start_subprocess(
+        self,
+        flight_dir: str,
+        *,
+        speed: float,
+        mqtt_url: str,
+        video_push_url: Optional[str],
+        video_anchor_offset_ms: int,
+    ) -> tuple[subprocess.Popen, float]:
+        """同步 Popen 起 sim-dji play + 写 pid/meta/symlink。
+
+        返回 (proc, deadline_monotonic)。供 ``start()`` 同步路径和 ``astart()``
+        异步路径共享，避免双倍 ftruncate/symlink/Popen 逻辑。
+        """
         resolved = self._resolve_flight_dir(flight_dir)
 
         cur = self.status()
@@ -104,28 +175,75 @@ class PlayController:
             self._latest_log.unlink()
         self._latest_log.symlink_to(log_path.name)
 
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if self._control_sidecar.exists():
-                break
-            if proc.poll() is not None:
-                logger.warning(
-                    "play process exited early (rc={}); sidecar will not appear",
-                    proc.poll(),
-                )
-                break
-            time.sleep(0.1)
-        else:
-            logger.warning(
-                "control sidecar timeout for {} ({}); "
-                "pause/resume/seek will return 503",
-                self.name, self._control_sidecar,
-            )
+        deadline = time.monotonic() + self.SIDECAR_WAIT_SECONDS
+        return proc, deadline
 
-        logger.info("PlayController started: pid={} flight={}", proc.pid, resolved)
-        return self.status()
+    def _check_sidecar(self, proc: subprocess.Popen) -> Optional[str]:
+        """Sidecar 状态机一次性 poll。
+
+        返回：
+          - "ready"   sidecar 已写
+          - "dead"    子进程已退（sidecar 不会再出现）
+          - None      还在等
+        """
+        if self._control_sidecar.exists():
+            return "ready"
+        rc = proc.poll()
+        if rc is not None:
+            logger.warning(
+                "play process exited early (rc={}); sidecar will not appear", rc,
+            )
+            return "dead"
+        return None
+
+    def _log_sidecar_timeout(self) -> None:
+        logger.warning(
+            "control sidecar timeout for {} ({}); "
+            "pause/resume/seek will return 503",
+            self.name, self._control_sidecar,
+        )
 
     def stop(self, timeout_s: float = 10.0) -> dict:
+        """Sync 停 sim-dji play 子进程；阻塞最长 ``timeout_s``。
+
+        async 上下文（FastAPI handler）请用 ``astop`` 避免冻 loop。
+        """
+        pid = self._send_term_and_get_pid()
+        if pid is None:
+            return self._finalize_stop()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(pid):
+                break
+            time.sleep(0.2)
+        else:
+            self._sigkill_after_timeout(pid)
+        return self._finalize_stop()
+
+    async def astop(self, timeout_s: float = 10.0) -> dict:
+        """Async 停 sim-dji play 子进程。
+
+        跟 ``stop()`` 行为对等，但 SIGTERM 等待用 ``await asyncio.sleep``
+        而不是 ``time.sleep``——FastAPI handler 不会被冻 ``timeout_s`` 秒，
+        并发 stop 请求不再霸占 anyio threadpool。
+        """
+        pid = self._send_term_and_get_pid()
+        if pid is None:
+            return self._finalize_stop()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._pid_alive(pid):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self._sigkill_after_timeout(pid)
+        return self._finalize_stop()
+
+    def _send_term_and_get_pid(self) -> Optional[int]:
+        """SIGTERM 给当前 pid；ProcessLookupError 或 not-running 时返 None。
+
+        not-running → 抛 NotRunning（路由层 404）；进程已死 → 清状态文件返 None。
+        """
         cur = self.status()
         if cur["state"] != "running":
             raise NotRunning()
@@ -133,27 +251,19 @@ class PlayController:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
-            self._cleanup_state_files()
-            try:
-                self._control_sidecar.unlink()
-            except FileNotFoundError:
-                pass
-            return self.status()
+            return None
+        return pid
 
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if not self._pid_alive(pid):
-                break
-            time.sleep(0.2)
-        else:
-            logger.warning(
-                "PlayController: pid {} SIGTERM 超时；SIGKILL 兜底", pid,
-            )
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    def _sigkill_after_timeout(self, pid: int) -> None:
+        logger.warning(
+            "PlayController: pid {} SIGTERM 超时；SIGKILL 兜底", pid,
+        )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
+    def _finalize_stop(self) -> dict:
         self._cleanup_state_files()
         try:
             self._control_sidecar.unlink()

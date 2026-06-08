@@ -54,7 +54,13 @@ class Player:
         self._video_task: Optional[asyncio.Task] = None
         self._control_sidecar_path = control_sidecar_path
         self._control_server: Optional[ControlServer] = None
-        self._seek_lock = asyncio.Lock()
+        # 单一控制锁覆盖 pause/resume/seek —— 三者都 mutate scheduler /
+        # _video_task / _video_pusher，必须串行。原来只 seek 有锁，
+        # 高频 pause+seek 交错时窗会孤儿掉 ffmpeg 子进程。
+        # Regression: test_pause_during_seek_serializes_via_control_lock.
+        self._control_lock = asyncio.Lock()
+        # 兼容：保留 _seek_lock 别名给 wait_until_done 用同一把锁。
+        self._seek_lock = self._control_lock
 
     async def start(self) -> None:
         self._manifest = json.loads((self.flight_dir / "manifest.json").read_text())
@@ -104,8 +110,12 @@ class Player:
             await self._scheduler.wait_until_virt(plan["wait_virt_ms"])
             pusher = self._video_pusher_factory(
                 video_file, self._video_push_url, [])
-            pusher.start(plan["ss_seconds"])
+            # 先存引用再 start：ffmpeg Popen 成功后 start() 内若再失败，
+            # 仍能在 wait_until_done / _stop_video_for_pause 里被 stop()
+            # 清理，避免孤儿子进程。
+            # Regression: test_video_pusher_reference_set_before_start.
             self._video_pusher = pusher
+            pusher.start(plan["ss_seconds"])
             logger.info("video push started -> {}", self._video_push_url)
         except asyncio.CancelledError:
             raise
@@ -156,8 +166,10 @@ class Player:
                 except (asyncio.CancelledError, Exception):
                     pass
             if self._video_pusher is not None:
+                # aclose 把同步 ffmpeg wait 丢线程池，避免冻 asyncio loop
+                # 最长 10s（review MAJOR: video_pusher.stop 阻塞事件循环）。
                 try:
-                    self._video_pusher.stop()
+                    await self._video_pusher.aclose()
                 except Exception:
                     logger.exception("停止视频推流失败")
             # 发一条合成 dock OSD 带 flighttask_step_code=5（任务空闲），让
@@ -179,21 +191,23 @@ class Player:
     # ==================================================================
 
     async def pause(self) -> dict:
-        if self._scheduler.paused:
-            raise RuntimeError("already paused")
-        self._scheduler.pause()
-        await self._stop_video_for_pause()
-        return {"state": "paused", "virt_ms": self._scheduler.virt_now_ms()}
+        async with self._control_lock:
+            if self._scheduler.paused:
+                raise RuntimeError("already paused")
+            self._scheduler.pause()
+            await self._stop_video_for_pause()
+            return {"state": "paused", "virt_ms": self._scheduler.virt_now_ms()}
 
     async def resume(self) -> dict:
-        if not self._scheduler.paused:
-            raise RuntimeError("not paused")
-        self._scheduler.resume()
-        await self._restart_video_at_current_virt()
-        return {"state": "running", "virt_ms": self._scheduler.virt_now_ms()}
+        async with self._control_lock:
+            if not self._scheduler.paused:
+                raise RuntimeError("not paused")
+            self._scheduler.resume()
+            await self._restart_video_at_current_virt()
+            return {"state": "running", "virt_ms": self._scheduler.virt_now_ms()}
 
     async def seek(self, virt_ms: int) -> dict:
-        async with self._seek_lock:
+        async with self._control_lock:
             total = self._total_ms()
             if total is not None and virt_ms >= total:
                 virt_ms = max(0, total - 1)
@@ -254,7 +268,7 @@ class Player:
             self._video_task = None
         if self._video_pusher is not None:
             try:
-                self._video_pusher.stop()
+                await self._video_pusher.aclose()
             except Exception:
                 logger.exception("video pusher stop failed during pause/seek")
             self._video_pusher = None
@@ -299,7 +313,7 @@ class Player:
             self._video_task = None
         if self._video_pusher is not None:
             try:
-                self._video_pusher.stop()
+                await self._video_pusher.aclose()
             except Exception:
                 logger.exception("video pusher stop failed during restart")
             self._video_pusher = None

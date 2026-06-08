@@ -40,6 +40,9 @@ class MqttRecorderClient:
         self._connected = asyncio.Event()
         self._stop = asyncio.Event()
         self._disconnect_at_ms: Optional[int] = None
+        # _connecting：connect 已发起但 _on_connect 尚未回调；防止 run_forever
+        # 1s tick 期间重复 connect → 双倍 subscribe → QoS=1 重复消息 → JSONL 双倍。
+        self._connecting: bool = False
         self.gaps: list[dict] = []
 
     async def _on_message_internal(self, client, topic, payload, qos, properties):
@@ -61,11 +64,13 @@ class MqttRecorderClient:
         for pattern in self.cfg.subscribe_patterns:
             self._client.subscribe(pattern, qos=1)
         self._connected.set()
+        self._connecting = False
 
     def _on_disconnect(self, client, packet, exc=None):
         logger.warning("mqtt disconnected exc={}", exc)
         self._disconnect_at_ms = now_ms()
         self._connected.clear()
+        self._connecting = False
 
     async def connect(self) -> None:
         ssl_ctx: Optional[ssl.SSLContext] = None
@@ -84,8 +89,17 @@ class MqttRecorderClient:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                if not self._connected.is_set():
-                    await self.connect()
+                # 仅当未连接且无 in-flight connect 时才发起；防止 broker 慢响应
+                # 时 1s tick 重复 connect → _on_connect 多次触发 → 重复 subscribe
+                # → QoS=1 收到重复消息 → JSONL 双倍。
+                # Regression: test_run_forever_does_not_double_connect.
+                if not self._connected.is_set() and not self._connecting:
+                    self._connecting = True
+                    try:
+                        await self.connect()
+                    except Exception:
+                        self._connecting = False
+                        raise
                     backoff = 1.0
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:

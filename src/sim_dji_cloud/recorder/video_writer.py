@@ -227,7 +227,17 @@ class VideoWriter:
                 self._proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-                self._proc.wait()
+                # SIGKILL 后再等一段时间；ffmpeg 卡在内核 D 状态时
+                # 裸 wait() 会无限阻塞。timeout=timeout_s 保上限。
+                # Regression: test_stop_does_not_block_forever_when_ffmpeg_hangs.
+                try:
+                    self._proc.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        "ffmpeg SIGKILL 后 {}s 仍未退出 (pid={})；放弃等待，"
+                        "可能是内核 D 状态。后续 reaper 处理僵尸。",
+                        timeout_s, self._proc.pid,
+                    )
 
         # ffmpeg has now exited (cleanly or killed). Capture the wall —
         # this is the upper anchor for ffprobe-based first-frame derivation.

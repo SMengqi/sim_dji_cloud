@@ -45,8 +45,15 @@ class ControlServer:
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, host="127.0.0.1", port=0)
         await self._site.start()
-        sockets = self._site._server.sockets    # aiohttp >= 3.10
-        self.port = sockets[0].getsockname()[1]
+        # 用 aiohttp 公开 API runner.addresses 拿端口；老代码访问内部属性
+        # _site._server.sockets，aiohttp 改内部 → sidecar control_port=null
+        # → pause/resume/seek 整套静默 503。fallback 老路径以容错。
+        self.port = self._extract_port()
+        if self.port is None:
+            raise RuntimeError(
+                "ControlServer.start: failed to determine bound port from aiohttp "
+                "(checked runner.addresses and _site._server.sockets)"
+            )
         self._sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         self._sidecar_path.write_text(json.dumps({
             "control_port": self.port,
@@ -55,6 +62,23 @@ class ControlServer:
         }))
         logger.info("control server listening on 127.0.0.1:{} sidecar={}",
                     self.port, self._sidecar_path)
+
+    def _extract_port(self) -> Optional[int]:
+        # 公开 API：aiohttp >= 3.8 暴露 AppRunner.addresses (list of sockaddr tuples)
+        addrs = getattr(self._runner, "addresses", None)
+        if addrs:
+            try:
+                return int(addrs[0][1])
+            except (IndexError, TypeError, ValueError):
+                pass
+        # Fallback：保留旧路径以防早期 aiohttp 或运行时 quirk
+        try:
+            sockets = self._site._server.sockets  # type: ignore[union-attr]
+            if sockets:
+                return int(sockets[0].getsockname()[1])
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return None
 
     async def stop(self) -> None:
         try:

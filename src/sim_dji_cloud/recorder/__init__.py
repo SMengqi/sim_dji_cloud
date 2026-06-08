@@ -46,6 +46,7 @@ class Recorder:
         self._video_writer_factory = video_writer_factory
         self._video_writer: Optional[VideoWriter] = None
         self._video_started_ms: Optional[int] = None
+        self._drained_topics: set[str] = set()
 
     async def start_async_components(self) -> None:
         """阶段一无后台任务；预留接口给阶段二。"""
@@ -244,8 +245,13 @@ class Recorder:
         if self.flight_dir is None:
             raise RuntimeError("no flight in progress")
 
-        for q in self._queues.values():
+        # 跟踪已被 finalize drain 过的 queues —— 后续 reset_for_next_flight
+        # 不再重复 drain。重复 await 一个已 crash 的 consumer 会再次抛出存储
+        # 的异常被 reset 的 except 静默吃掉。
+        # Regression: test_reset_does_not_redrain_after_finalize.
+        for topic, q in self._queues.items():
             await q.drain_and_close()
+            self._drained_topics.add(topic)
 
         assert self._manifest is not None
         # rename 现在不再关闭/重建 writer，每个 topic 的全生命周期数据都在
@@ -287,12 +293,16 @@ class Recorder:
         """一段任务 finalize 后清空状态，准备录下一段（长跑多任务）。
 
         注意：保留 dock_sn / 已学到的 drone_sn / detector 的 sticky _last_step。
+        已被 finalize drain 过的 queues 不重复 drain（重复 await crashed
+        consumer 会再次抛出存储的异常被 except 静默吃掉）。
         """
-        for q in self._queues.values():
+        for topic, q in self._queues.items():
+            if topic in self._drained_topics:
+                continue
             try:
                 await q.drain_and_close()
             except Exception:
-                logger.exception("drain queue on reset failed")
+                logger.exception("drain queue on reset failed (topic={})", topic)
         self._queues = {}
         self._writers = {}
         self._topic_routed = {}
@@ -301,4 +311,5 @@ class Recorder:
         self._task_started_ms = None
         self._video_writer = None
         self._video_started_ms = None
+        self._drained_topics.clear()
         self._detector.reset()
