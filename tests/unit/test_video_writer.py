@@ -252,6 +252,112 @@ def test_long_running_ffmpeg_is_in_manifest(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Reconnect: a ≥ success_min run that exits ON ITS OWN (source dropped) is
+#     NOT the end of recording — the supervisor relaunches because the flight
+#     is still going. Recording ends only when stop() fires.
+#     "断开并不代表完成了" — regression for the mid-flight RTMP drop.
+# ---------------------------------------------------------------------------
+
+def test_reconnects_after_long_run_self_exit(tmp_path: Path):
+    video_dir = tmp_path / "video"
+    launches: list = []
+    third_launch = threading.Event()
+
+    def side_effect(*args, **kwargs):
+        launches.append(args)
+        n = len(launches)
+        if n <= 2:
+            # A proc that "ran" (had frames) then exited on its own → completed
+            # segment, but flight ongoing → supervisor must relaunch.
+            seq = iter([None, 0, 0, 0, 0])
+            p = MagicMock()
+            p.poll.side_effect = lambda: next(seq, 0)
+            p.stdout = _progress_stdout(b"out_time_us=100000\n")
+            return p
+        # 3rd attempt stays alive so we can stop() cleanly.
+        third_launch.set()
+        return _running_proc()
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen") as popen_mock:
+        popen_mock.side_effect = side_effect
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=0.0,   # any self-exit counts as a completed segment
+        )
+        vw.start()
+        assert third_launch.wait(timeout=3.0), (
+            "supervisor must relaunch ffmpeg after a long run self-exits "
+            "(a source drop is not 'recording complete')"
+        )
+        vw.stop()
+
+    assert len(launches) >= 3, (
+        f"expected ≥3 ffmpeg launches (2 self-exits → 2 reconnects + 1 running), "
+        f"got {len(launches)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2c. manifest_video_block emits ALL real segments with per-segment offsets.
+#     White-box: populate _segments directly (deterministic, no real ffprobe).
+# ---------------------------------------------------------------------------
+
+def _seg(file, popen, start, dur, had_frames=True):
+    return {
+        "file": file,
+        "ffmpeg_popen_wall_ms": popen,
+        "ffmpeg_start_wall_ms": start,
+        "had_any_frames": had_frames,
+        "duration_ms": dur,
+        "pts_offset_ms": 0,
+    }
+
+
+def test_manifest_block_multi_segment(tmp_path: Path):
+    vw = VideoWriter("rtmp://x/live/y", tmp_path / "video")
+    vw._segments = [
+        _seg("main_1000.mp4", popen=900, start=1000, dur=5000),
+        _seg("main_20000.mp4", popen=19000, start=20000, dur=3000),
+    ]
+    block = vw.manifest_video_block(duration_ms=25000)
+
+    # top-level fields stay backward-compatible: point at the FIRST real segment
+    assert block["file"] == "video/main_1000.mp4"
+    assert block["started_at_recv_ms"] == 1000
+    assert block["popen_at_recv_ms"] == 900
+    assert block["duration_ms"] == 25000
+
+    segs = block["segments"]
+    assert len(segs) == 2
+    assert segs[0]["file"] == "video/main_1000.mp4"
+    assert segs[0]["start_ms"] == 0
+    assert segs[0]["end_ms"] == 5000               # 0 + dur 5000
+    assert segs[0]["started_at_recv_ms"] == 1000
+    assert segs[0]["popen_at_recv_ms"] == 900
+    assert segs[1]["file"] == "video/main_20000.mp4"
+    assert segs[1]["start_ms"] == 19000            # 20000 - 1000 (rel to first frame)
+    assert segs[1]["end_ms"] == 22000              # 19000 + dur 3000
+    assert segs[1]["started_at_recv_ms"] == 20000
+
+
+def test_manifest_block_multi_segment_skips_empty_shells(tmp_path: Path):
+    vw = VideoWriter("rtmp://x/live/y", tmp_path / "video")
+    vw._segments = [
+        _seg("main_1000.mp4", popen=900, start=1000, dur=5000),
+        _seg("main_8000.mp4", popen=8000, start=8000, dur=None, had_frames=False),
+        _seg("main_20000.mp4", popen=19000, start=20000, dur=3000),
+    ]
+    block = vw.manifest_video_block(duration_ms=25000)
+    files = [s["file"] for s in block["segments"]]
+    assert files == ["video/main_1000.mp4", "video/main_20000.mp4"], (
+        "empty-shell (had_any_frames=False) segments must be excluded"
+    )
+    assert block["file"] == "video/main_1000.mp4"
+
+
+# ---------------------------------------------------------------------------
 # 3. Fast-fail then long-run → only the success is in the manifest
 # ---------------------------------------------------------------------------
 

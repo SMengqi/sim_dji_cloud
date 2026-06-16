@@ -86,8 +86,15 @@ Each attempt:
 4. **Classify the exit.**
    - ffmpeg still alive when stop_event fires → user-initiated finalize, keep
      the segment. ``stop()`` SIGINTs ffmpeg so the mp4 trailer is written.
-   - ``ran_sec >= success_min_seconds`` (default 15 s) → ffmpeg necessarily
-     received real packets, treat as completed recording, do **not** retry.
+   - ``ran_sec >= success_min_seconds`` (default 15 s) → ffmpeg received real
+     packets, so this is a **completed segment** — keep it. But a source drop
+     is NOT "recording complete": as long as ``stop()`` hasn't fired the flight
+     is still in progress, so finalize this segment in place (join its reader,
+     ffprobe its anchor) and **reconnect** — the next ffmpeg run becomes the
+     next segment. This is record-side segment stitching: a mid-flight RTMP
+     ``Error during demuxing: Input/output error`` (DJI Dock 3 does this
+     routinely on a congested link) no longer ends video capture for the rest
+     of the flight. Regression: ``test_reconnects_after_long_run_self_exit``.
    - Else → failed start (no publisher yet / transient glitch). Delete the
      partial mp4 (under whichever name it currently has — placeholder or
      renamed), pop the segment entry, sleep ``retry_interval_s``, retry.
@@ -96,10 +103,23 @@ Each attempt:
    ``"a"`` mode each attempt with a ``=== ffmpeg attempt at wall_ms=… ===``
    separator so failure messages across attempts are all preserved.
 
+Per-segment finalize: each segment is finalized with its OWN exit wall time —
+the reconnect path in ``_supervise`` finalizes a dropped segment *before*
+launching the next one, and ``stop()`` finalizes only the segment it itself
+interrupts (re-running ffprobe on an already-finalized segment with a later
+``now()`` would push its first-frame anchor wrong). ``manifest_video_block``
+emits every ``had_any_frames`` segment with per-segment offsets; the top-level
+``file`` / ``started_at_recv_ms`` stay pointed at the first segment for
+backward compatibility.
+
 Not in scope:
-- Concatenating multiple successful ffmpeg runs into one logical recording
-  (segment stitching). If ffmpeg dies mid-flight after running ≥ 15 s, we stop
-  there and the rest of the flight isn't captured.
+- Multi-segment **playback**. The recorder now captures and catalogues every
+  segment, but the player (``player/video_pusher.py``) still pushes only the
+  first segment (top-level ``manifest.video.file``). Replaying segments 2..N at
+  their offsets is a follow-up.
+- Probe budget: see ``_build_cmd`` / ``probesize`` / ``analyzeduration`` —
+  DJI's late/sparse H.264 sequence header needs a larger probe than ffmpeg's
+  default or the mp4 muxer fails with "dimensions not set".
 """
 
 from __future__ import annotations
@@ -178,6 +198,10 @@ class VideoWriter:
         # 每次 attempt 起一个 progress reader 线程；stop() 必须 join 完才能
         # 写 timing.json，否则会跟"reader 还在 rename"撞 race。
         self._progress_threads: list[threading.Thread] = []
+        # 当前 attempt 的 progress reader。重连前必须 join 它，确保它的 rename /
+        # had_any_frames patch 落在正确的（当时的 tail）segment 上，之后才 append
+        # 新 segment——否则 _segments[-1] 会指向新段，patch 错位。
+        self._current_progress_thread: Optional[threading.Thread] = None
         # Protects concurrent writes to ``_filename`` / ``_segments`` between
         # the supervisor thread (cleanup) and the progress reader thread (rename).
         self._state_lock = threading.Lock()
@@ -232,6 +256,7 @@ class VideoWriter:
             self._supervisor_thread.join(timeout=timeout_s)
 
         if self._proc is not None and self._proc.poll() is None:
+            # stop() 是结束这一段的人：SIGINT 让 ffmpeg 写完 mp4 trailer。
             self._proc.send_signal(signal.SIGINT)
             try:
                 self._proc.wait(timeout=timeout_s)
@@ -248,43 +273,78 @@ class VideoWriter:
                         "可能是内核 D 状态。后续 reaper 处理僵尸。",
                         timeout_s, self._proc.pid,
                     )
+            # ffmpeg 已退出（clean 或 killed）。用退出时刻 finalize 这一段
+            # （join reader + 关 log + ffprobe 权威锚点）。
+            exit_wall_ms = int(time.time() * 1000)
+            self._finalize_current_segment(exit_wall_ms)
+        else:
+            # ffmpeg 在 stop() 之前就自己退了（源端断开的那一段）：它已在
+            # _supervise 重连循环里用 *它自己的* exit_wall finalize 过了；这里再用
+            # now() 重算会把首帧锚点算晚。所以只做防御性收尾。
+            for t in self._progress_threads:
+                t.join(timeout=timeout_s)
+            if self._stderr_log is not None:
+                try:
+                    self._stderr_log.close()
+                except Exception:
+                    pass
+                self._stderr_log = None
 
-        # ffmpeg has now exited (cleanly or killed). Capture the wall —
-        # this is the upper anchor for ffprobe-based first-frame derivation.
-        exit_wall_ms = int(time.time() * 1000)
+        self._write_timing()
 
-        # ffmpeg exited → its stdout pipe closes → progress readers' for-loops
-        # exit and finally-rename fires. Join them so any in-band rename
-        # lands in self._segments before ffprobe reads the file.
-        for t in self._progress_threads:
-            t.join(timeout=timeout_s)
+    def _finalize_current_segment(self, exit_wall_ms: int) -> None:
+        """Finalize the just-exited (tail) segment with its OWN exit wall time.
 
+        Joins this attempt's progress reader so any in-band rename /
+        ``had_any_frames`` patch lands, closes its stderr log, then runs the
+        authoritative ffprobe anchor override (``first_frame_wall =
+        exit_wall - duration``).
+
+        Called once per segment, each with that segment's exit wall:
+          - the reconnect path in ``_supervise`` (a ≥ ``success_min`` run the
+            source dropped), *before* the next ffmpeg launches; and
+          - ``stop()`` for the segment stop() itself interrupts.
+
+        Joining the reader before the next launch is what keeps multi-segment
+        metadata from cross-contaminating: the reader patches ``_segments[-1]``,
+        so it must finish while the tail is still its own segment.
+        """
+        t = self._current_progress_thread
+        if t is not None:
+            t.join(timeout=10.0)
+            self._current_progress_thread = None
         if self._stderr_log is not None:
             try:
                 self._stderr_log.close()
             except Exception:
                 pass
             self._stderr_log = None
-
-        # Authoritative override: ffprobe the on-disk mp4 to learn the real
-        # recorded duration, then back-calc first-frame wall from exit_wall.
-        # ffprobe reads the muxer's actual PTS so it's immune to the
-        # ``-progress out_time_us`` unreliability that bit us on 2026-06-01.
+        # Authoritative override: ffprobe the on-disk mp4 for its real duration,
+        # immune to ``-progress out_time_us`` unreliability (2026-06-01 bug).
         self._finalize_segment_via_ffprobe(exit_wall_ms)
 
-        self._write_timing()
-
     def manifest_video_block(self, duration_ms: int) -> dict:
-        """Return ``manifest.video`` block. ``file=None`` & ``segments=[]`` if
-        no ffmpeg attempt was ever classified as successful, OR if ffmpeg ran
-        long enough (≥ ``success_min_seconds``) but never produced a first
-        frame (``ffmpeg_start_wall_ms == ffmpeg_popen_wall_ms`` — supervisor
-        keeps the partial mp4 on disk for diagnostics but we refuse to lie to
-        downstream consumers about there being playable video).
+        """Return ``manifest.video`` block covering ALL recorded segments.
 
-        Reads filename from the segment list (not ``self._filename``) so the
-        block is consistent with what's on disk even if rename happened in a
-        different thread.
+        断点续录后一次飞行可能有多段：每次源端断开 + 重连产生一段。本方法把所有
+        "真录到帧"的段(had_any_frames=True)按时间顺序列进 ``segments[]``，每段带：
+
+          - ``file``                  相对 flight_dir 的路径（video/main_<ms>.mp4）
+          - ``start_ms`` / ``end_ms`` 相对**第一段首帧**的视频时间轴偏移
+          - ``started_at_recv_ms``    该段首帧的绝对墙钟（回放对齐锚点）
+          - ``popen_at_recv_ms``      该段"开始拉流"的绝对墙钟
+          - ``duration_ms``           ffprobe 测得的本段时长（None=未知）
+
+        顶层 ``file`` / ``started_at_recv_ms`` / ``popen_at_recv_ms`` 仍指向
+        **第一段**，保持对旧版单段播放器的向后兼容（当前回放只推第一段；多段
+        回放是后续工作）。
+
+        空壳段(had_any_frames=False，握手成功但 demuxing 立即 I/O error → ~800B
+        只有 moov header 的 mp4)被过滤掉。没有任何真段 → file=None / segments=[]。
+        老段（升级前 timing.json 缺 had_any_frames 字段）按"出过帧"放行。
+
+        从段列表读 filename（非 ``self._filename``），即使 rename 发生在别的线程，
+        block 也跟磁盘一致。
         """
         empty_block = {
             "file": None,
@@ -295,39 +355,55 @@ class VideoWriter:
             "segments": [],
         }
         with self._state_lock:
-            if not self._segments:
+            # had_any_frames 缺失 = 老段，按"出过帧"放行（向后兼容）。
+            real = [s for s in self._segments if s.get("had_any_frames", True)]
+            if not real:
+                if self._segments:
+                    logger.warning(
+                        "manifest.video skipped: {} segment(s) recorded but none "
+                        "had detected frames (all empty shells). Partial mp4(s) "
+                        "kept on disk for diagnostics.",
+                        len(self._segments),
+                    )
                 return empty_block
-            seg = self._segments[0]
-            started = seg["ffmpeg_start_wall_ms"]
-            # 老段（升级前的 timing.json）可能没有 ffmpeg_popen_wall_ms 字段，
-            # 这种情况下退回 started_at_recv_ms（语义上视频"开始拉流"≈"已开始录"）。
-            popen = seg.get("ffmpeg_popen_wall_ms", started)
-            # had_any_frames=False = progress reader 和 ffprobe 都没找到任何
-            # 帧数据。空壳 mp4，不让 dashboard 拿去回放。
-            # 注：sanity-rejected back-calc (start==popen 但确实出过帧) 仍
-            # had_any_frames=True，video 段保留，popen-time 作为锚点 fallback。
-            # 老段缺字段时按"出过帧"放行，保证向后兼容。
-            if not seg.get("had_any_frames", True):
-                logger.warning(
-                    "manifest.video skipped: first segment has no detected "
-                    "frames (had_any_frames=False, popen_wall_ms={}). "
-                    "Partial mp4 file {} is kept on disk for diagnostics.",
-                    popen, seg.get("file"),
-                )
-                return empty_block
-            video_rel = f"video/{seg['file']}"
+
+            first_started = real[0]["ffmpeg_start_wall_ms"]
+            seg_entries: list[dict] = []
+            for i, seg in enumerate(real):
+                started = seg["ffmpeg_start_wall_ms"]
+                popen = seg.get("ffmpeg_popen_wall_ms", started)
+                start_ms = started - first_started
+                seg_dur = seg.get("duration_ms")
+                if seg_dur is not None:
+                    end_ms = start_ms + seg_dur
+                elif i + 1 < len(real):
+                    # 本段时长未知（ffprobe 失败）→ 填到下一段起点。
+                    end_ms = real[i + 1]["ffmpeg_start_wall_ms"] - first_started
+                else:
+                    # 最后一段时长未知 → 退回飞行时长（单段场景向后兼容：
+                    # end_ms == duration_ms，跟旧 {start_ms:0,end_ms:duration} 一致）。
+                    end_ms = max(start_ms, duration_ms)
+                seg_entries.append({
+                    "file": f"video/{seg['file']}",
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "started_at_recv_ms": started,
+                    "popen_at_recv_ms": popen,
+                    "duration_ms": seg_dur,
+                })
+
+            top_started = first_started
+            top_popen = real[0].get("ffmpeg_popen_wall_ms", first_started)
+            top_file = seg_entries[0]["file"]
         return {
-            "file": video_rel,
+            "file": top_file,
             "source_url": self.source_url,
-            "started_at_recv_ms": started,
-            # popen_at_recv_ms：ffmpeg Popen 时的墙钟（"开始拉流"），可作为下游
-            # 视频对齐的备选锚点；如果回放时视频比数据晚，可以尝试用这个替代
-            # started_at_recv_ms 看效果。
-            "popen_at_recv_ms": popen,
+            "started_at_recv_ms": top_started,
+            # popen_at_recv_ms：第一段 ffmpeg Popen 墙钟（"开始拉流"），下游视频
+            # 对齐的备选早锚点。
+            "popen_at_recv_ms": top_popen,
             "duration_ms": duration_ms,
-            "segments": [
-                {"start_ms": 0, "end_ms": duration_ms, "file": video_rel},
-            ],
+            "segments": seg_entries,
         }
 
     # ------------------------------------------------------------------
@@ -379,34 +455,43 @@ class VideoWriter:
             # Classify by how long it ran.
             ran_sec = time.monotonic() - launch_t
             if ran_sec >= self._success_min_seconds:
-                # ≥ 15s 不再 retry，但区分"真录到"vs"撑住了但没出帧"。
-                # had_any_frames 由 progress reader（看到非零 out_time_us）或
-                # ffprobe（duration > 0）置位。两路都没置 → 空壳 mp4。真机场景：
-                # RTMP 握手成功 + stream metadata 拿到，但 demuxing I/O error
-                # 立即断开 → mp4 文件 ~800B 只有 moov header，无视频帧。
-                # ffprobe 在 stop() 才跑，所以这里只看 in-band 标志；ffprobe
-                # 后续如果也算不出 duration，manifest_video_block 会再次兜底
-                # 跳过 video 段。
+                # 段完成（≥ success_min 说明 ffmpeg 真收过包）。关键语义：
+                # **源端断开 ≠ 整个飞行结束**。只要 stop() 没触发，飞行仍在进行，
+                # 必须重连续录，把后续画面录成 *新的* segment（断点续录 / segment
+                # stitching）。真正的结束只由 stop() 决定。
+                #
+                # 在重连之前，必须 *就地* finalize 这一段：join 它的 progress
+                # reader（让 rename / had_any_frames patch 落定）、关掉它的
+                # stderr log、用本段自己的 exit_wall_ms 跑 ffprobe 拿权威锚点。
+                # 这一步在 append 下一段之前完成，确保各段 metadata 不串。
+                exit_wall_ms = int(time.time() * 1000)
+                self._finalize_current_segment(exit_wall_ms)
                 with self._state_lock:
-                    no_first_frame = (
+                    had_frames = (
                         bool(self._segments)
-                        and not self._segments[-1].get("had_any_frames", False)
+                        and self._segments[-1].get("had_any_frames", False)
                     )
-                if no_first_frame:
-                    logger.warning(
-                        "ffmpeg exited after {:.1f}s (≥ {}s) but progress reader "
-                        "got no first frame — RTMP source likely connected then "
-                        "stalled (e.g. demuxing I/O error). Keeping partial mp4 "
-                        "for diagnostics; manifest.video will skip if ffprobe "
-                        "also fails to confirm any frames.",
-                        ran_sec, self._success_min_seconds,
+                if had_frames:
+                    logger.info(
+                        "ffmpeg exited after {:.1f}s (≥ {}s) — 段已保存；源端断开但"
+                        "飞行未结束，{:.1f}s 后重连续录下一段",
+                        ran_sec, self._success_min_seconds, self._retry_interval_s,
                     )
                 else:
-                    logger.info(
-                        "ffmpeg exited after {:.1f}s (≥ {}s) — treating as completed recording",
-                        ran_sec, self._success_min_seconds,
+                    # 撑过 success_min 但一帧都没出（RTMP 握手成功 + 立即
+                    # demuxing I/O error → ~800B 空壳 mp4）。段留在 _segments 里但
+                    # had_any_frames=False，manifest_video_block 会把它过滤掉。
+                    logger.warning(
+                        "ffmpeg exited after {:.1f}s (≥ {}s) but progress reader got "
+                        "no first frame — RTMP source connected then stalled "
+                        "(e.g. demuxing I/O error). Partial mp4 kept for diagnostics "
+                        "(manifest 会跳过该空壳段)；{:.1f}s 后重连续录",
+                        ran_sec, self._success_min_seconds, self._retry_interval_s,
                     )
-                return
+                if self._stop_event.is_set():
+                    break
+                self._stop_event.wait(timeout=self._retry_interval_s)
+                continue
 
             logger.warning(
                 "ffmpeg exited within {:.1f}s (< {}s threshold) — treating as failed "
@@ -478,6 +563,7 @@ class VideoWriter:
         )
         progress_thread.start()
         self._progress_threads.append(progress_thread)
+        self._current_progress_thread = progress_thread
 
     def _read_progress_and_rename(
         self,
@@ -767,6 +853,13 @@ class VideoWriter:
         duration_ms = self._probe_duration_ms(file_path)
         if duration_ms is None:
             return  # ffprobe missing/failed; keep in-band path's result
+
+        # 记录本段真实时长（ffprobe 读容器 PTS），供 manifest_video_block 算各段
+        # 在飞行时间轴上的 end_ms。即使下面锚点 sanity-reject，时长仍然可靠。
+        with self._state_lock:
+            if (self._segments
+                    and self._segments[-1]["file"] == current_filename):
+                self._segments[-1]["duration_ms"] = duration_ms
 
         first_frame_wall_ms = exit_wall_ms - duration_ms
         if first_frame_wall_ms < popen_wall_ms:
