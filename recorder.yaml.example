@@ -31,7 +31,12 @@ video:
   enabled: false                 # 默认不录视频；需要时启动加 --video
   source_url_override: "rtmp://localhost/live/dock"
   source_url_field: "osd.live_capacity.live_status[0].rtmp_url"
-  ffmpeg_extra_args: []
+  ffmpeg_extra_args: []        # 输出侧附加参数（落在 -i 之后）
+  # 输入侧探测预算（落在 -i 之前）。DJI Dock 的 H.264-over-RTMP 序列头(SPS/PPS)
+  # 来得晚/稀疏时，默认探测内拿不到画面尺寸 → mp4 "dimensions not set" → 录成空壳。
+  # 调大可让 ffmpeg 等够序列头再封装。默认 20M/10M；仍不够可继续加大（如 50M）。
+  ffmpeg_probesize: "20M"
+  ffmpeg_analyzeduration: "10M"
 
 flight_detection:
   record_steps: [0, 1, 2]        # dock flighttask_step_code ∈ 此集合时录制（0准备/1飞行/2作业后恢复）

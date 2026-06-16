@@ -162,6 +162,13 @@ class Recorder:
                     video_dir = self.flight_dir / "video"
                     vw = self._video_writer_factory(
                         url, video_dir, vcfg.get("ffmpeg_extra_args", []))
+                    # 可选 config 覆盖输入探测预算（DJI dock 序列头晚到时调大）。
+                    # 默认 20M/10M 已在 VideoWriter 内；用 setattr 后置覆盖而非工厂
+                    # 参数，避免破坏自定义 factory 的 (url, out, args) 三参签名。
+                    if vcfg.get("ffmpeg_probesize") and hasattr(vw, "_probesize"):
+                        vw._probesize = vcfg["ffmpeg_probesize"]
+                    if vcfg.get("ffmpeg_analyzeduration") and hasattr(vw, "_analyzeduration"):
+                        vw._analyzeduration = vcfg["ffmpeg_analyzeduration"]
                     vw.start()
                     self._video_writer = vw
                     self._video_started_ms = started_ms

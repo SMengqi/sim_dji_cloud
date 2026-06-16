@@ -150,6 +150,8 @@ class VideoWriter:
         extra_args: Optional[list[str]] = None,
         retry_interval_s: float = 2.0,
         success_min_seconds: float = 15.0,
+        probesize: str = "20M",
+        analyzeduration: str = "10M",
     ):
         self.source_url = source_url
         self.output_dir = Path(output_dir)
@@ -157,6 +159,14 @@ class VideoWriter:
         self.extra_args = list(extra_args or [])
         self._retry_interval_s = retry_interval_s
         self._success_min_seconds = success_min_seconds
+        # 输入探测预算。DJI Dock 的 H.264-over-RTMP 序列头(SPS/PPS)来得晚 /
+        # 稀疏，ffmpeg 默认 probesize(5MB)/analyzeduration 内常常拿不到画面
+        # 尺寸 → mp4 muxer "dimensions not set / Could not write header" → 录成
+        # 空壳。实测把这两个调大(20M/10M)后 ffmpeg 才解析进真正的码流。
+        # 必须作为 **输入** 选项放在 -i 之前才生效(见 _build_cmd)。
+        # 空字符串 = 不显式传该 flag(用 ffmpeg 默认)。
+        self._probesize = probesize
+        self._analyzeduration = analyzeduration
 
         self._proc: Optional[subprocess.Popen] = None
         self._stderr_log = None
@@ -878,6 +888,15 @@ class VideoWriter:
             self._stderr_log = None
 
     def _build_cmd(self, filename: str) -> list[str]:
+        # Input-side probe budget. MUST precede -i (input options); appended
+        # after -i they'd be treated as output options and silently ignored,
+        # which is exactly why ``ffmpeg_extra_args`` (which lands after -i)
+        # can't fix the "unspecified size" muxer failure.
+        probe_args: list[str] = []
+        if self._probesize:
+            probe_args += ["-probesize", self._probesize]
+        if self._analyzeduration:
+            probe_args += ["-analyzeduration", self._analyzeduration]
         return [
             "ffmpeg",
             "-y",
@@ -886,6 +905,7 @@ class VideoWriter:
             # loop can keep probing without consuming a GOP per probe like
             # the old ffmpeg-probe did.
             "-rw_timeout", "5000000",
+            *probe_args,
             "-i", self.source_url,
             # Only take video stream (+ optional audio); drop data streams
             # some docks inject (e.g. "Stream Data:none") which break the mp4

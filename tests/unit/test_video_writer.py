@@ -432,6 +432,49 @@ def test_rw_timeout_in_cmd_before_input(tmp_path: Path):
     )
 
 
+# 7b. ffmpeg cmd includes -probesize / -analyzeduration before -i so ffmpeg
+#     reads enough of a difficult live H.264 stream (DJI dock) to capture the
+#     SPS/PPS before the mp4 muxer needs dimensions. Default probe is too small
+#     → "Could not find codec parameters ... unspecified size" → empty mp4.
+# ---------------------------------------------------------------------------
+
+def test_probe_args_in_cmd_before_input(tmp_path: Path):
+    video_dir = tmp_path / "video"
+    launched_event = threading.Event()
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen") as popen_mock:
+        proc = _running_proc()
+
+        def side_effect(*args, **kwargs):
+            launched_event.set()
+            return proc
+
+        popen_mock.side_effect = side_effect
+
+        vw = VideoWriter(
+            source_url="rtmp://example/live/abc",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=0.05,
+            probesize="20M",
+            analyzeduration="10M",
+        )
+        vw.start()
+        launched_event.wait(timeout=2.0)
+        vw.stop()
+
+    args, _ = popen_mock.call_args
+    cmd = args[0]
+    i_idx = cmd.index("-i")
+    for flag, val in (("-probesize", "20M"), ("-analyzeduration", "10M")):
+        assert flag in cmd, f"ffmpeg cmd must include {flag}"
+        assert cmd.index(flag) < i_idx, (
+            f"{flag} must appear before -i (otherwise it's an output option "
+            f"and ffmpeg ignores it for input probing)"
+        )
+        assert cmd[cmd.index(flag) + 1] == val, f"{flag} value must be {val}"
+
+
 # ---------------------------------------------------------------------------
 # 8. main.ffmpeg.log: append mode, separator per attempt, earlier attempts preserved
 # ---------------------------------------------------------------------------
