@@ -300,6 +300,54 @@ def test_reconnects_after_long_run_self_exit(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 2b'. A ≥success_min run that self-exits with NO frames (source unreachable /
+#      -reconnect dragging "Error opening input" past the threshold) is a
+#      FAILED START, not a completed empty segment: delete the partial, drop
+#      the segment, retry. No phantom segments / junk files accumulate.
+#      (The stop()-interrupted shell case is kept for diagnostics — separate.)
+# ---------------------------------------------------------------------------
+
+def test_no_frame_self_exit_is_failed_start_not_phantom_segment(tmp_path: Path):
+    video_dir = tmp_path / "video"
+    third = threading.Event()
+    created: list = []
+
+    def side_effect(*args, **kwargs):
+        cmd = args[0]
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"\x00" * 800)   # ffmpeg leaves a tiny shell then exits
+        created.append(out)
+        if len(created) <= 2:
+            # already-exited proc with NO progress output → no frames, self-exit
+            return _exited_proc(exit_code=1, stdout=_empty_stdout())
+        third.set()
+        return _running_proc(stdout=_progress_stdout(b"out_time_us=100000\n"))
+
+    with patch("sim_dji_cloud.recorder.video_writer.subprocess.Popen") as popen_mock:
+        popen_mock.side_effect = side_effect
+        vw = VideoWriter(
+            source_url="http://h/live/x.flv",
+            output_dir=video_dir,
+            retry_interval_s=0.001,
+            success_min_seconds=0.0,   # force the ≥success_min branch even on instant exit
+        )
+        vw.start()
+        assert third.wait(timeout=3.0), "supervisor must retry after no-frame self-exits"
+        vw.stop()
+
+    assert len(created) >= 3, "no-frame self-exit must trigger a retry (failed-start)"
+    assert not created[0].exists(), "no-frame self-exit partial must be deleted (not kept)"
+    assert not created[1].exists()
+    # timing.json must not accumulate phantom no-frame segments from the self-exits
+    timing = json.loads((video_dir / "main.timing.json").read_text())
+    no_frame_segs = [s for s in timing["segments"] if not s.get("had_any_frames")]
+    assert no_frame_segs == [], (
+        f"no-frame self-exits must not leave phantom segments, got {no_frame_segs}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 2c. manifest_video_block emits ALL real segments with per-segment offsets.
 #     White-box: populate _segments directly (deterministic, no real ffprobe).
 # ---------------------------------------------------------------------------

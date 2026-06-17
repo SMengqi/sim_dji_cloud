@@ -86,18 +86,29 @@ Each attempt:
 4. **Classify the exit.**
    - ffmpeg still alive when stop_event fires → user-initiated finalize, keep
      the segment. ``stop()`` SIGINTs ffmpeg so the mp4 trailer is written.
-   - ``ran_sec >= success_min_seconds`` (default 15 s) → ffmpeg received real
-     packets, so this is a **completed segment** — keep it. But a source drop
-     is NOT "recording complete": as long as ``stop()`` hasn't fired the flight
-     is still in progress, so finalize this segment in place (join its reader,
-     ffprobe its anchor) and **reconnect** — the next ffmpeg run becomes the
-     next segment. This is record-side segment stitching: a mid-flight RTMP
-     ``Error during demuxing: Input/output error`` (DJI Dock 3 does this
-     routinely on a congested link) no longer ends video capture for the rest
-     of the flight. Regression: ``test_reconnects_after_long_run_self_exit``.
-   - Else → failed start (no publisher yet / transient glitch). Delete the
-     partial mp4 (under whichever name it currently has — placeholder or
-     renamed), pop the segment entry, sleep ``retry_interval_s``, retry.
+   - ``ran_sec >= success_min_seconds`` (default 15 s) AND the segment actually
+     produced frames (``had_any_frames``) → **completed segment**, keep it. A
+     source drop is NOT "recording complete": as long as ``stop()`` hasn't
+     fired the flight is still in progress, so finalize this segment in place
+     (join its reader, ffprobe its anchor) and **reconnect** — the next ffmpeg
+     run becomes the next segment. This is record-side segment stitching: a
+     mid-flight RTMP ``Error during demuxing: Input/output error`` (DJI Dock 3
+     does this routinely on a congested link) no longer ends video capture for
+     the rest of the flight. Regression: ``test_reconnects_after_long_run_self_exit``.
+   - ``ran_sec >= success_min_seconds`` but **no frames** → treat as a failed
+     start, not a completed (empty) segment. With ``-reconnect`` on an http
+     source, an *unreachable / not-yet-publishing* endpoint makes ffmpeg retry
+     the open and burn past the 15 s threshold before exiting with
+     ``Error opening input: Connection timed out`` — that's not a recording, so
+     delete the partial, drop the segment, and retry like any failed start
+     (otherwise the reconnect loop accumulates phantom no-frame segments + junk
+     files). Regression: ``test_no_frame_self_exit_is_failed_start_not_phantom_segment``.
+     (The *stop()-interrupted* no-frame shell is a separate, terminal case — it
+     is kept on disk for diagnostics; see ``test_empty_shell_mp4_skipped_in_manifest``.)
+   - ``ran_sec < success_min_seconds`` → failed start (no publisher yet /
+     transient glitch). Delete the partial mp4 (under whichever name it
+     currently has — placeholder or renamed), pop the segment entry, sleep
+     ``retry_interval_s``, retry.
 
 5. **stderr is appended, not overwritten.** ``main.ffmpeg.log`` is opened in
    ``"a"`` mode each attempt with a ``=== ffmpeg attempt at wall_ms=… ===``
@@ -309,19 +320,29 @@ class VideoWriter:
         metadata from cross-contaminating: the reader patches ``_segments[-1]``,
         so it must finish while the tail is still its own segment.
         """
+        self._join_current_progress_reader()
+        self._close_stderr_log()
+        # Authoritative override: ffprobe the on-disk mp4 for its real duration,
+        # immune to ``-progress out_time_us`` unreliability (2026-06-01 bug).
+        self._finalize_segment_via_ffprobe(exit_wall_ms)
+
+    def _join_current_progress_reader(self) -> None:
+        """Join this attempt's progress reader so its in-band rename /
+        ``had_any_frames`` patch lands on the (still-tail) segment before we
+        decide what to do with it. Must run before the next ffmpeg launches."""
         t = self._current_progress_thread
         if t is not None:
             t.join(timeout=10.0)
             self._current_progress_thread = None
+
+    def _close_stderr_log(self) -> None:
+        """Close the current attempt's ffmpeg stderr log handle (idempotent)."""
         if self._stderr_log is not None:
             try:
                 self._stderr_log.close()
             except Exception:
                 pass
             self._stderr_log = None
-        # Authoritative override: ffprobe the on-disk mp4 for its real duration,
-        # immune to ``-progress out_time_us`` unreliability (2026-06-01 bug).
-        self._finalize_segment_via_ffprobe(exit_wall_ms)
 
     def manifest_video_block(self, duration_ms: int) -> dict:
         """Return ``manifest.video`` block covering ALL recorded segments.
@@ -455,39 +476,43 @@ class VideoWriter:
             # Classify by how long it ran.
             ran_sec = time.monotonic() - launch_t
             if ran_sec >= self._success_min_seconds:
-                # 段完成（≥ success_min 说明 ffmpeg 真收过包）。关键语义：
-                # **源端断开 ≠ 整个飞行结束**。只要 stop() 没触发，飞行仍在进行，
-                # 必须重连续录，把后续画面录成 *新的* segment（断点续录 / segment
-                # stitching）。真正的结束只由 stop() 决定。
-                #
-                # 在重连之前，必须 *就地* finalize 这一段：join 它的 progress
-                # reader（让 rename / had_any_frames patch 落定）、关掉它的
-                # stderr log、用本段自己的 exit_wall_ms 跑 ffprobe 拿权威锚点。
-                # 这一步在 append 下一段之前完成，确保各段 metadata 不串。
-                exit_wall_ms = int(time.time() * 1000)
-                self._finalize_current_segment(exit_wall_ms)
+                # ffmpeg 自己退了且跑够了阈值。先 join 这次 attempt 的 progress
+                # reader，让 had_any_frames / rename patch 落定，再判类型。
+                self._join_current_progress_reader()
                 with self._state_lock:
                     had_frames = (
                         bool(self._segments)
                         and self._segments[-1].get("had_any_frames", False)
                     )
                 if had_frames:
+                    # 真录到帧的完整段。关键语义：**源端断开 ≠ 整个飞行结束**。
+                    # 只要 stop() 没触发，飞行仍在进行，必须重连续录把后续画面录成
+                    # *新的* segment（断点续录 / segment stitching）。先就地 finalize
+                    # 本段：关 stderr log、用本段自己的 exit_wall_ms 跑 ffprobe 拿权威
+                    # 锚点（在 append 下一段之前完成，确保各段 metadata 不串）。
+                    exit_wall_ms = int(time.time() * 1000)
+                    self._close_stderr_log()
+                    self._finalize_segment_via_ffprobe(exit_wall_ms)
                     logger.info(
                         "ffmpeg exited after {:.1f}s (≥ {}s) — 段已保存；源端断开但"
                         "飞行未结束，{:.1f}s 后重连续录下一段",
                         ran_sec, self._success_min_seconds, self._retry_interval_s,
                     )
                 else:
-                    # 撑过 success_min 但一帧都没出（RTMP 握手成功 + 立即
-                    # demuxing I/O error → ~800B 空壳 mp4）。段留在 _segments 里但
-                    # had_any_frames=False，manifest_video_block 会把它过滤掉。
+                    # 跑够阈值但一帧都没出。两种典型：①源端不可达 / 没在发布，
+                    # `-reconnect` 把"打不开输入"拖过了阈值（Connection timed out）；
+                    # ②握手成功但立即 demuxing I/O error。无论哪种都**不是完整段**，
+                    # 按启动失败处理：删掉空文件、不留 segment、据实记日志，再重连。
+                    # （诊断追踪在 main.ffmpeg.log 里已保留；不再攒幽灵段 / 垃圾文件。）
+                    # 注意：用户 stop() 中断的无帧段仍由 stop() 保留给诊断，不走这里。
                     logger.warning(
-                        "ffmpeg exited after {:.1f}s (≥ {}s) but progress reader got "
-                        "no first frame — RTMP source connected then stalled "
-                        "(e.g. demuxing I/O error). Partial mp4 kept for diagnostics "
-                        "(manifest 会跳过该空壳段)；{:.1f}s 后重连续录",
+                        "ffmpeg exited after {:.1f}s (≥ {}s) but produced no frames — "
+                        "source likely unreachable / not publishing, or connected then "
+                        "stalled (see main.ffmpeg.log). Treating as failed start; "
+                        "retry in {:.1f}s",
                         ran_sec, self._success_min_seconds, self._retry_interval_s,
                     )
+                    self._cleanup_failed_attempt()
                 if self._stop_event.is_set():
                     break
                 self._stop_event.wait(timeout=self._retry_interval_s)
