@@ -582,6 +582,33 @@ def test_probe_args_in_cmd_before_input(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 7c. HTTP(S) sources get ffmpeg native -reconnect flags (a single ffmpeg
+#     process can self-heal across mid-stream drops → ONE continuous mp4).
+#     RTMP does NOT support these flags, so they must be gated by protocol.
+# ---------------------------------------------------------------------------
+
+def _cmd_for_source(source_url: str) -> list:
+    vw = VideoWriter(source_url=source_url, output_dir=Path("/tmp/_vw_cmd_test"))
+    return vw._build_cmd("main_1.mp4")
+
+
+def test_reconnect_flags_for_http_source_before_input():
+    cmd = _cmd_for_source("http://10.0.0.1:8080/live/x.flv")
+    i_idx = cmd.index("-i")
+    for flag in ("-reconnect", "-reconnect_at_eof", "-reconnect_streamed",
+                 "-reconnect_on_network_error", "-reconnect_delay_max"):
+        assert flag in cmd, f"http source must get {flag}"
+        assert cmd.index(flag) < i_idx, f"{flag} must precede -i (input option)"
+
+
+def test_no_reconnect_flags_for_rtmp_source():
+    cmd = _cmd_for_source("rtmp://10.0.0.1:1935/live/x")
+    assert "-reconnect" not in cmd, (
+        "rtmp does not support -reconnect; flags must be gated to http(s) only"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 8. main.ffmpeg.log: append mode, separator per attempt, earlier attempts preserved
 # ---------------------------------------------------------------------------
 

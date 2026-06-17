@@ -990,6 +990,26 @@ class VideoWriter:
             probe_args += ["-probesize", self._probesize]
         if self._analyzeduration:
             probe_args += ["-analyzeduration", self._analyzeduration]
+        # HTTP(S)-only native reconnect. ffmpeg 对 http 协议支持断线自愈：单个
+        # ffmpeg 进程在源端断流后自动重连、**续写同一个 mp4**（"存成一个文件"
+        # 的方案）。RTMP **不支持** 这些 flag（加了无效/反而干扰），所以按协议
+        # gate：只有 http:// https:// 源才加。
+        #   -reconnect_on_network_error 1  接住 mid-stream I/O error（关键：DJI
+        #                                  源那个 "Error during demuxing: I/O error"）
+        #   -reconnect_at_eof 1            接住源端 EOF（推流端短暂停了）
+        #   -reconnect_streamed 1          非可 seek 的流也重连
+        #   -reconnect_delay_max 2         重试退避上限 2s
+        # 必须作为 **输入** 选项放在 -i 之前。若 http 重连扛不住（实测确认），
+        # supervisor 的重连+多段逻辑仍作兜底（那时会回到多文件）。
+        reconnect_args: list[str] = []
+        if self.source_url.lower().startswith(("http://", "https://")):
+            reconnect_args = [
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_delay_max", "2",
+            ]
         return [
             "ffmpeg",
             "-y",
@@ -998,6 +1018,7 @@ class VideoWriter:
             # loop can keep probing without consuming a GOP per probe like
             # the old ffmpeg-probe did.
             "-rw_timeout", "5000000",
+            *reconnect_args,
             *probe_args,
             "-i", self.source_url,
             # Only take video stream (+ optional audio); drop data streams
