@@ -563,13 +563,28 @@ function dashboard() {
       });
     },
 
-    addOsmBase() {
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    addBaseLayers() {
+      // 全国/全球在线底图。轨迹是 WGS84，这两个底图都是 WGS84 系，直接对齐不偏移。
+      // 默认 Esri 卫星影像（免 key），OSM 街道图可在右上角切换器切换。
+      const esri = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        { attribution: 'Esri World Imagery', maxZoom: 19 },
+      );
+      const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap', maxZoom: 19,
-      }).addTo(this.map);
+      });
+      esri.addTo(this.map);  // 默认底图
+      this.layerControl = L.control.layers(
+        { '卫星影像 (Esri)': esri, '街道图 (OSM)': osm },
+        null,
+        { position: 'topright', collapsed: true },
+      ).addTo(this.map);
     },
 
     async loadFlightArea() {
+      // 全国底图永远先垫一层（任意场地都有背景），PNG 仅作上层叠加增强。
+      this.addBaseLayers();
+
       let fa = null;
       try {
         const r = await fetch('/api/flight-area');
@@ -578,11 +593,9 @@ function dashboard() {
 
       if (fa && fa.configured) {
         if (fa.png_url) {
-          // PNG 作为离线底图
+          // 场地高清正射图叠在底图之上；可在切换器里关掉看下方卫星图
           this.pngOverlay = L.imageOverlay(fa.png_url, fa.png_bounds, { opacity: 1 }).addTo(this.map);
-        } else {
-          // 配置了区域但没有 PNG：用 OSM 作底图
-          this.addOsmBase();
+          if (this.layerControl) this.layerControl.addOverlay(this.pngOverlay, '场地高清图');
         }
         // 区域多边形：限制区红、作业区蓝
         L.geoJSON(fa.areas, {
@@ -601,10 +614,8 @@ function dashboard() {
         // ?calibrate=1 进入 PNG 对位校准（拖角缩放、拖中心平移、实时输出边界串）
         const calibrate = new URLSearchParams(location.search).get('calibrate') === '1';
         if (calibrate && this.pngOverlay && fa.png_bounds) this.startCalibration(fa.png_bounds);
-      } else {
-        // 未配置飞行区 -> 回退 OSM 在线底图（保持现有行为）
-        this.addOsmBase();
       }
+      // 未配置飞行区 / 无 PNG：已有全国底图垫底，无需额外处理
     },
 
     async loadVideo() {
