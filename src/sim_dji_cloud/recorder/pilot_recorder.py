@@ -8,7 +8,7 @@ from sim_dji_cloud.utils.time_ms import now_ms
 from sim_dji_cloud.storage.manifest import ManifestBuilder
 from sim_dji_cloud.storage.rotation import RotatingJsonlWriter
 from sim_dji_cloud.recorder.topic_router import file_name_for_topic, is_denied
-from sim_dji_cloud.recorder.pilot_topic_router import Source, route_topic
+from sim_dji_cloud.recorder.pilot_topic_router import route_topic
 from sim_dji_cloud.recorder.write_queue import TopicWriteQueue
 from sim_dji_cloud.recorder.pilot_flight_detector import PilotFlightDetector, PilotFlightState
 
@@ -80,8 +80,7 @@ class PilotRecorder:
             routed = route_topic(topic, self.rc_sn, self.aircraft_sn)
             self._topic_routed[topic] = routed
 
-        prev_state = self._detector.state
-        new_state = self._detector.feed(routed.source, payload_obj, recv_ts_ms)
+        self._detector.feed(routed.source, payload_obj, recv_ts_ms)
 
         # 回填 aircraft_sn —— 从拓扑消息学到；跟 dock 版一样，之前缓存的路由
         # 需要重新解析（学到 SN 前，飞行器自己的 topic 会被判成 UNKNOWN）。
@@ -96,7 +95,7 @@ class PilotRecorder:
             routed = self._topic_routed[topic]
             logger.info("aircraft_sn learned from topology: {}", self.aircraft_sn)
 
-        if prev_state != PilotFlightState.RECORDING and new_state == PilotFlightState.RECORDING:
+        if self._detector.state == PilotFlightState.RECORDING and self.flight_dir is None:
             await self._open_flight_dir(recv_ts_ms)
 
         if self._detector.state != PilotFlightState.RECORDING:

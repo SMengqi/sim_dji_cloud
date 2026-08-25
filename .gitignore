@@ -17,6 +17,7 @@ __pycache__/
 *.mp4
 *.avi
 recordings/
+recordings_pilot/
 # run.sh 后台日志 + pid
 logs/
 

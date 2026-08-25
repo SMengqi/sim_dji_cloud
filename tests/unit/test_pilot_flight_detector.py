@@ -18,7 +18,7 @@ class FakeMonoClock:
 
 
 def _topo(sns):
-    return {"data": {"sub_devices": [{"sn": s} for s in sns]}}
+    return {"method": "update_topo", "data": {"sub_devices": [{"sn": s} for s in sns]}}
 
 
 def _osd(track_id=None):
@@ -115,3 +115,75 @@ def test_track_id_backfilled_from_aircraft_osd_while_recording():
 def test_rc_osd_does_not_change_presence():
     d = PilotFlightDetector(idle_debounce_seconds=5)
     assert d.feed(Source.RC_OSD, {"data": {}}, 1000) == PilotFlightState.WAITING_AIRCRAFT
+
+
+def test_rc_status_without_update_topo_method_does_not_change_presence():
+    """method != "update_topo"（或缺失）不应更新 presence，即使 sub_devices
+    看起来是合法拓扑——DJI Pilot-to-Cloud 只在 update_topo 上发拓扑，但代码
+    不能假设这一点没有被别的 method 复用同一 topic。"""
+    d = PilotFlightDetector(idle_debounce_seconds=5)
+    payload_wrong_method = {
+        "method": "something_else",
+        "data": {"sub_devices": [{"sn": "SN_AIRCRAFT"}]},
+    }
+    assert d.feed(Source.RC_STATUS, payload_wrong_method, 1000) == PilotFlightState.WAITING_AIRCRAFT
+    assert d.aircraft_sn is None
+
+    payload_no_method = {"data": {"sub_devices": [{"sn": "SN_AIRCRAFT"}]}}
+    assert d.feed(Source.RC_STATUS, payload_no_method, 2000) == PilotFlightState.WAITING_AIRCRAFT
+    assert d.aircraft_sn is None
+
+
+def test_missing_sub_devices_key_leaves_presence_unchanged_while_waiting():
+    """data 存在但完全没有 sub_devices key（不是空列表）——这条消息不携带
+    拓扑信息，presence 应保持不变（sticky-by-default，同 dock 版哲学）。"""
+    d = PilotFlightDetector(idle_debounce_seconds=5)
+    payload = {"method": "update_topo", "data": {"some_other_field": 1}}
+    assert d.feed(Source.RC_STATUS, payload, 1000) == PilotFlightState.WAITING_AIRCRAFT
+    assert d.aircraft_sn is None
+
+
+def test_missing_sub_devices_key_leaves_presence_unchanged_while_recording():
+    """同上，但飞机已经在录制中：缺 sub_devices key 的拓扑消息不应触发
+    offline debounce（不能等价于 sub_devices: []）。"""
+    clock = FakeMonoClock()
+    d = PilotFlightDetector(idle_debounce_seconds=5, mono_clock=clock)
+    d.feed(Source.RC_STATUS, _topo(["SN_AIRCRAFT"]), 1000)
+    assert d.state == PilotFlightState.RECORDING
+
+    payload = {"method": "update_topo", "data": {"some_other_field": 1}}
+    clock.advance_s(9)
+    assert d.feed(Source.RC_STATUS, payload, 10_000) == PilotFlightState.RECORDING
+    # debounce 不应被启动——再 tick 到远超 5s debounce 之后仍是 RECORDING
+    clock.advance_s(10)
+    assert d.tick(20_000) == PilotFlightState.RECORDING
+
+
+def test_explicit_empty_sub_devices_still_starts_offline_debounce():
+    """sub_devices: []（显式空列表，带 method: update_topo）代表子设备显式
+    下线，应该跟之前行为一样启动/持续 offline debounce（对比上面两个
+    「key 缺失」的用例，这个是「key 存在但为空」）。"""
+    clock = FakeMonoClock()
+    d = PilotFlightDetector(idle_debounce_seconds=5, mono_clock=clock)
+    d.feed(Source.RC_STATUS, _topo(["SN_AIRCRAFT"]), 1000)
+    assert d.state == PilotFlightState.RECORDING
+
+    clock.advance_s(1)
+    d.feed(Source.RC_STATUS, _topo([]), 2000)
+    assert d.state == PilotFlightState.RECORDING  # debounce 刚启动，还没到 5s
+    clock.advance_s(5)
+    assert d.tick(7000) == PilotFlightState.FINALIZING
+
+
+def test_presence_scans_whole_sub_devices_list_once_sn_known():
+    """aircraft_sn 学到之后，拓扑里该 SN 排在非 0 位置（比如其它子设备排前面）
+    也应该被识别为在线——不能只看 index 0。"""
+    d = PilotFlightDetector(idle_debounce_seconds=5)
+    d.feed(Source.RC_STATUS, _topo(["SN_AIRCRAFT"]), 1000)
+    assert d.aircraft_sn == "SN_AIRCRAFT"
+    d.feed(Source.RC_STATUS, _topo([]), 2000)  # 离线，进入 debounce（不会推进到 FINALIZING，因为下面立刻用 tick 验证 RECORDING）
+    payload = {
+        "method": "update_topo",
+        "data": {"sub_devices": [{"sn": "SN_OTHER"}, {"sn": "SN_AIRCRAFT"}]},
+    }
+    assert d.feed(Source.RC_STATUS, payload, 3000) == PilotFlightState.RECORDING

@@ -13,12 +13,21 @@ class PilotFlightState(str, Enum):
     FINALIZING = "finalizing"
 
 
-def _extract_aircraft_sn(payload: dict[str, Any]) -> Optional[str]:
+def _sub_devices_or_none(payload: dict[str, Any]) -> Optional[list]:
+    """拓扑消息里的 sub_devices 列表；key 缺失（不是空列表）说明这条消息本身
+    不携带拓扑信息，返回 None 让调用方保持 presence 不变（同 dock 版
+    sticky-by-default 哲学：字段缺失从不当作状态变化）。"""
     data = payload.get("data")
     if not isinstance(data, dict):
         return None
     sub_devices = data.get("sub_devices")
-    if not isinstance(sub_devices, list) or not sub_devices:
+    if not isinstance(sub_devices, list):
+        return None
+    return sub_devices
+
+
+def _first_sn(sub_devices: list) -> Optional[str]:
+    if not sub_devices:
         return None
     if len(sub_devices) > 1:
         logger.warning(
@@ -66,14 +75,22 @@ class PilotFlightDetector:
         self.end_reason: Optional[str] = None
 
     def feed(self, source: Source, payload: dict[str, Any], now_ms: int) -> PilotFlightState:
-        if source == Source.RC_STATUS:
-            sn = _extract_aircraft_sn(payload)
-            if sn is not None:
+        if source == Source.RC_STATUS and payload.get("method") == "update_topo":
+            sub_devices = _sub_devices_or_none(payload)
+            if sub_devices is not None:
                 if self.aircraft_sn is None:
-                    self.aircraft_sn = sn
-                self._aircraft_present = (sn == self.aircraft_sn)
-            else:
-                self._aircraft_present = False
+                    sn = _first_sn(sub_devices)
+                    if sn is not None:
+                        self.aircraft_sn = sn
+                        self._aircraft_present = True
+                    else:
+                        self._aircraft_present = False
+                else:
+                    self._aircraft_present = any(
+                        isinstance(d, dict) and d.get("sn") == self.aircraft_sn
+                        for d in sub_devices
+                    )
+            # else: sub_devices key 整体缺失 —— 这条消息不携带拓扑信息，presence 保持不变
         result = self._advance(now_ms)
         if (
             source == Source.AIRCRAFT_OSD

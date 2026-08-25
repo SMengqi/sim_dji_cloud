@@ -31,7 +31,7 @@ pytest tests/unit/test_dashboard_live_state.py::test_partial_dock_osd_preserves_
 pytest tests/ -k dashboard               # filter by name
 
 # CLI smoke
-sim-dji --help                           # 9 subcommands: dashboard / inspect / list / play / record / repair / selfcheck / stop-record / validate-config
+sim-dji --help                           # 10 subcommands: dashboard / inspect / list / play / record / record-pilot / repair / selfcheck / stop-record / validate-config
 sim-dji <cmd> --help                     # per-command help
 
 # Typical workflow

@@ -137,13 +137,44 @@ async def test_pending_dir_renamed_once_track_id_learned(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tick_driven_recording_transition_still_opens_flight_dir(tmp_path):
+    """Regression: reset() doesn't clear detector presence, so tick() alone can
+    transition WAITING_AIRCRAFT -> RECORDING with no triggering MQTT message.
+    The dir-open check must be level-triggered, not edge-triggered on feed()."""
+    rec = PilotRecorder(_cfg(tmp_path), rc_sn="SN_RC", aircraft_sn=None)
+    await rec.start_async_components()
+
+    await _topo(rec, ["SN_AIRCRAFT"], 1000)
+    await _topo(rec, [], 2000)  # idle_debounce_seconds=0 -> FINALIZING
+    await rec.finalize_and_close("aircraft_offline")
+    await rec.reset_for_next_flight()
+
+    # Aircraft reappears in topology *without* going through on_mqtt_message's
+    # feed() path this time -- simulate the detector already having transitioned
+    # via a bare tick() (as the CLI's 1s loop would do) before any message arrives.
+    rec._detector._aircraft_present = True
+    rec._detector.tick(5000)
+    assert rec._detector.state == PilotFlightState.RECORDING
+    assert rec.flight_dir is None  # not opened yet -- next message must open it
+
+    await rec.on_mqtt_message(
+        "thing/product/SN_AIRCRAFT/osd",
+        json.dumps({"data": {"mode_code": 3}}).encode(),
+        5500,
+    )
+    assert rec.flight_dir is not None
+    flight_dir = await rec.finalize_and_close("aircraft_offline")
+    assert flight_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_on_mqtt_message_accepts_str_payload(tmp_path):
     """跟 dock 版一样，gmqtt 某些版本传 str 而不是 bytes；不应抛 AttributeError。"""
     rec = PilotRecorder(_cfg(tmp_path), rc_sn="SN_RC", aircraft_sn=None)
     await rec.start_async_components()
     await rec.on_mqtt_message(
         "sys/product/SN_RC/status",
-        '{"data": {"sub_devices": [{"sn": "SN_AIRCRAFT"}]}}',   # type: ignore[arg-type]
+        '{"method": "update_topo", "data": {"sub_devices": [{"sn": "SN_AIRCRAFT"}]}}',   # type: ignore[arg-type]
         500,
     )
     assert rec._detector.state == PilotFlightState.RECORDING
