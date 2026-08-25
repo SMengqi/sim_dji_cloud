@@ -63,3 +63,9 @@ def test_cli_stop_record_invokes(tmp_path):
         "stop-record", "T1", "--state-dir", str(tmp_path),
     ])
     assert r.exit_code == 0
+
+
+def test_cli_help_lists_record_pilot():
+    r = CliRunner().invoke(main, ["--help"])
+    assert r.exit_code == 0
+    assert "record-pilot" in r.output

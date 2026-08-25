@@ -1,0 +1,29 @@
+mqtt:
+  host: dji-cloud.example.com
+  port: 8883
+  tls: true
+  client_id: sim-dji-pilot-recorder-001
+  rc_sn: "SN_RC_EXAMPLE"          # 遥控器(网关) SN；对应 Pilot-to-Cloud 的 gateway_sn
+  username: "${env:DJI_MQTT_USERNAME}"
+  password: "${env:DJI_MQTT_PASSWORD}"
+  ca_file: null
+  cert_file: null
+  key_file: null
+  subscribe_patterns:
+    - "thing/product/+/+"
+    - "thing/product/+/property/+"
+    - "thing/product/+/drc/+"
+    - "sys/product/+/+"
+  deny_topics: []
+
+storage:
+  root: ./recordings_pilot         # 独立目录，避免跟 dock 录制混在一起
+  enable_raw_firehose: false
+  flush_max_records: 1000
+  flush_interval_ms: 200
+  queue_max_size: 10000
+  rotate_max_bytes: 104857600
+  rotate_max_records: 1000000
+
+pilot_flight_detection:
+  idle_debounce_seconds: 5         # 飞行器从拓扑消失后，等待多久 finalize 当前段

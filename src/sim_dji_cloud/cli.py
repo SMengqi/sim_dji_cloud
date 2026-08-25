@@ -113,6 +113,80 @@ def record_cmd(config_path: str, video: bool | None, storage_root: str | None, s
     asyncio.run(run())
 
 
+@main.command("record-pilot")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--storage-root", default=None, type=click.Path())
+@click.option("--state-dir", default=".sim-dji-state", type=click.Path())
+def record_pilot_cmd(config_path: str, storage_root: str | None, state_dir: str) -> None:
+    from sim_dji_cloud.config import load_pilot_config
+    from sim_dji_cloud.recorder.pilot_recorder import PilotRecorder
+    from sim_dji_cloud.recorder.mqtt_client import MqttRecorderClient, MqttConfig
+    from sim_dji_cloud.recorder.stop_signal import StopSignalFile, read_stop_signal_if_present
+    from sim_dji_cloud.recorder.pilot_flight_detector import PilotFlightState
+
+    cfg = load_pilot_config(Path(config_path))
+    if storage_root is not None:
+        cfg["storage"]["root"] = storage_root
+
+    rc_sn = cfg["mqtt"].get("rc_sn") or click.prompt("rc_sn (遥控器 SN)", type=str)
+
+    async def run():
+        rec = PilotRecorder(cfg, rc_sn=rc_sn, aircraft_sn=None)
+        await rec.start_async_components()
+
+        async def on_msg(topic: str, payload: bytes, recv_ts_ms: int) -> None:
+            await rec.on_mqtt_message(topic, payload, recv_ts_ms)
+
+        m = cfg["mqtt"]
+        mqtt = MqttRecorderClient(
+            MqttConfig(
+                host=m["host"], port=m["port"], tls=m["tls"],
+                client_id=m["client_id"],
+                username=m.get("username"), password=m.get("password"),
+                ca_file=m.get("ca_file"), cert_file=m.get("cert_file"), key_file=m.get("key_file"),
+                subscribe_patterns=m["subscribe_patterns"],
+            ),
+            on_message=on_msg,
+        )
+        loop_task = asyncio.create_task(mqtt.run_forever())
+
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+
+        from sim_dji_cloud.utils.time_ms import now_ms
+        state_path = Path(state_dir)
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(1.0)
+                rec._detector.tick(now_ms())                        # 推进离线去抖
+                if rec._detector.state == PilotFlightState.FINALIZING:  # 一段结束
+                    reason = rec._detector.end_reason or "aircraft_offline"
+                    seg_gaps = list(mqtt.gaps)
+                    mqtt.gaps.clear()
+                    fd = await rec.finalize_and_close(
+                        finalize_reason=reason, extra_gaps=seg_gaps)
+                    click.echo(f"finalized: {fd}  (reason={reason})")
+                    await rec.reset_for_next_flight()                # 重置，继续等下一段
+                    continue
+                if rec._detector.task_id:                            # 外部 stop-record
+                    sig_file = StopSignalFile(state_path, rec._detector.task_id)
+                    if read_stop_signal_if_present(sig_file) is not None:
+                        stop_event.set()
+        finally:
+            await mqtt.stop()
+            loop_task.cancel()
+            if rec.flight_dir is not None:                           # 退出时收尾在录的那段
+                seg_gaps = list(mqtt.gaps)
+                mqtt.gaps.clear()
+                fd = await rec.finalize_and_close(
+                    finalize_reason="manual_stop", extra_gaps=seg_gaps)
+                click.echo(f"finalized: {fd}  (reason=manual_stop)")
+
+    asyncio.run(run())
+
+
 @main.command("play")
 @click.argument("flight_dir", type=click.Path(exists=True, file_okay=False))
 @click.option("--mqtt-url", default="tcp://localhost:1883",
