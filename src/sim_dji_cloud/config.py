@@ -6,6 +6,7 @@ import yaml
 
 _ENV_PATTERN = re.compile(r"\$\{env:([A-Z_][A-Z0-9_]*)\}")
 REQUIRED_SECTIONS = ["mqtt", "storage", "video", "flight_detection"]
+REQUIRED_SECTIONS_PILOT = ["mqtt", "storage", "pilot_flight_detection"]
 
 
 class ConfigError(Exception):
@@ -28,14 +29,22 @@ def substitute_env(value: Any) -> Any:
     return value
 
 
-def load_config(path: Path) -> dict[str, Any]:
+def _load_and_validate(path: Path, required_sections: list[str]) -> dict[str, Any]:
     text = Path(path).read_text()
     raw = yaml.safe_load(text)
     if not isinstance(raw, dict):
         raise ConfigError("top-level YAML must be a mapping")
 
-    for sect in REQUIRED_SECTIONS:
+    for sect in required_sections:
         if sect not in raw:
             raise ConfigError(f"missing required section: {sect}")
 
     return substitute_env(raw)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    return _load_and_validate(path, REQUIRED_SECTIONS)
+
+
+def load_pilot_config(path: Path) -> dict[str, Any]:
+    return _load_and_validate(path, REQUIRED_SECTIONS_PILOT)
