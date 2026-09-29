@@ -41,3 +41,4 @@ video:
 flight_detection:
   record_steps: [0, 1, 2]        # dock flighttask_step_code ∈ 此集合时录制（0准备/1飞行/2作业后恢复）
   idle_debounce_seconds: 5       # 进入空闲(5)等持续该秒数后收尾当前任务
+  record_when_drone_out_of_dock: true  # 飞行器出舱(drone_in_dock=0)也录制：覆盖无航线任务的手动飞行(一键起飞+DRC)

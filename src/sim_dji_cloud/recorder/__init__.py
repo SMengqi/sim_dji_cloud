@@ -36,6 +36,8 @@ class Recorder:
         self._detector = FlightDetector(
             record_steps=fd.get("record_steps", [0, 1, 2]),
             idle_debounce_seconds=fd.get("idle_debounce_seconds", 5),
+            record_when_drone_out_of_dock=bool(
+                fd.get("record_when_drone_out_of_dock", True)),
         )
         self._queues: dict[str, TopicWriteQueue] = {}
         self._topic_routed: dict[str, Any] = {}

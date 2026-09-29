@@ -129,3 +129,69 @@ def test_non_dock_osd_does_not_change_step():
     d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5)
     assert d.feed(Source.DRONE_OSD, {"data": {"flighttask_step_code": 1}}, 1000) \
         == FlightState.WAITING_TASK
+
+
+# ---------------------------------------------------------------------------
+# 手动飞行（一键起飞 + DRC，无航线任务）：flighttask_step_code 不进 record set，
+# 靠 dock OSD 的 drone_in_dock（0=舱外, 1=舱内）起停。
+# 2026-09-28 生产：手动飞行整段未录（无 flight dir）。
+# ---------------------------------------------------------------------------
+
+def _dock_osd(step=None, in_dock=None):
+    data = {}
+    if step is not None:
+        data["flighttask_step_code"] = step
+    if in_dock is not None:
+        data["drone_in_dock"] = in_dock
+    return {"data": data}
+
+
+def test_manual_flight_records_while_drone_out_of_dock():
+    clock = FakeMonoClock()
+    d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5, mono_clock=clock)
+    assert d.feed(Source.DOCK_OSD, _dock_osd(step=5, in_dock=1), 1000) == FlightState.WAITING_TASK
+    assert d.feed(Source.DOCK_OSD, _dock_osd(in_dock=0), 2000) == FlightState.RECORDING
+    assert d.task_started_ms == 2000
+    # 回舱：debounce 未满继续录
+    assert d.feed(Source.DOCK_OSD, _dock_osd(in_dock=1), 3000) == FlightState.RECORDING
+    clock.advance_s(5)
+    assert d.tick(8000) == FlightState.FINALIZING
+    assert d.end_reason == "task_idle"
+    assert d.task_ended_ms == 8000
+
+
+def test_absent_drone_in_dock_is_sticky():
+    clock = FakeMonoClock()
+    d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5, mono_clock=clock)
+    d.feed(Source.DOCK_OSD, _dock_osd(step=5, in_dock=0), 1000)
+    assert d.state == FlightState.RECORDING
+    # 部分 OSD 不带 drone_in_dock → 不据此停
+    clock.advance_s(60)
+    assert d.feed(Source.DOCK_OSD, _dock_osd(), 61000) == FlightState.RECORDING
+    assert d.tick(62000) == FlightState.RECORDING
+
+
+def test_drone_in_dock_trigger_can_be_disabled():
+    d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5,
+                       record_when_drone_out_of_dock=False)
+    assert d.feed(Source.DOCK_OSD, _dock_osd(step=5, in_dock=0), 1000) == FlightState.WAITING_TASK
+
+
+def test_task_flight_not_cut_by_drone_in_dock_change():
+    clock = FakeMonoClock()
+    d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5, mono_clock=clock)
+    d.feed(Source.DOCK_OSD, _dock_osd(step=0, in_dock=1), 1000)
+    d.feed(Source.DOCK_OSD, _dock_osd(step=1, in_dock=0), 2000)
+    # 航线结束落回舱，但仍在 step=2 恢复阶段 → 继续录
+    d.feed(Source.DOCK_OSD, _dock_osd(step=2, in_dock=1), 3000)
+    clock.advance_s(30)
+    assert d.tick(33000) == FlightState.RECORDING
+    d.feed(Source.DOCK_OSD, _dock_osd(step=5), 34000)
+    clock.advance_s(5)
+    assert d.tick(39000) == FlightState.FINALIZING
+
+
+def test_drone_osd_drone_in_dock_field_ignored():
+    # 只认机场 OSD 的 drone_in_dock，飞行器 OSD 同名字段（若有）不参与
+    d = FlightDetector(record_steps=[0, 1, 2], idle_debounce_seconds=5)
+    assert d.feed(Source.DRONE_OSD, _dock_osd(in_dock=0), 1000) == FlightState.WAITING_TASK

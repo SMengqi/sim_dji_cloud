@@ -67,3 +67,33 @@ async def test_reset_clears_state(tmp_path):
     assert rec._manifest is None
     assert rec._queues == {}
     assert rec._writers == {}
+
+
+async def _dock_osd(rec, ts, **data):
+    await rec.on_mqtt_message("thing/product/SN_DOCK/osd",
+                              json.dumps({"data": data}).encode(), ts)
+
+
+@pytest.mark.asyncio
+async def test_manual_flight_drone_out_of_dock_makes_flight_dir(tmp_path):
+    rec = Recorder(_cfg(tmp_path), dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    await _dock_osd(rec, 1000, flighttask_step_code=5, drone_in_dock=1,
+                    sub_device={"device_sn": "SN_DRONE"})
+    assert rec.flight_dir is None
+    await _dock_osd(rec, 2000, drone_in_dock=0)
+    assert rec._detector.state == FlightState.RECORDING
+    await _dock_osd(rec, 3000, drone_in_dock=1)       # debounce=0 → FINALIZING
+    assert rec._detector.state == FlightState.FINALIZING
+    d = await rec.finalize_and_close("task_idle")
+    assert (d / "manifest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_record_when_drone_out_of_dock_config_passthrough(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg["flight_detection"]["record_when_drone_out_of_dock"] = False
+    rec = Recorder(cfg, dock_sn="SN_DOCK", drone_sn=None)
+    assert rec._detector.record_when_drone_out_of_dock is False
+    assert Recorder(_cfg(tmp_path), dock_sn="SN_DOCK",
+                    drone_sn=None)._detector.record_when_drone_out_of_dock is True
