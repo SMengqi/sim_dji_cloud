@@ -157,3 +157,14 @@ def test_max_reorder_records_actual_backstep_ms(tmp_path: Path):
     assert result.max_reorder_offset == 250, (
         f"应记 250ms 倒退，旧实现硬封顶 1；实际 {result.max_reorder_offset}"
     )
+
+
+def test_raw_b64_payload_difference_is_divergence(tmp_path: Path):
+    orig = tmp_path / "orig.jsonl"
+    replay = tmp_path / "replay.jsonl"
+    base = {"recv_ts_ms": 0, "dji_ts_ms": None, "direction": "up", "topic": "t", "payload": None}
+    _write_jsonl(orig, [dict(base, payload_b64="AAE=")])
+    _write_jsonl(replay, [dict(base, payload_b64="AAI=")])
+    result = compare_topic(orig, replay, tolerance_ms=50)
+    assert result.status == "FAIL"
+    assert result.first_divergence_field == "payload"

@@ -7,6 +7,7 @@ from typing import Optional, Protocol, Callable
 from loguru import logger
 
 from sim_dji_cloud.player.jsonl_iterator import JsonlIterator
+from sim_dji_cloud.storage.payload_codec import record_payload_bytes
 from sim_dji_cloud.player.scheduler import VirtTimeScheduler
 from sim_dji_cloud.player.video_pusher import VideoPusher, plan_video_push
 from sim_dji_cloud.player.control_server import ControlServer
@@ -163,9 +164,7 @@ class Player:
                 continue
             virt_target = recv_ts - started_at_ms + self._start_offset_ms
             await self._scheduler.wait_until_virt(virt_target)
-            payload = record.get("payload", {})
-            payload_bytes = json.dumps(payload, ensure_ascii=False,
-                                       separators=(",", ":")).encode("utf-8")
+            payload_bytes = record_payload_bytes(record)
             try:
                 await self._publisher.publish(topic, payload_bytes)
             except Exception:
@@ -389,10 +388,7 @@ class Player:
             # from the current virt = S, which `wait_until_virt(T)` achieves.
             virt_target = recv_ts - started_at_ms
             await self._scheduler.wait_until_virt(virt_target)
-            payload = record.get("payload", {})
-            payload_bytes = json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            payload_bytes = record_payload_bytes(record)
             try:
                 await self._publisher.publish(topic, payload_bytes)
             except Exception:

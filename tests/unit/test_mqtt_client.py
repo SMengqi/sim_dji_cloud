@@ -104,3 +104,27 @@ async def test_connecting_flag_prevents_double_connect():
             c._connecting = True
             await c.connect()
     assert connect_calls == 2, "断线后应允许重连一次"
+
+
+def test_repeated_disconnect_callbacks_keep_earliest_gap_start():
+    # 2026-09-28 生产：gmqtt 一次断线多次回调 on_disconnect（11:37:57 ×2、
+    # 11:38:08 ×2），旧实现覆盖 _disconnect_at_ms → gap 起点晚 ~11s。
+    cfg = MqttConfig(host="h", port=1883, tls=False, client_id="t",
+                     username=None, password=None, ca_file=None,
+                     cert_file=None, key_file=None, subscribe_patterns=[])
+
+    async def on_message(topic, payload, recv_ts_ms):
+        pass
+
+    fake_client = MagicMock()
+    clock = {"ms": 0}
+    with patch("sim_dji_cloud.recorder.mqtt_client.gmqtt.Client", return_value=fake_client), \
+         patch("sim_dji_cloud.recorder.mqtt_client.now_ms", side_effect=lambda: clock["ms"]):
+        c = MqttRecorderClient(cfg, on_message=on_message)
+        clock["ms"] = 1000
+        c._on_disconnect(fake_client, packet=None, exc=None)
+        clock["ms"] = 12000
+        c._on_disconnect(fake_client, packet=None, exc=None)
+        clock["ms"] = 30000
+        c._on_connect(fake_client, flags=0, rc=0, properties={})
+    assert c.gaps == [{"reason": "mqtt_disconnect", "start_ms": 1000, "end_ms": 30000}]

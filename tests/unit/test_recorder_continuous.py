@@ -97,3 +97,33 @@ async def test_record_when_drone_out_of_dock_config_passthrough(tmp_path):
     assert rec._detector.record_when_drone_out_of_dock is False
     assert Recorder(_cfg(tmp_path), dock_sn="SN_DOCK",
                     drone_sn=None)._detector.record_when_drone_out_of_dock is True
+
+
+def _read_topic_records(flight_dir, suffix):
+    out = []
+    for f in sorted((flight_dir / "topics").glob(f"*__{suffix}.*.jsonl")):
+        out += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+    return out
+
+
+@pytest.mark.asyncio
+async def test_non_json_payload_recorded_as_b64_while_recording(tmp_path):
+    # 2026-09-28 生产：drc/up / 飞行器 state 有 non-JSON 负载，旧实现直接丢弃。
+    import base64
+    rec = Recorder(_cfg(tmp_path), dock_sn="SN_DOCK", drone_sn=None)
+    await rec.start_async_components()
+    raw = b"\x08\x01\xffnot-json"
+    # 未录制时 non-JSON 不落盘也不崩
+    await rec.on_mqtt_message("thing/product/SN_DOCK/drc/up", raw, 500)
+    await _step(rec, 1, 1000, extra={"sub_device": {"device_sn": "SN_DRONE"}})
+    await rec.on_mqtt_message("thing/product/SN_DOCK/drc/up", raw, 1100)
+    await rec.on_mqtt_message("thing/product/SN_DRONE/state", raw, 1200)
+    assert rec._detector.state == FlightState.RECORDING   # non-JSON 不影响起停
+    await _step(rec, 5, 2000)
+    d = await rec.finalize_and_close("task_idle")
+    for suffix in ("drc__up", "state"):
+        recs = _read_topic_records(d, suffix)
+        assert len(recs) == 1, suffix
+        assert recs[0]["payload"] is None
+        assert recs[0]["dji_ts_ms"] is None
+        assert base64.b64decode(recs[0]["payload_b64"]) == raw

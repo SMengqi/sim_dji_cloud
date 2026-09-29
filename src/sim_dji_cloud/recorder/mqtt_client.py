@@ -68,7 +68,10 @@ class MqttRecorderClient:
 
     def _on_disconnect(self, client, packet, exc=None):
         logger.warning("mqtt disconnected exc={}", exc)
-        self._disconnect_at_ms = now_ms()
+        # gmqtt 一次断线会多次回调；只记第一次，否则 gap 起点被推迟。
+        # Regression: test_repeated_disconnect_callbacks_keep_earliest_gap_start.
+        if self._disconnect_at_ms is None:
+            self._disconnect_at_ms = now_ms()
         self._connected.clear()
         self._connecting = False
 

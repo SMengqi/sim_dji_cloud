@@ -178,3 +178,20 @@ async def test_on_mqtt_message_accepts_str_payload(tmp_path):
         500,
     )
     assert rec._detector.state == PilotFlightState.RECORDING
+
+
+@pytest.mark.asyncio
+async def test_non_json_payload_recorded_as_b64(tmp_path):
+    import base64
+    rec = PilotRecorder(_cfg(tmp_path), rc_sn="SN_RC", aircraft_sn=None)
+    await rec.start_async_components()
+    await _topo(rec, ["SN_AIRCRAFT"], 1000)
+    raw = b"\xff\x00raw"
+    await rec.on_mqtt_message("thing/product/SN_RC/drc/up", raw, 1500)
+    d = await rec.finalize_and_close(finalize_reason="aircraft_offline")
+    lines = []
+    for f in (d / "topics").glob("*__drc__up.*.jsonl"):
+        lines += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+    assert len(lines) == 1
+    assert lines[0]["payload"] is None
+    assert base64.b64decode(lines[0]["payload_b64"]) == raw

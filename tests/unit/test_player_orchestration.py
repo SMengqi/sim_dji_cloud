@@ -213,3 +213,28 @@ async def test_start_raises_player_error_on_malformed_manifest(tmp_path):
     p = Player(flight_dir=flight, publisher=_NoopPublisher())
     with pytest.raises(PlayerError, match="manifest.json 损坏"):
         await p.start()
+
+
+@pytest.mark.asyncio
+async def test_player_republishes_raw_b64_payload_bytes(tmp_path: Path):
+    import base64
+    flight = _make_flight_dir(tmp_path)
+    raw = b"\x08\x01\xffnot-json"
+    f = flight / "topics" / "thing__product__SN_DOCK_FIXTURE__osd.0001.jsonl"
+    f.write_text(
+        json.dumps({"recv_ts_ms": 0, "dji_ts_ms": None, "direction": "up",
+                    "topic": "thing/product/SN_DOCK_FIXTURE/osd", "payload": None,
+                    "payload_b64": base64.b64encode(raw).decode()}) + "\n"
+    )
+    published: list[tuple[str, bytes]] = []
+
+    class FakePublisher:
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def publish(self, topic, payload, qos=0):
+            published.append((topic, payload))
+
+    p = Player(flight_dir=flight, publisher=FakePublisher(), speed=100.0)
+    await p.start()
+    await p.wait_until_done()
+    assert ("thing/product/SN_DOCK_FIXTURE/osd", raw) in published

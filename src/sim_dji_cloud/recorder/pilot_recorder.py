@@ -7,6 +7,9 @@ from loguru import logger
 from sim_dji_cloud.utils.time_ms import now_ms
 from sim_dji_cloud.storage.manifest import ManifestBuilder
 from sim_dji_cloud.storage.rotation import RotatingJsonlWriter
+from sim_dji_cloud.storage.payload_codec import (
+    decode_mqtt_payload, describe_raw, encode_raw_b64,
+)
 from sim_dji_cloud.recorder.topic_router import file_name_for_topic, is_denied
 from sim_dji_cloud.recorder.pilot_topic_router import route_topic
 from sim_dji_cloud.recorder.write_queue import TopicWriteQueue
@@ -40,6 +43,7 @@ class PilotRecorder:
         )
         self._queues: dict[str, TopicWriteQueue] = {}
         self._topic_routed: dict[str, Any] = {}
+        self._non_json_warned: set[str] = set()
         self._writers: dict[str, RotatingJsonlWriter] = {}
         self.flight_dir: Optional[Path] = None
         self._manifest: Optional[ManifestBuilder] = None
@@ -61,19 +65,22 @@ class PilotRecorder:
             return
 
         try:
-            if not payload:
-                payload_obj = {}
-            elif isinstance(payload, bytes):
-                payload_obj = json.loads(payload.decode("utf-8"))
-            elif isinstance(payload, str):
-                payload_obj = json.loads(payload)
-            else:
-                logger.warning("unexpected payload type {} on topic {}",
-                               type(payload).__name__, topic)
-                return
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            logger.warning("non-JSON payload on topic {}", topic)
+            payload_obj, raw = decode_mqtt_payload(payload)
+        except TypeError:
+            logger.warning("unexpected payload type {} on topic {}",
+                           type(payload).__name__, topic)
             return
+        if raw is not None:
+            # 非 JSON 不丢：以 payload_b64 落盘、回放原样重发。每 topic 首条
+            # WARNING 带 hex 头便于诊断，其余 debug 防刷屏。
+            if topic not in self._non_json_warned:
+                self._non_json_warned.add(topic)
+                logger.warning("non-JSON payload on topic {} ({}); recording as "
+                               "payload_b64, further ones logged at debug",
+                               topic, describe_raw(raw))
+            else:
+                logger.debug("non-JSON payload on topic {} ({})", topic, describe_raw(raw))
+            payload_obj = {}
 
         routed = self._topic_routed.get(topic)
         if routed is None:
@@ -108,7 +115,7 @@ class PilotRecorder:
         ):
             await self._rename_pending_to_task(self._detector.task_id)
 
-        await self._write_record(topic, routed, payload_obj, recv_ts_ms)
+        await self._write_record(topic, routed, payload_obj, recv_ts_ms, raw)
 
     async def _open_flight_dir(self, started_ms: int) -> None:
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(started_ms / 1000))
@@ -191,15 +198,26 @@ class PilotRecorder:
 
     async def _write_record(
         self, topic: str, routed, payload_obj: dict, recv_ts_ms: int,
+        raw: Optional[bytes] = None,
     ) -> None:
         q = await self._ensure_topic_writer(topic)
-        record = {
-            "recv_ts_ms": recv_ts_ms,
-            "dji_ts_ms": payload_obj.get("timestamp"),
-            "direction": routed.direction,
-            "topic": topic,
-            "payload": payload_obj,
-        }
+        if raw is not None:
+            record = {
+                "recv_ts_ms": recv_ts_ms,
+                "dji_ts_ms": None,
+                "direction": routed.direction,
+                "topic": topic,
+                "payload": None,
+                "payload_b64": encode_raw_b64(raw),
+            }
+        else:
+            record = {
+                "recv_ts_ms": recv_ts_ms,
+                "dji_ts_ms": payload_obj.get("timestamp"),
+                "direction": routed.direction,
+                "topic": topic,
+                "payload": payload_obj,
+            }
         await q.put(record)
 
     async def finalize_and_close(

@@ -74,7 +74,8 @@ def compare_topic(
         if a.get("dji_ts_ms") != b.get("dji_ts_ms"):
             first_div_idx, first_div_field = i, "dji_ts_ms"
             break
-        if _canonical_payload(a.get("payload")) != _canonical_payload(b.get("payload")):
+        if (_canonical_payload(a.get("payload")) != _canonical_payload(b.get("payload"))
+                or a.get("payload_b64") != b.get("payload_b64")):
             first_div_idx, first_div_field = i, "payload"
             break
 
