@@ -44,3 +44,9 @@ venv/
 # flight-area local site data (large binaries)
 东方理工新区_*.xml
 *背景.png
+
+# Docker compose 文件要进版本控制（上面 *.yml 规则的例外）
+!docker-compose.yml
+
+# deploy/package.sh 产物（镜像 tar + 部署包）
+dist/

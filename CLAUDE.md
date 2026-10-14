@@ -45,6 +45,18 @@ sim-dji selfcheck ./recordings/<flight_dir>/ --tolerance-ms 50
 sim-dji dashboard --port 8080            # browser: http://<server>:8080
 ```
 
+```bash
+# Docker deployment (production / test host; image is built there, never on the dev box)
+cp .env.example .env                     # PUID/PGID must match the owner of recordings/
+docker compose build
+docker compose up -d                     # default = record only, config /config/recorder.yaml; data stays in host ./recordings
+docker compose run --rm record other.yaml   # one-off record with any yaml in the project dir (stop the long-running one first)
+docker compose --profile dashboard up -d dashboard
+docker compose run --rm tools play /data/recordings/<flight> --speed 1.0
+docker compose stop record               # SIGTERM → graceful finalize (40s grace)
+bash deploy/package.sh v0.1.0            # build + docker save + deploy bundle → dist/ (offline deploy: docs/docker-offline-deploy.md)
+```
+
 ## Architecture you can't infer from a single file
 
 ### Dock vs drone are separate data sources
@@ -118,6 +130,7 @@ That formula is the contract for `--speed` and `--start-offset-ms`. SelfCheck (`
 - Plain TCP (port 1883) vs TLS (port 8883) — the YAML `mqtt.tls` flag must match the actual broker. A mismatch surfaces as `ConnectionResetError` during handshake.
 - The CLI `record` loop is **long-running and does NOT auto-exit**. Each 1s tick calls `rec._detector.tick(now_ms())`; on `FlightState.FINALIZING` it `finalize_and_close` + `reset_for_next_flight` and **keeps looping** for the next task (multi-task per process). Only Ctrl-C / SIGTERM / `stop-record` set `stop_event` to exit, and the `finally` finalizes any in-progress flight on the way out (`reason=manual_stop`). Video is default-off (`video.enabled: false`); `--video` opts in.
 - `recordings/` and `*.yaml` are gitignored; only `*.yaml.example` is tracked.
+- Docker: `Dockerfile` + `docker-compose.yml` + `.env.example` + `deploy/` (see `docs/docker-deploy.md`). All services use `network_mode: host` (dashboard's in-process `sim-dji play` child and the local broker share the host stack, same as `run.sh`), bind-mount the host `recordings/` / `logs/` into `/data/…`, mount the project dir read-only at `/config` (so `deploy/record-entrypoint.sh` resolves a bare yaml filename as `/config/<name>` and forces `--storage-root`), and run as `PUID:PGID`. `TZ` defaults to `Asia/Shanghai` because flight dir names use `time.localtime`. `.gitignore` has an explicit `!docker-compose.yml` exception to the `*.yml` rule.
 
 ## Reference documents
 

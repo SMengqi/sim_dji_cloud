@@ -1,0 +1,151 @@
+# sim-dji-cloud 生产部署（Docker Compose）
+#
+# 用法速查（详见 docs/docker-deploy.md）：
+#   cp .env.example .env && vim .env                 # PUID/PGID、地址
+#   docker compose build                             # 在部署机本地构建镜像
+#   docker compose up -d                             # 默认只起 record（配置 ./recorder.yaml）
+#   docker compose run --rm record recorder_125.yaml # 一次性：用项目目录里另一份配置录制
+#   docker compose --profile dashboard up -d dashboard
+#   docker compose --profile pilot up -d record-pilot
+#   docker compose run --rm tools list --root /data/recordings
+#   docker compose run --rm tools play /data/recordings/<flight> --speed 1.0
+#   docker compose stop record                       # SIGTERM → 优雅 finalize 当前飞行
+#
+# 配置文件：宿主机项目目录只读挂到容器 /config，record 包装按 /config/<文件名> 找；
+#   `docker compose run --rm record <文件名>` 即可指定任意一份本地 yaml。
+#
+# 所有服务都是 network_mode: host：跟 run.sh 部署形态一致
+#   - record 出站连 DJI 云 broker (8883) + 局域网 SRS 拉流
+#   - dashboard / play 连宿主机 localhost:1883 本地 broker，8080 直接对外
+#   - dashboard 进程内 Popen 的 `sim-dji play` 子进程共享同一网络栈
+#
+# 数据全部 bind mount 到宿主机目录（默认就是项目目录下现有的 recordings/ logs/），
+# 不用 docker named volume，tar / du / 清理老飞行都直接在宿主机上操作。
+name: sim-dji-cloud
+
+x-common: &common
+  image: ${IMAGE:-sim-dji-cloud:local}
+  network_mode: host
+  # 必须与宿主机 recordings/ logs/ 目录属主一致（id -u / id -g），否则写不进去
+  user: "${PUID:-1000}:${PGID:-1000}"
+  init: true
+  environment: &common-env
+    TZ: ${TZ:-Asia/Shanghai}
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  # ---- 连续录制（Dock 3 → 云 MQTT）。默认服务：`docker compose up -d` 只起它 ----
+  #   视频开关在 yaml 的 video.enabled；配置文件名由 RECORDER_CONFIG 或 run 时第一个参数指定
+  record:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sim-dji-record
+    restart: unless-stopped
+    # SIGTERM 后 record 要 finalize 当前飞行 + 停 ffmpeg；run.sh 等 30s，这里给 40s
+    stop_grace_period: 40s
+    entrypoint: ["sim-dji-record"]
+    command: []          # 必须显式置空，否则继承镜像 CMD ["--help"] 会被包装脚本透传给 sim-dji record
+    environment:
+      <<: *common-env
+      RECORD_CMD: record
+      STORAGE_ROOT: /data/recordings
+      RECORDER_CONFIG: ${RECORDER_CONFIG:-recorder.yaml}
+      # yaml 里用 ${env:...} 引用凭据时才需要；明文写在 yaml 里则留空即可
+      DJI_MQTT_USERNAME: ${DJI_MQTT_USERNAME:-}
+      DJI_MQTT_PASSWORD: ${DJI_MQTT_PASSWORD:-}
+    volumes:
+      - ${RECORDINGS_DIR:-./recordings}:/data/recordings
+      - ${LOGS_DIR:-./logs}:/data/logs
+      - ${CONFIG_DIR:-.}:/config:ro
+
+  # ---- Pilot-to-Cloud 录制（RC Plus 2 + M400，遥控器为网关，无视频）----
+  record-pilot:
+    <<: *common
+    profiles: ["pilot"]
+    container_name: sim-dji-record-pilot
+    restart: unless-stopped
+    stop_grace_period: 40s
+    entrypoint: ["sim-dji-record"]
+    command: []
+    environment:
+      <<: *common-env
+      RECORD_CMD: record-pilot
+      STORAGE_ROOT: /data/recordings_pilot
+      RECORDER_CONFIG: ${PILOT_CONFIG:-pilot_recorder.yaml}
+      DJI_MQTT_USERNAME: ${DJI_MQTT_USERNAME:-}
+      DJI_MQTT_PASSWORD: ${DJI_MQTT_PASSWORD:-}
+    volumes:
+      - ${RECORDINGS_PILOT_DIR:-./recordings_pilot}:/data/recordings_pilot
+      - ${LOGS_DIR:-./logs}:/data/logs
+      - ${CONFIG_DIR:-.}:/config:ro
+
+  # ---- 仪表盘（FastAPI + WS）。按需：docker compose --profile dashboard up -d dashboard ----
+  #   参数由 deploy/dashboard-entrypoint.sh 按环境变量拼
+  dashboard:
+    <<: *common
+    profiles: ["dashboard"]
+    container_name: sim-dji-dashboard
+    restart: unless-stopped
+    entrypoint: ["sim-dji-dashboard"]
+    command: []
+    environment:
+      <<: *common-env
+      DASH_HOST: ${DASH_HOST:-0.0.0.0}
+      DASH_PORT: ${DASH_PORT:-8080}
+      MQTT_URL: ${MQTT_URL:-tcp://127.0.0.1:1883}
+      DASH_WS_INTERVAL: ${DASH_WS_INTERVAL:-2000}
+      VIDEO_URL: ${VIDEO_URL:-}
+      DEFAULT_VIDEO_PUSH_URL: ${DEFAULT_VIDEO_PUSH_URL:-}
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      FLIGHT_AREA_XML: ${FLIGHT_AREA_XML:-}
+      FLIGHT_AREA_PNG: ${FLIGHT_AREA_PNG:-}
+      FLIGHT_AREA_BOUNDS_LATLON: ${FLIGHT_AREA_BOUNDS_LATLON:-}
+      DASH_EXTRA_ARGS: ${DASH_EXTRA_ARGS:-}
+    volumes:
+      - ${RECORDINGS_DIR:-./recordings}:/data/recordings
+      - ${LOGS_DIR:-./logs}:/data/logs
+      # 飞行区域叠加文件（XML / PNG / .bounds sidecar）放 deploy/area/，容器内 /area
+      - ${FLIGHT_AREA_DIR:-./deploy/area}:/area:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/' % os.environ.get('DASH_PORT','8080'), timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ---- 一次性 CLI（list / inspect / play / selfcheck / repair / validate-config / stop-record）----
+  #   docker compose run --rm tools <子命令> ...
+  tools:
+    <<: *common
+    profiles: ["tools"]
+    environment:
+      <<: *common-env
+      DJI_MQTT_USERNAME: ${DJI_MQTT_USERNAME:-}
+      DJI_MQTT_PASSWORD: ${DJI_MQTT_PASSWORD:-}
+    volumes:
+      - ${RECORDINGS_DIR:-./recordings}:/data/recordings
+      - ${RECORDINGS_PILOT_DIR:-./recordings_pilot}:/data/recordings_pilot
+      - ${LOGS_DIR:-./logs}:/data/logs
+      - ${CONFIG_DIR:-.}:/config:ro
+    command: ["--help"]
+
+  # ---- 可选：本地 MQTT broker（宿主机没有 mosquitto 时才启用）----
+  #   docker compose --profile broker up -d mosquitto
+  mosquitto:
+    image: eclipse-mosquitto:2
+    profiles: ["broker"]
+    container_name: sim-dji-mosquitto
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro

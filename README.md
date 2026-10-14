@@ -20,6 +20,22 @@ pip install -e ".[test]"
 - `ffmpeg` — 视频录制必需
 - `mosquitto` — 仅运行集成测试需要，正常使用不需要
 
+## Docker 部署（生产 / 测试机）
+
+镜像在部署机本地构建，数据和视频仍落在宿主机 `recordings/`：
+
+```bash
+cp .env.example .env && vim .env                    # 至少填 PUID/PGID
+docker compose build
+docker compose up -d                                # 默认只起 record，配置 ./recorder.yaml
+docker compose run --rm record recorder_125.yaml    # 一次性：换项目目录里另一份配置
+docker compose --profile dashboard up -d dashboard  # 需要仪表盘时
+docker compose run --rm tools list --root /data/recordings
+```
+
+完整流程、run.sh 模式对照表和排障见 [`docs/docker-deploy.md`](docs/docker-deploy.md)。
+要把镜像打成 tar 部署到另一台新机器：`bash deploy/package.sh <tag>`，步骤见 [`docs/docker-offline-deploy.md`](docs/docker-offline-deploy.md)。
+
 ## 配置
 
 ```bash
