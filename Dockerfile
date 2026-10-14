@@ -9,9 +9,19 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Asia/Shanghai
 
+# 构建期软件源（国内 / 内网机器连不上 deb.debian.org / pypi.org 时用，见 .env.example）：
+#   APT_MIRROR     留空 = 官方 deb.debian.org；例：mirrors.aliyun.com / mirrors.tuna.tsinghua.edu.cn
+#   PIP_INDEX_URL  例：https://mirrors.aliyun.com/pypi/simple/ 或 https://pypi.tuna.tsinghua.edu.cn/simple
+ARG APT_MIRROR=""
+ARG PIP_INDEX_URL="https://pypi.org/simple"
+
 # ffmpeg/ffprobe：录视频 (record --video) + 回放推流 (play --video-push-url) 必需
 # tzdata：飞行目录名用本地时间 (time.localtime)，容器必须有时区数据
-RUN apt-get update \
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+      || sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list; \
+    fi \
+ && apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg tzdata \
  && rm -rf /var/lib/apt/lists/*
 
@@ -19,10 +29,10 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" \
- | pip install --no-cache-dir -r /dev/stdin
+ | pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /dev/stdin
 
 COPY src ./src
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps --index-url "$PIP_INDEX_URL" .
 
 # 启动包装：
 #   sim-dji-record    [配置文件] [...]   record / record-pilot，配置按 /config/<name> 解析

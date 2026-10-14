@@ -185,5 +185,6 @@ dashboard 拉起的 play 子进程日志在 `logs/`。
 | 视频面板黑屏 / 录不到视频 | `docker compose logs record` 找 `ffmpeg exited`；检查 SRS 地址（容器 host 网络，地址和以前一样写） |
 | 想进容器看看 | `docker compose exec record sh`（或 `docker compose run --rm --entrypoint sh tools`） |
 | 改了 Dockerfile 想干净重建 | `docker compose build --no-cache` |
+| build 时 apt `Unable to connect to deb.debian.org` / `Unable to locate package ffmpeg`，或 pip 超时 | 构建机连不上官方源：`.env` 设 `APT_MIRROR=mirrors.aliyun.com`、`PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`（或清华源），走代理则填 `http_proxy`/`https_proxy`，再 `docker compose build` |
 
 更多录制 / 回放本身的排障看 `../2026-05-21-sim-dji-cloud-operations-manual.md` §10。

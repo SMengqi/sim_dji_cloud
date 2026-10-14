@@ -20,7 +20,13 @@
 - Docker Engine ≥ 20.10 + Compose 插件 v2（`docker compose version` 能输出）。
 - 当前用户能连 Docker daemon：`docker ps` 不报 `permission denied`。报了就 `sudo usermod -aG docker "$USER"` 后重新登录（或 `newgrp docker`）；不想加组就 `sudo -E bash deploy/package.sh <TAG>`，完事 `sudo chown -R "$(id -u):$(id -g)" dist`。
 - 构建机能访问 Docker Hub（拉 `python:3.12-slim`）和 Debian / PyPI 源。只在构建机需要外网，新环境不需要。
-- **架构要一致**：在 x86_64 机器上 build 出的镜像只能在 x86_64 上跑；目标是 arm64 就在 arm64 机器上 build（或 `docker buildx build --platform linux/arm64`，较慢）。`uname -m` 两边对一下。
+  国内机器通常连不上 `deb.debian.org` / `pypi.org`（apt 报 `Unable to connect`、`Unable to locate package ffmpeg`），
+  在 `.env` 里设 `APT_MIRROR` / `PIP_INDEX_URL`（`.env.example` 默认已填阿里云），或者命令行直接给：
+  `APT_MIRROR=mirrors.aliyun.com PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ sudo -E bash deploy/package.sh v0.1.0`。
+  走代理的机器填 `http_proxy` / `https_proxy`。
+- **架构要一致**：`package.sh` 开头会打印构建机架构（如 `linux/arm64`）。arm64 上 build 出的镜像只能在 arm64 上跑，x86_64 同理；`uname -m` 两边对一下。
+  跨架构只能用 buildx + qemu（慢，且需要先 `docker run --privileged --rm tonistiigi/binfmt --install all` 装模拟器）：
+  `docker buildx build --platform linux/amd64 --build-arg APT_MIRROR=mirrors.aliyun.com --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ --load -t sim-dji-cloud:v0.1.0 .`，然后手动 `docker save`（A.3）。
 
 ### A.2 一条命令
 
