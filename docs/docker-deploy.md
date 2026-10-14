@@ -146,8 +146,12 @@ FLIGHT_AREA_BOUNDS_LATLON=29.919465,121.655345,29.928699,121.675011   # 有 .bou
 play / dashboard 需要一个本地 MQTT broker。宿主机已有 mosquitto 就什么都不用做；没有则：
 
 ```bash
-docker compose --profile broker up -d mosquitto     # host 网络监听 1883，匿名
+docker compose --profile broker up -d mosquitto     # 只监听 127.0.0.1:1883，匿名
 ```
+
+它只绑本机回环地址：容器都是 host 网络，dashboard / play 通过 `127.0.0.1` 就能连上。要让**另一台机器**上的被测系统订阅回放流，改 `deploy/mosquitto.conf` 为 `listener 1883 0.0.0.0`，并且把 `allow_anonymous` 关掉配 `password_file`，别把匿名 broker 开到局域网。
+
+dashboard 的 8080 默认绑 `0.0.0.0`（浏览器要从别的机器访问），写操作由 `DASHBOARD_TOKEN` 守护、读是公开的，和 run.sh 直跑时一致；对外网段建议用防火墙限制来源。
 
 ---
 
