@@ -14,6 +14,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 前置：能连上 Docker daemon（常见失败：当前用户不在 docker 组）
+if ! docker info >/dev/null 2>&1; then
+  cat >&2 <<'MSG'
+[package] 连不上 Docker daemon（permission denied / daemon 未启动）。
+  方法 1（推荐）：sudo usermod -aG docker "$USER" && newgrp docker   # 或退出重新登录
+  方法 2：sudo -E bash deploy/package.sh <TAG>   # 之后 sudo chown -R "$(id -u):$(id -g)" dist
+MSG
+  exit 1
+fi
+
 TAG="${1:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y%m%d)}"
 IMAGE="sim-dji-cloud:${TAG}"
 OUT_DIR="${OUT_DIR:-./dist}"
